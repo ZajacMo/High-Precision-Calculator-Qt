@@ -321,6 +321,10 @@ option(BUILD_SERVER "构建 Web 服务端"            ON)
 7. **除法舍入判定** —— `i == -(FracBit+2)` 的边界条件脆弱。
 8. **资源路径错误** —— `QIcon("://ICON.jpg")` 写法有误。
 9. **`get()` 解析负号后的空串** —— 边界输入未处理。
+10. **除法在精度为 0 时崩溃** —— 试商循环的边界依赖全局 `FracBit`，
+    `FracBit == 0` 时循环走出预期区间，`result.Tail` 被退到 `nullptr` 后再解引用，
+    实测 SIGSEGV（`legacy/COMPARISON.md` 缺陷 #10 有最小复现）。
+    新设计以 `Context` 显式传参，`precision <= 0` 直接拒绝。
 
 ---
 

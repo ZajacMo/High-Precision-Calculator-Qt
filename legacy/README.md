@@ -145,6 +145,8 @@ Check_Zero / Check_Bit       checkZero / checkBit              checkZero / check
 7. **除法舍入判定** —— `if (i == -(FracBit+2))` 的边界条件脆弱。
 8. **资源路径错误** —— `QIcon("://ICON.jpg")` 缺少 `qrc:` 前缀，图标无法加载。
 9. **`get()` 解析负号后的空串** —— 输入 `"-"` 时被**静默接受为 0**，而不是报错。
+10. **除法在精度为 0 时崩溃** —— `FracBit == 0` 时试商循环走出预期区间，
+    链表尾指针被退到 `nullptr` 后再解引用，实测 SIGSEGV。
 
 上述缺陷在 v3.0 重写中逐一消除：改用 base-10⁹ 分块的 `BigDecimal`（无链表、无指针、
 无手动内存管理）、精度下沉为 `Context` 显式参数、解析前置校验。

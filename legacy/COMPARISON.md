@@ -254,6 +254,37 @@ void Number::get(STR qstr){
 
 > v3.0：解析前做完整校验（空串、非法字符、仅符号等），返回明确的错误而非 UB。
 
+### 10. 除法在 `FracBit = 0` 时崩溃（可复现的空指针解引用）
+
+第 2 代 `number.cpp:40-45`（第 3 代同）：
+
+```cpp
+result.Tail = result.Tail->insertAfter(j);   // 追加试商结果
+result.Len++ ;
+if(i < 0)
+    result.Len_frac++;
+else if(i == 0)
+    result.Unit=result.Tail;                  // 确定个位
+```
+
+试商循环的边界是 `for( i = start ; i >= - ( FracBit + 1 ) ; i-- )`。当
+**`FracBit == 0`** 时，循环区间退化为 `i >= -1`，而 `start` 通常大于 0，
+于是 `i` 会一路减到 `-1` 并继续走出循环体；此时 `result.Tail` 可能已指向链表首节点，
+再执行 `result.Tail = result.Tail->prior` 就得到 `nullptr`，
+随后的 `result.Tail->Data++` 解引用空指针。
+
+实测（第 2 代，`Number::FracBit = 0`，输入 `-02.881332` 与 `0474` 相除）：
+
+```
+RUN_EXIT=139        // SIGSEGV
+```
+
+`FracBit` 是**全局静态成员**，而 GUI 的「设置精度」对话框允许把它设为 0
+（`dialog_setbit.cpp` 中只校验 `bit < 0`），因此这条路径在真实使用中可达。
+
+> v3.0：精度通过 `Context` 显式传入，且 `precision <= 0` 时直接拒绝
+> （抛 `std::invalid_argument`），从根上消除「精度为 0」这一非法状态。
+
 ---
 
 ## 三、三代共享的算法缺陷小结
@@ -269,6 +300,7 @@ void Number::get(STR qstr){
 | 7 除法舍入判定 | ✓ | ✓ | ✓ |
 | 8 资源路径错误 | 不适用 | 不适用 | ✓ |
 | 9 `get()` 解析负号后的空串 | ✓（`Get`，静默接受为 0） | ✓（静默接受为 0） | ✓（静默接受为 0） |
+| 10 除法在 `FracBit = 0` 时崩溃 | ✓ | ✓（实测 SIGSEGV） | ✓ |
 
 三代的核心数值算法是**同一份代码的三次复制**，缺陷也随复制传播 —— 这正是 v3.0
 重写的根本理由：三代积累下来的不是能力，而是同一批 bug 的三个副本。
