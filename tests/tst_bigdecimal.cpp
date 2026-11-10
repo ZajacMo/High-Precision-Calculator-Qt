@@ -457,3 +457,40 @@ TEST(divide, no_negative_zero_output) {
              std::string("-0.000001"));
     CHECK_EQ(div("-0.4", "1", 1, RoundingMode::Floor).toString(), std::string("-0.4"));
 }
+
+// 回归测试：normalize() 的尾随零剥离曾有两个缺陷。
+//
+// 1. 逐个剥离尾随零是 O(零个数 × 块数) 的二次方开销。高精度除法的商
+//    形如 0.5000…0，precision=1000000 时单次除法要以分钟计。
+//    现改为整块批量剥离。
+// 2. 批量剥离时若 scale_ 少减了 9，会把 10.00 归一化成 1 ——
+//    值被除了 10^9 而小数位只减了 1。
+TEST(normalize, trailing_zero_strip) {
+    // 跨块边界的尾随零：块内不足 9 个 + 整块为零
+    CHECK_EQ(BigDecimal::fromString("1.500").toString(), std::string("1.5"));
+    CHECK_EQ(BigDecimal::fromString("10.00").toString(), std::string("10"));
+    CHECK_EQ(BigDecimal::fromString("0.000").toString(), std::string("0"));
+
+    // 整整一块零（9 个零）后跟非零位：零块在**非零位之前**，不能被剥掉
+    std::string wide = "12.5";
+    wide.append(9, '0');
+    wide += "3";
+    CHECK_EQ(BigDecimal::fromString(wide).toString(), std::string("12.50000000003"));
+
+    // 整整一块尾随零（9 个零）必须被剥掉，且小数位同步收缩 9
+    std::string trailingBlock = "12.5";
+    trailingBlock.append(9, '0');
+    CHECK_EQ(BigDecimal::fromString(trailingBlock).toString(), std::string("12.5"));
+
+    // 两个整块尾随零（18 个零）
+    std::string twoBlocks = "12.5";
+    twoBlocks.append(18, '0');
+    CHECK_EQ(BigDecimal::fromString(twoBlocks).toString(), std::string("12.5"));
+
+    // 值不变、只归一化：除法结果尾随零被剥离后数值必须一致
+    const BigDecimal half = BigDecimal::divide(BigDecimal::fromString("1"),
+                                               BigDecimal::fromString("2"),
+                                               Context{20, RoundingMode::Down});
+    CHECK_EQ(half.toString(), std::string("0.5"));
+    CHECK(half.compare(BigDecimal::fromString("0.5")) == 0);
+}

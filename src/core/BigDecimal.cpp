@@ -303,11 +303,34 @@ void BigDecimal::normalize() {
     //
     // 注意：digits_ 是**小端**存储，digits_[0] 是最低位块，
     // 尾随零位于 digits_[0] 而不是 digits_.back()。
-    // 逐次除以 10 直到最低位块不再是 10 的倍数。
+    //
+    // 性能：尾随零可能成千上万（高精度除法的商形如 0.5000…0）。
+    // 逐个剥离是 O(零个数 × 块数) 的二次方开销，因此先整块剥离
+    // （每次去掉 9 个零），块内不足 9 个时再逐个处理。
     while (scale_ > 0 && (digits_.size() > 1 || digits_[0] != 0)) {
-        if (digits_[0] % 10 != 0) break;
-        divideBy10(digits_);
-        --scale_;
+        // 整块剥离：最低位块为 0，说明它 9 个十进制位全为零。
+        //
+        // 性能：尾随零可能成千上万（高精度除法的商形如 0.5000…0）。
+        // 逐块剥离每次都要移动整个数组，退化成 O(块数²)；因此先数出
+        // 能剥多少块，再**一次性** erase，避免重复搬移。
+        std::size_t zeroBlocks = 0;
+        while (zeroBlocks + 1 < digits_.size() && digits_[zeroBlocks] == 0) ++zeroBlocks;
+        const std::size_t affordable = static_cast<std::size_t>(scale_ / kBlockDigits);
+        const std::size_t strip = zeroBlocks < affordable ? zeroBlocks : affordable;
+        if (strip > 0) {
+            digits_.erase(digits_.begin(), digits_.begin() + static_cast<std::ptrdiff_t>(strip));
+            scale_ -= static_cast<int>(strip) * kBlockDigits;
+            continue;
+        }
+        // 块内零：最低位块非零，但它的末尾可能有零（最多 8 个）。
+        int zeros = 0;
+        std::uint32_t probe = digits_[0];
+        while (probe % 10 == 0 && zeros < kBlockDigits) { ++zeros; probe /= 10; }
+        if (zeros == 0) break;
+        const int removed = zeros < scale_ ? zeros : scale_;
+        for (int i = 0; i < removed; ++i) divideBy10(digits_);
+        scale_ -= removed;
+        break;
     }
     digits_ = trimBlk(std::move(digits_));
     if (digits_.size() == 1 && digits_[0] == 0) {
