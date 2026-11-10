@@ -449,17 +449,23 @@ constexpr int kBlockDigits = 9;
 
 using Blk = std::vector<std::uint32_t>;
 
-std::uint32_t pow10(int exponent) {
-    std::uint32_t value = 1;
-    for (int i = 0; i < exponent; ++i) value *= 10;
-    return value;
-}
-
 // 去除高位的零块，但至少保留一个块表示 0。
 Blk trimBlk(Blk value) {
     while (value.size() > 1 && value.back() == 0) value.pop_back();
     if (value.empty()) value.push_back(0);
     return value;
+}
+
+// 把小端 base-10^9 块序列原地除以 10（去掉一个十进制尾随零）。
+// 小端表示下，最高位在末尾，所以进位要从高位往低位传。
+void divideBy10(Blk& blocks) {
+    std::uint64_t remainder = 0;
+    for (std::size_t i = blocks.size(); i-- > 0;) {
+        const std::uint64_t current = remainder * kBase + blocks[i];
+        blocks[i] = static_cast<std::uint32_t>(current / 10);
+        remainder = current % 10;
+    }
+    blocks = trimBlk(std::move(blocks));
 }
 
 // 比较两块序列（均为小端）：<0 / 0 / >0。
@@ -612,23 +618,21 @@ BigDecimal BigDecimal::fromString(std::string_view text) {
 
 void BigDecimal::normalize() {
     digits_ = trimBlk(std::move(digits_));
-    // 去掉小数部分的尾随零，并同步收缩 scale。
-    while (scale_ > 0 && digits_.size() > 1) {
-        std::uint32_t last = digits_.back();
-        int zeros = 0;
-        std::uint32_t probe = last;
-        while (probe % 10 == 0) { ++zeros; probe /= 10; }
-        if (zeros == 0) break;
-        if (zeros >= kBlockDigits) {
-            digits_.pop_back();
-            scale_ -= kBlockDigits;
-            continue;
-        }
-        digits_.back() = last / pow10(zeros);
-        scale_ -= zeros;
-        break;
+    // 去掉小数部分的尾随零（可跨块边界），并同步收缩 scale。
+    //
+    // 注意：digits_ 是**小端**存储，digits_[0] 是最低位块，
+    // 尾随零位于 digits_[0] 而不是 digits_.back()。
+    // 逐次除以 10 直到最低位块不再是 10 的倍数。
+    while (scale_ > 0 && (digits_.size() > 1 || digits_[0] != 0)) {
+        if (digits_[0] % 10 != 0) break;
+        divideBy10(digits_);
+        --scale_;
     }
-    if (digits_.size() == 1 && digits_[0] == 0) sign_ = 0;
+    digits_ = trimBlk(std::move(digits_));
+    if (digits_.size() == 1 && digits_[0] == 0) {
+        sign_ = 0;
+        scale_ = 0;
+    }
 }
 
 // 对齐小数位：把 scale 较小的数末尾补零，使两者 scale 相同。
