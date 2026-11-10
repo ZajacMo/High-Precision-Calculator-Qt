@@ -20,6 +20,10 @@
 - **构建脚本必须复用** `scripts\msvc-env.bat`（含 Win SDK `bin\<ver>\x64`，否则 `rc.exe`/`mt.exe` 缺失导致 CMake try-compile 失败）。
 - **单元测试框架**：复用兄弟项目的 `tests/test_framework.h`（`TEST`/`CHECK`/`CHECK_EQ`/`CHECK_STREQ` 宏，零依赖单文件聚合）。
 - **每个 Task 结束前必须实际运行测试并看到全绿**，不得只写代码就宣称完成。
+- **构建命令直接在 Git Bash 里运行 `.bat`，不要用 `cmd //c` 包装**：
+  用 `./scripts/build-core.bat`、`./scripts/run-ctest.bat`、
+  `./scripts/msvc-env.bat cmake ...`。`cmd //c` 在本沙箱中被拒绝
+  （无法静态判定其是否会执行版本控制命令），直接调用 `.bat` 已验证可用。
 
 ---
 
@@ -291,12 +295,12 @@ call "%~dp0msvc-env.bat" cmake --build "%~dp0..\build" || exit /b 1
 - [ ] **Step 9: 构建并运行测试**
 
 ```bash
-cmd //c "scripts\\build-core.bat"
+./scripts/build-core.bat
 ```
 预期：编译 `hpc_core`、`hpc_cli`、`hpc_tests` 全部成功，无 warning。
 
 ```bash
-cmd //c "scripts\\run-ctest.bat"
+./scripts/run-ctest.bat
 ```
 （`run-ctest.bat` 内容见 Task 10，或先建最小版本）
 
@@ -794,7 +798,7 @@ TEST(compare, sign) {
 - [ ] **Step 5: 构建并运行测试**
 
 ```bash
-cmd //c "scripts\\build-core.bat" && cmd //c "scripts\\run-ctest.bat"
+./scripts/build-core.bat && ./scripts/run-ctest.bat
 ```
 预期：`hpc_tests` 通过，用例数 ≥ 6，`0 个断言失败`。
 
@@ -1183,7 +1187,7 @@ sys.exit(1 if failures else 0)
 运行：
 
 ```bash
-cmd //c "scripts\\build-core.bat"
+./scripts/build-core.bat
 python scripts/verify_div.py
 ```
 
@@ -1502,7 +1506,7 @@ sys.exit(1 if failures else 0)
 - [ ] **Step 6: 构建并验证**
 
 ```bash
-cmd //c "scripts\\build-core.bat"
+./scripts/build-core.bat
 python scripts/verify_func.py
 ```
 预期：`函数差分测试：496/496 通过`（或末位 1 ulp 差异在合理范围）。
@@ -1839,7 +1843,7 @@ TEST(bitwise, rejects_fraction) {
 - [ ] **Step 5: 构建并运行测试**
 
 ```bash
-cmd //c "scripts\\build-core.bat" && cmd //c "scripts\\run-ctest.bat"
+./scripts/build-core.bat && ./scripts/run-ctest.bat
 ```
 预期：全部通过。
 
@@ -2208,7 +2212,7 @@ TEST(expression, errors) {
 - [ ] **Step 4: 构建并运行测试**
 
 ```bash
-cmd //c "scripts\\build-core.bat" && cmd //c "scripts\\run-ctest.bat"
+./scripts/build-core.bat && ./scripts/run-ctest.bat
 ```
 预期：全部通过。
 
@@ -2396,7 +2400,7 @@ int main(int argc, char** argv) {
 - [ ] **Step 2: 构建并手工验证**
 
 ```bash
-cmd //c "scripts\\build-core.bat"
+./scripts/build-core.bat
 ```
 
 ```bash
@@ -3016,8 +3020,8 @@ button:hover { background: #3f7bea; }
 - [ ] **Step 9: 构建并端到端验证**
 
 ```bash
-cmd //c "scripts\\msvc-env.bat" cmake -S . -B build -G Ninja -DBUILD_GUI=OFF -DBUILD_SERVER=ON -DBUILD_TESTS=ON
-cmd //c "scripts\\msvc-env.bat" cmake --build build
+./scripts/msvc-env.bat cmake -S . -B build -G Ninja -DBUILD_GUI=OFF -DBUILD_SERVER=ON -DBUILD_TESTS=ON
+./scripts/msvc-env.bat cmake --build build
 ```
 
 ```bash
@@ -3310,9 +3314,9 @@ int main(int argc, char** argv) {
 - [ ] **Step 6: 构建并运行 GUI 冒烟测试**
 
 ```bash
-cmd //c "scripts\\msvc-env.bat" cmake -S . -B build -G Ninja -DBUILD_GUI=ON -DBUILD_TESTS=ON
-cmd //c "scripts\\msvc-env.bat" cmake --build build
-cmd //c "scripts\\run-ctest.bat"
+./scripts/msvc-env.bat cmake -S . -B build -G Ninja -DBUILD_GUI=ON -DBUILD_TESTS=ON
+./scripts/msvc-env.bat cmake --build build
+./scripts/run-ctest.bat
 ```
 
 预期：2 个测试全绿（`hpc_tests` 与 `gui_smoke`）。
@@ -3528,9 +3532,9 @@ Knuth Algorithm D 的对照说明与基准数据、舍入模式语义表、
 - [ ] **Step 8: 全量验证**
 
 ```bash
-cmd //c "scripts\\msvc-env.bat" cmake -S . -B build -G Ninja -DBUILD_GUI=ON -DBUILD_TESTS=ON -DBUILD_SERVER=ON
-cmd //c "scripts\\msvc-env.bat" cmake --build build
-cmd //c "scripts\\run-ctest.bat"
+./scripts/msvc-env.bat cmake -S . -B build -G Ninja -DBUILD_GUI=ON -DBUILD_TESTS=ON -DBUILD_SERVER=ON
+./scripts/msvc-env.bat cmake --build build
+./scripts/run-ctest.bat
 python scripts/difftest.py
 ```
 
