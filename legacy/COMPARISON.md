@@ -20,7 +20,7 @@
 | 维度 | onlinejudge_calculator（第 1 代） | oj_console_edition（第 2 代） | qt_gui_original（第 3 代） |
 |---|---|---|---|
 | API 命名 | PascalCase（`Get`/`Show`/`Copy`/`Release`/`Transform_Sign`/`POWER`） | camelCase（`get`/`show`/`copy`/`release`/`transformSign`/`getPower`） | camelCase（同第 2 代） |
-| 输入输出 | `std::string` + 流重载 | `std::string` + 流重载 | `QString` |
+| 输入输出 | `std::string` + `Get`/`Show` 显式调用（**无流重载**） | `std::string` + 流重载 | `QString` |
 | 除法 | 试商法（`Gap`/`Times` 临时对象） | 试商法 | 试商法 |
 | `node.cpp/h` | 独立 | **与第 3 代逐字节相同**（md5 `45615d3a` / `b67dc507`） | — |
 | 谱系判定 | 注释提及「Qt版参数为待转化的字符串QString类型」→ 先于 Qt 版存在 | 由第 3 代反向移植（时间戳晚于第 3 代） | Qt 版的源头 |
@@ -83,7 +83,8 @@ node.h     fc2f0b612c06ba5a1db429a5419b5e5a   onlinejudge_calculator ← 不同
 
 ## 二、已知缺陷清单（重写理由）
 
-以下 9 条来自设计规格 §8，均已对照源码核实。v3.0 重写中逐一消除。
+以下前 9 条来自设计规格 §8，均已对照源码核实；第 10 条为本次核实新发现。
+v3.0 重写中逐一消除。
 
 ### 1. 头文件守卫冲突
 
@@ -219,7 +220,7 @@ setWindowIcon(QIcon("://ICON.jpg"));    // dialog_help.cpp:10
 
 > v3.0：Qt 界面为可选目标（`BUILD_GUI`，默认 OFF），资源路径届时一并修正。
 
-### 9. `get()` 解析负号后的空串
+### 9. `get()` 静默接受非法输入
 
 第 3 代 `number.cpp:142-147`：
 
@@ -327,7 +328,7 @@ if (i == -(FracBit+2)) {                    // 若精度超过预设值
 | 6 全局静态精度 | ✓（文件级全局变量） | ✓ | ✓ |
 | 7 除法舍入判定 | ✓ | ✓ | ✓ |
 | 8 资源路径错误 | 不适用 | 不适用 | ✓ |
-| 9 `get()` 解析负号后的空串 | ✓（`Get`，静默接受为 0） | ✓（静默接受为 0） | ✓（静默接受为 0） |
+| 9 `get()` 静默接受非法输入 | ✓（`Get`，静默接受为 0） | ✓（静默接受为 0） | ✓（静默接受为 0） |
 | 10 除法在 `FracBit = 0` 且 `start == -2` 时崩溃 | ✓（实测 SIGSEGV） | ✓（实测 SIGSEGV） | ✓ |
 
 三代的核心数值算法是**同一份代码的三次复制**，缺陷也随复制传播 —— 这正是 v3.0

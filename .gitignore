@@ -48,6 +48,9 @@ build.ninja
 *.aps
 *.ncb
 *.opendb
+# legacy/ 里的 .user 文件是**归档**内容，必须能被 git 重新纳入跟踪，
+# 否则一旦重命名或 git rm --cached，git 会静默拒绝重新加入，存档悄悄丢文件。
+!legacy/**/*.user
 *.opensdf
 *.sdf
 *.VC.db

@@ -320,7 +320,7 @@ option(BUILD_SERVER "构建 Web 服务端"            ON)
 6. **全局静态精度** —— `static int Number::FracBit` 隐式影响所有运算。
 7. **除法舍入判定** —— `i == -(FracBit+2)` 的边界条件脆弱。
 8. **资源路径错误** —— `QIcon("://ICON.jpg")` 写法有误。
-9. **`get()` 解析负号后的空串** —— 边界输入未处理。
+9. **`get()` 静默接受非法输入** —— 边界输入未处理。
 10. **除法在精度为 0 时崩溃** —— 需同时满足 `FracBit == 0` 且 `start == -2`：
     试商循环一次都不执行，收尾的舍入分支对单节点链表做 `->prior` 回退得到
     `nullptr`，紧随其后的 `result.Tail->next->Data` 解引用空指针，实测 SIGSEGV

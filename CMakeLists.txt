@@ -28,19 +28,26 @@ add_library(hpc_core STATIC
 )
 target_include_directories(hpc_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-if(MSVC)
-    target_compile_options(hpc_core PRIVATE /W4 /permissive- /utf-8)
-    target_compile_definitions(hpc_core PRIVATE _CRT_SECURE_NO_WARNINGS)
-else()
-    target_compile_options(hpc_core PRIVATE -Wall -Wextra)
-endif()
+# 统一给每个目标开启警告开关。
+#
+# MSVC 会传递性地带入一些标准库头文件（如 <algorithm>），掩盖缺失 include 的
+# 问题；GCC 不会。所以**每个**目标都必须显式开启警告，不能只给核心库加 ——
+# 否则命令行与表达式层的代码在 GCC 下会一条警告都不报。
+function(hpc_set_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
+        target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra)
+    endif()
+endfunction()
+
+hpc_set_warnings(hpc_core)
 
 if(BUILD_CLI)
     add_executable(hpc_cli src/cli/main.cpp)
     target_link_libraries(hpc_cli PRIVATE hpc_core)
-    if(MSVC)
-        target_compile_options(hpc_cli PRIVATE /W4 /utf-8)
-    endif()
+    hpc_set_warnings(hpc_cli)
 endif()
 
 if(BUILD_TESTS)
@@ -53,8 +60,6 @@ if(BUILD_TESTS)
     )
     target_link_libraries(hpc_tests PRIVATE hpc_core)
     target_include_directories(hpc_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    if(MSVC)
-        target_compile_options(hpc_tests PRIVATE /W4 /utf-8)
-    endif()
+    hpc_set_warnings(hpc_tests)
     add_test(NAME hpc_tests COMMAND hpc_tests)
 endif()
