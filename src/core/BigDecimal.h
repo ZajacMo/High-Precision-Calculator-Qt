@@ -59,6 +59,35 @@ public:
     bool isZero() const;
     int sign() const { return sign_; }
 
+    // --- 超越函数 ---
+    //
+    // 这些函数本质上不精确，必须显式给出精度：结果按 context.precision
+    // 位有效数字舍入，舍入方式取 context.mode。
+    //
+    // 定义域之外抛 std::domain_error：
+    //   sqrt：负数
+    //   ln / log10：非正数
+    //   pow：负底数的非整数次幂、零的负数次幂
+    //
+    // 结果规模超出可计算范围时抛 std::overflow_error（exp 的参数过大、
+    // pow 的整数指数过大）。
+
+    // 平方根。
+    static BigDecimal sqrt(const BigDecimal& value, const Context& context);
+
+    // 幂。整数指数走精确的快速幂；非整数指数用 exp(b·ln a)。
+    static BigDecimal pow(const BigDecimal& base, const BigDecimal& exponent,
+                          const Context& context);
+
+    // 自然指数 e^x。
+    static BigDecimal exp(const BigDecimal& value, const Context& context);
+
+    // 自然对数 ln(x)。
+    static BigDecimal ln(const BigDecimal& value, const Context& context);
+
+    // 常用对数 log10(x)。
+    static BigDecimal log10(const BigDecimal& value, const Context& context);
+
 private:
     // 规范化：去除前导零块，去掉多余的尾随零。
     void normalize();
@@ -68,6 +97,52 @@ private:
 
     // 舍入到 context.precision 位有效数字。
     static BigDecimal roundToPrecision(const BigDecimal& value, const Context& context);
+
+    // --- 超越函数的内部工具 ---
+
+    // 值的十进制指数 e：10^e <= |value| < 10^(e+1)。零值按 0 处理。
+    int decimalExponent() const;
+
+    // 精确地做 value * 10^exponent（指数可正可负，不引入舍入）。
+    static BigDecimal shiftByPowerOfTen(const BigDecimal& value, int exponent);
+
+    // 精确地乘以 2（十进制下 2 是有限的，除以 2 用乘 5 再移小数点）。
+    static BigDecimal multiplyByTwo(const BigDecimal& value);
+
+    // 精确地除以 2。
+    static BigDecimal divideByTwo(const BigDecimal& value);
+
+    // 向下取整到整数（scale 归零）。
+    static BigDecimal floorToInteger(const BigDecimal& value);
+
+    // scale 为 0 的整数值转成 long long；超出范围时抛 std::overflow_error。
+    static long long toInteger(const BigDecimal& value);
+
+    // 精确的整数幂 base^power（power >= 1）；结果位数超限时抛 std::overflow_error。
+    static BigDecimal integerPower(const BigDecimal& base, long long power);
+
+    // atanh 级数：z + z^3/3 + z^5/5 + ...（|z| <= 1/3 时收敛很快）。
+    static BigDecimal atanhSeries(const BigDecimal& z, const Context& work);
+
+    // exp(g) 的泰勒级数（0 <= g < ln(10) 时收敛很快）。
+    static BigDecimal expSeries(const BigDecimal& g, const Context& work);
+
+    // 把 value 分解成 mantissa * 10^exponent * 2^halvings，
+    // 其中 mantissa ∈ [1, 2)，exponent 与 halvings 由输出参数给出。
+    //
+    // 移位与折半都是精确操作，不引入任何舍入。
+    static BigDecimal decomposeForLog(const BigDecimal& value, int& exponent, int& halvings);
+
+    // ln(2) 与 ln(10)：按 work 精度**实时计算**（硬编码常量在高精度下不够用）。
+    static BigDecimal ln2Constant(const Context& work);
+    static BigDecimal ln10Constant(const Context& work);
+
+    // 超越函数的内部实现：work 是工作精度（含保护位），final 是最终舍入上下文。
+    static BigDecimal expInternal(const BigDecimal& value, const Context& work,
+                                  const Context& final);
+    static BigDecimal lnInternal(const BigDecimal& value, const Context& work);
+    static BigDecimal log10Internal(const BigDecimal& value, const Context& work,
+                                    const Context& final);
 
     // 逐块长除法 + 二分试商。返回 {商, 余数}。
     static std::pair<Blk, Blk> divideBlk(const Blk& dividend, const Blk& divisor);

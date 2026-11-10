@@ -55,6 +55,7 @@ if(BUILD_TESTS)
     add_executable(hpc_tests
         tests/tst_main.cpp
         tests/tst_bigdecimal.cpp
+        tests/tst_transcendental.cpp
         tests/tst_format.cpp
         tests/tst_expression.cpp
     )
@@ -72,4 +73,9 @@ if(BUILD_TESTS)
     add_executable(mod_probe tests/mod_probe.cpp)
     target_link_libraries(mod_probe PRIVATE hpc_core)
     hpc_set_warnings(mod_probe)
+
+    # 超越函数探针：供 scripts/verify_func.py 做差分验证。
+    add_executable(func_probe tests/func_probe.cpp)
+    target_link_libraries(func_probe PRIVATE hpc_core)
+    hpc_set_warnings(func_probe)
 endif()
