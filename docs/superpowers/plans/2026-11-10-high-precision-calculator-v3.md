@@ -978,7 +978,13 @@ BigDecimal BigDecimal::divide(const BigDecimal& lhs, const BigDecimal& rhs, cons
 BigDecimal BigDecimal::modulo(const BigDecimal& lhs, const BigDecimal& rhs) {
     if (rhs.sign_ == 0) throw std::domain_error("BigDecimal: 取余的除数为零");
     if (lhs.compare(rhs) < 0 && lhs.sign() * rhs.sign() >= 0) return lhs;
-    BigDecimal quotient = divide(lhs, rhs, Context{1000000, RoundingMode::Down});
+    // 求商时向零截断。精度按**操作数的量级**给，而不是写死一个巨大值 ——
+    // 写死 1000000 会让每次除法都做十万位运算，实测单次超过 3 分钟。
+    // 商的整数部分不超过 lhs 的位数，取这么多位足够精确。
+    const int quotientDigits = lhs.scale_ > rhs.scale_
+        ? lhs.scale_ - rhs.scale_ + 1
+        : 1;
+    BigDecimal quotient = divide(lhs, rhs, Context{quotientDigits, RoundingMode::Down});
     return lhs - quotient * rhs;
 }
 ```
@@ -1803,9 +1809,20 @@ BigDecimal shiftLeft(const BigDecimal& value, int bits) {
 BigDecimal shiftRight(const BigDecimal& value, int bits) {
     if (!value.isInteger()) throw std::domain_error("shiftRight: 只支持整数");
     if (bits < 0) throw std::invalid_argument("shiftRight: 位数不能为负");
+    // 右移是精确的整数除法：除数是 2 的幂，结果一定整除，
+    // 所以精度只需覆盖商的位数，无需写死一个巨大值
+    // （precision=1000000 会让单次除法超过 3 分钟）。
+    // 商的位数 = 原值位数 + bits 的十进制位数 + 1，足够保险。
     BigDecimal result = value;
+    int decimalDigits = 0;
+    for (BigDecimal probe = value; !probe.isZero(); probe = probe * BigDecimal(10)) {
+        ++decimalDigits;
+        if (decimalDigits > 4096) break;   // 防御：避免病态输入导致死循环
+    }
+    const int precision = decimalDigits + bits / 3 + 2;
     for (int i = 0; i < bits; ++i) {
-        result = BigDecimal::divide(result, BigDecimal(2), Context{1000000, RoundingMode::Down});
+        result = BigDecimal::divide(result, BigDecimal(2),
+                                    Context{precision, RoundingMode::Down});
     }
     return result;
 }

@@ -458,6 +458,28 @@ TEST(divide, no_negative_zero_output) {
     CHECK_EQ(div("-0.4", "1", 1, RoundingMode::Floor).toString(), std::string("-0.4"));
 }
 
+// 回归测试：precision 曾无上限，写死一个巨大值（如 1000000）会让单次除法
+// 以分钟计。核心现在拒绝超出上限的精度，逼迫调用方按量的级给精度。
+TEST(divide, rejects_absurd_precision) {
+    bool threw = false;
+    try {
+        BigDecimal::divide(BigDecimal::fromString("1"), BigDecimal::fromString("2"),
+                           Context{1000000, RoundingMode::Down});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    threw = false;
+    try {
+        BigDecimal::divide(BigDecimal::fromString("1"), BigDecimal::fromString("2"),
+                           Context{0, RoundingMode::Down});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
 // 回归测试：normalize() 的尾随零剥离曾有两个缺陷。
 //
 // 1. 逐个剥离尾随零是 O(零个数 × 块数) 的二次方开销。高精度除法的商

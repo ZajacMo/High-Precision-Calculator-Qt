@@ -13,6 +13,10 @@ namespace {
 constexpr std::uint64_t kBase = 1000000000ULL;   // 10^9
 constexpr int kBlockDigits = 9;
 
+// 允许的最大有效数字位数。超过这个量级的运算量已大到不实用，
+// 通常说明调用方用了一个写死的巨大精度，而不是按量的级计算。
+constexpr int kMaxPrecision = 100000;
+
 // 去除高位的零块，但至少保留一个块表示 0。
 Blk trimBlk(Blk value) {
     while (value.size() > 1 && value.back() == 0) value.pop_back();
@@ -532,6 +536,12 @@ BigDecimal BigDecimal::divide(const BigDecimal& lhs, const BigDecimal& rhs,
                                const Context& context) {
     if (rhs.sign_ == 0) throw std::domain_error("BigDecimal: 除数为零");
     if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    // 上限：precision 直接决定运算量，写死一个巨大值（例如 1000000）会让
+    // 单次除法做十万位运算，实测以分钟计。真正的需求应按量的级给精度，
+    // 而不是靠一个荒谬的上限来"保险"。
+    if (context.precision > kMaxPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出上限");
+    }
     if (lhs.sign_ == 0) return BigDecimal();
 
     // 被除数与除数先对齐到共同的小数位：
@@ -562,6 +572,12 @@ BigDecimal BigDecimal::divide(const BigDecimal& lhs, const BigDecimal& rhs,
 BigDecimal BigDecimal::roundToPrecision(const BigDecimal& value, const Context& context) {
     if (value.sign_ == 0) return value;
     if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    // 上限：precision 直接决定运算量，写死一个巨大值（例如 1000000）会让
+    // 单次除法做十万位运算，实测以分钟计。真正的需求应按量的级给精度，
+    // 而不是靠一个荒谬的上限来"保险"。
+    if (context.precision > kMaxPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出上限");
+    }
 
     // 把精确值表示成分数：numerator/denominator = value。
     // value = digits * 10^-scale，所以分母是 10^scale，分子是 digits。
