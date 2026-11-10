@@ -11,12 +11,20 @@ v3.0 的新代码不引用、不依赖这里的任何代码；本目录中的文
 | 子目录 | 代际 | 来源 | 归档方式 |
 |---|---|---|---|
 | `onlinejudge_calculator/` | 第 1 代（最古老） | `F:\Projects\01_courses\cpp\VSC_C++Project\OnlineJudge\Calculator\` | 复制（原位置保留不动） |
-| `oj_console_edition/` | 第 2 代 | `F:\Projects\01_courses\cpp\CLion\C++Programming\OJ_Calculator Console Edition\` | 复制（原位置保留不动） |
-| `qt_gui_original/` | 第 3 代（最新） | 本仓库原根目录 | `git mv`（保留 git 历史） |
+| `oj_console_edition/` | 第 2 代（Console 形态） | `F:\Projects\01_courses\cpp\CLion\C++Programming\OJ_Calculator Console Edition\` | 复制（原位置保留不动） |
+| `qt_gui_original/` | 第 3 代（Qt GUI 形态） | 本仓库原根目录 | `git mv`（保留 git 历史） |
+
+> 代际编号按**形态**（Console / Qt GUI）而非时间排列，真实时间顺序见下文
+> [5. 谱系结论](#5-谱系结论)。
 
 外部两份命令行版的源码**只复制、不删除**：它们原本就不在 git 内，删除会造成不可逆的
-历史丢失。第 2 代复制时排除了 `cmake-build-debug/` 与 `.idea/`（构建产物与 IDE 配置，
-无归档价值且体积巨大）。
+历史丢失。第 2 代复制时排除了四类内容：`cmake-build-debug/` 与 `.idea/`（构建产物与
+IDE 配置，无归档价值且体积巨大）、`.git/` 与 `.gitignore`。
+
+其中 `.git/` 是**有意排除**的：第 2 代本身就是一个独立的 git 仓库（`git log` 只有
+一条提交 `e408eb8 "chore: track the project files"`）。把一个 `.git` 目录嵌套进另一个
+仓库，会让 git 把归档副本当成子模块 / 嵌套仓库对待，是明确的隐患；因此归档副本只
+保留源码快照，不携带其提交历史。
 
 ---
 
@@ -77,16 +85,43 @@ Check_Zero / Check_Bit       checkZero / checkBit              checkZero / check
 ### 5. 谱系结论
 
 ```
-第 3 代 (Qt GUI, 2024-03)
+第 3 代 (Qt GUI, 2024-02-28 建项)
       │
       │  node.{h,cpp} 逐字节保留 + camelCase 命名 + QString 化
       ▼
-第 2 代 (Console Edition, 2024-03，反向移植)
+第 2 代 (Console Edition, 2024-03-22 ~ 03-23，反向移植)
       │
       │  独立的 node 重构 + PascalCase 命名 + 注释提及"Qt版"
       ▼
-第 1 代 (OnlineJudge, 2024-02，最早)
+第 1 代 (OnlineJudge, 2024-02-15，最早)
 ```
+
+**代际顺序不是按"第 N 代"这个编号递增的**。真实的先后顺序是
+**第 1 代（2024-02-15）→ 第 3 代（2024-02-28 建项）→ 第 2 代（2024-03-22 起）**：
+
+- 第 1 代全部文件的时间戳为 **2024-02-15**（`main.cpp` / `node.*` / `number.*`）；
+- 第 3 代**建项于 2024-02-28** —— `calculator.user` 头部写明
+  `<!-- Written by QtCreator 12.0.2, 2024-02-28T21:05:38. -->`，
+  其界面与资源更早：`res/res.qrc`、`res/ICON.jpg`（2024-02-08）、
+  `dialog_*.ui`（2024-02-11）；
+- 第 2 代全部源码的时间戳落在 **2024-03-22 ~ 03-23**
+  （`main.cpp` 03-22 09:31、`number.cpp` 03-22 15:06、`node.cpp` 03-22 15:12、
+  `node.h` 03-23 18:45、`number.h` 03-23 21:52）。
+
+需要说明的是：第 3 代的**数值核心文件**（`node.*`、`number.*`）本身带有
+2024-03-22 / 03-23 的时间戳 —— 那是反向移植的那次会话同时改动了两侧副本所致
+（第 2、3 代的 `node.cpp` 逐字节相同、时间戳仅相隔 48 秒：
+15:12:44 与 15:13:32）。因此判定第 3 代的建项时间应以其**不会随移植改动的 Qt 工程
+脚手架**为准（`calculator.user` 2024-02-28、`.ui` 2024-02-11、`res/` 2024-02-08），
+这些文件在第 2 代出现前一个月就已存在。
+
+也就是说，**第 2 代晚于第 3 代**，本归档中"第 2 代 / 第 3 代"的编号是按*形态*
+（Console / Qt GUI）而非时间排列的。编号沿用归档目录的既有称谓，以免打乱既有引用。
+
+这一点**强化**了"第 2 代由第 3 代反向移植"的结论：若第 2 代是 Qt 版的**前身**，
+它的时间戳应当**早于** Qt 版；实测恰好相反 —— 第 2 代比第 3 代的 Qt 工程脚手架
+晚了近一个月，只能解释为在 Qt 版完成之后才被移植回命令行形态。第 1 代 `number.h`
+注释中"Qt版参数为待转化的字符串QString类型"的自述，与这一时间线互相印证。
 
 ---
 
@@ -103,13 +138,13 @@ Check_Zero / Check_Bit       checkZero / checkBit              checkZero / check
    `new Number(j)`），常数极大。
 4. **`copy()` / `release()` 双重释放风险** —— 手写链表生命周期，靠 `reset()` 手工
    维护状态，拷贝与释放的顺序一旦出错就会 double free。
-5. **`deleteZero()` 边界** —— 第 3 代在 `Len == Len_frac` 时，`Head->next` 可能越界。
+5. **`deleteZero()` 边界** —— 第二个循环中 `Tail = Tail->prior;` 可能让 `Tail` 变为
+   `nullptr`，随后的 `delete Tail->next` 即为空指针解引用。
 6. **全局静态精度** —— `Number::FracBit` 是静态成员（第 1 代是文件级
    `int FracBit = 10;`），隐式影响所有运算，无法在同一进程内做多精度并存。
 7. **除法舍入判定** —— `if (i == -(FracBit+2))` 的边界条件脆弱。
 8. **资源路径错误** —— `QIcon("://ICON.jpg")` 缺少 `qrc:` 前缀，图标无法加载。
-9. **`get()` 解析负号后的空串** —— 输入 `"-"` 时，`str.erase(0,1)` 后得到空串，
-   随后 `str[0]` 越界访问。
+9. **`get()` 解析负号后的空串** —— 输入 `"-"` 时被**静默接受为 0**，而不是报错。
 
 上述缺陷在 v3.0 重写中逐一消除：改用 base-10⁹ 分块的 `BigDecimal`（无链表、无指针、
 无手动内存管理）、精度下沉为 `Context` 显式参数、解析前置校验。

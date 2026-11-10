@@ -2,9 +2,14 @@
 
 对比对象：本仓库 `legacy/` 下的三份归档实现。
 
-- **第 1 代** = `legacy/onlinejudge_calculator/`（2024-02，原始命令行版）
-- **第 2 代** = `legacy/oj_console_edition/`（2024-03，由第 3 代反向移植）
-- **第 3 代** = `legacy/qt_gui_original/`（2024-03，Qt GUI 版）
+- **第 1 代** = `legacy/onlinejudge_calculator/`（2024-02-15，原始命令行版）
+- **第 2 代** = `legacy/oj_console_edition/`（2024-03-22 ~ 03-23，由第 3 代反向移植）
+- **第 3 代** = `legacy/qt_gui_original/`（2024-02-28 建项，Qt GUI 版）
+
+> **编号按形态而非时间排列**：真实的时间顺序是 第 1 代 → 第 3 代（2024-02-28）→
+> 第 2 代（2024-03-22），即**第 2 代反而晚于第 3 代**。这一"倒置"恰好印证了本文档
+> 主张的"第 2 代由第 3 代反向移植"——若是 Qt 版的前身，第 2 代应当更早。
+> 判定依据见 [`README.md`](README.md#5-谱系结论)。
 
 代际判定依据见 [`README.md`](README.md#代际判定依据)。
 
@@ -18,7 +23,7 @@
 | 输入输出 | `std::string` + 流重载 | `std::string` + 流重载 | `QString` |
 | 除法 | 试商法（`Gap`/`Times` 临时对象） | 试商法 | 试商法 |
 | `node.cpp/h` | 独立 | **与第 3 代逐字节相同**（md5 `45615d3a` / `b67dc507`） | — |
-| 谱系判定 | 注释提及「Qt版参数为待转化的字符串QString类型」→ 先于 Qt 版存在 | 由第 3 代反向移植 | 最新 |
+| 谱系判定 | 注释提及「Qt版参数为待转化的字符串QString类型」→ 先于 Qt 版存在 | 由第 3 代反向移植（时间戳晚于第 3 代） | Qt 版的源头 |
 
 ### 补充说明（与上表等价的逐项展开）
 
@@ -47,9 +52,17 @@ node.h     b67dc5073df0c5ce0882549955c04c69   qt_gui_original
 node.h     fc2f0b612c06ba5a1db429a5419b5e5a   onlinejudge_calculator ← 不同
 ```
 
-第 2 代与第 3 代在 `number.cpp` 上的差异**仅有 4 处**，全部是 Qt 适配：
-`#include <string>`、`get(STR qstr)` 内的 `toStdString()` 转换、`show()` → `showQstr()`、
-`transformSign` 的 `char` → `QChar`，以及删掉两个流重载函数。
+第 2 代与第 3 代在 `number.cpp` 上的差异共 **5 处**（`diff -u` 得到 5 个 hunk），
+全部是 Qt 适配：
+
+1. `number.cpp` 顶部新增 `#include <string>`（第 2 代只在 `number.h` 里包含 `<string>`，
+   第 3 代的 `number.h` 不再包含它，改在 .cpp 中自带）；
+2. `get(STR str)` 改名为 `get(STR qstr)`，并在函数体开头新增
+   `std::string str = qstr.toStdString();` 与 `release();`（Qt 版需要先转换类型，
+   并在重建链表前释放旧数据）；
+3. `show()` 改名为 `showQstr()`（返回类型从 `std::string` 变为 `QString`）；
+4. `transformSign` 的第三参数类型由 `char&` 改为 `QChar&`；
+5. 删除两个流重载函数 `operator<<` 与 `operator>>`（Qt 版改用 `showQstr()` 输出）。
 
 ### 命名演化对照
 
@@ -123,15 +136,44 @@ Number Gap((*this) - getPower(i) * Num2);   // 做差法比较尝试值与被除
 第 3 代 `number.cpp:174-188`：
 
 ```cpp
-while(Head!=nullptr && Head->Data == 0 && Len-Len_frac>1) {
+while(Head!=nullptr && Head->Data == 0 && Len-Len_frac>1) {  // 循环一
     Head = Head->next;
-    delete Head->prior;      // Head 可能已是 nullptr
+    delete Head->prior;
     Head->prior = nullptr;
+    Len--;
+}
+while(Tail!=nullptr && Tail->Data == 0 && Len_frac>0) {      // 循环二
+    Tail = Tail->prior;
+    delete Tail->next;
+    Tail->next = nullptr;
+    Len_frac--;
     Len--;
 }
 ```
 
-当 `Len == Len_frac` 时，`Head->next` 可能越界（`Head` 已被置空后再取 `->next`）。
+**循环一不可达**：其守卫是 `Len-Len_frac>1`，而 `Len == Len_frac` 时该式为 0，
+根本不满足条件，循环体不会执行。因此"当 `Len == Len_frac` 时 `Head->next` 越界"
+的旧描述有误。
+
+**可达的空指针解引用在循环二**：当循环二的条件（`Tail->Data == 0 && Len_frac>0`）
+成立时，`Tail` 可能恰好是链表的**首节点**（`Tail->prior == nullptr`），此时
+`Tail = Tail->prior;` 把它置为 `nullptr`，紧接着的 `delete Tail->next` 即解引用空指针。
+
+实测（第 3 代，`Number::FracBit = 10`）：输入 `0` 与 `0.11` 相乘即崩溃 ——
+乘法结果 `0` 的链表只剩一个节点且 `Len_frac = 1`，`deleteZero()` 的循环二把 `Tail`
+一路退到首节点之外（`nullptr`）后再解引用。
+
+插桩 fuzz 的可达性统计（对 `deleteZero()` 两个循环分别打点，故循环一的可达性
+也已一并验证）：
+
+| 代际 | 随机用例数 | 循环一可达 | 循环二可达（空指针解引用） |
+|---|---:|:---:|:---:|
+| 第 1 代（`Delete_zero`） | 150 万 | 未观察到 | 观察到（19196 次） |
+| 第 2 代 | 240 万 | 未观察到 | 观察到（30722 次） |
+| 第 3 代 | 300 万 | 未观察到 | 观察到（38738 次） |
+
+因此这是**三代共有的同一处缺陷**，而非仅第 3 代独有；且循环一在三代的这批用例中
+均未出现可达的越界/空指针路径。
 
 > v3.0：表示层规范化时统一处理前导/末尾零，不存在原地修改链表的操作。
 
@@ -186,15 +228,29 @@ void Number::get(STR qstr){
     std::string str = qstr.toStdString();
     release();
     Unit = Tail = Head = new Node;
-    if (str[0] == '-') {        // 空串时 str[0] 越界
+    if (str[0] == '-') {        // 注意：此处 str[0] 的求值发生在 erase 之前
         isNegative = true;
         str.erase(0, 1);
     }
 ```
 
-输入 `"-"` 时，`erase(0,1)` 后 `str` 变为空串，但 `str[0]` 在**进入 if 之前**已被求值；
-而 `"-"` 之后的空串在后续 `str.find('.')` / `str.size()` 路径上同样缺乏边界处理。
-第 1 代 `Get()`（`number.cpp:169`）有完全相同的问题。
+**真正的缺陷不是越界访问，而是静默接受**。`str[0]` 的求值发生在 `erase` **之前**，
+此时 `str` 仍非空，因此这一步并不越界；`erase(0,1)` 之后 `str` 变为空串，但代码
+**从不再次索引 `str[0]`** —— 后续走的是 `str.find('.')`（返回 `npos`）与
+`str.size()`（返回 0），二者对空串都是良定义的。
+
+自 C++11 起 `std::string::operator[](size())` 返回 `'\0'`（而非 UB），因此整个过程
+**不会崩溃**。实测（第 3 代与第 1 代一致）：
+
+```
+输入 "-"   → 结果 "0"     // 静默当作 0 接受
+输入 ""    → 结果 "0"
+输入 "-0"  → 结果 "0"
+```
+
+真正的危害是**语义错误**：一个非法的输入被静默转换成了合法的 0，用户无从察觉，
+且 `"-"` 与真正的 `"0"` 在下游完全无法区分。第 1 代 `Get()`（`number.cpp:169`）有
+完全相同的问题。
 
 > v3.0：解析前做完整校验（空串、非法字符、仅符号等），返回明确的错误而非 UB。
 
@@ -208,11 +264,11 @@ void Number::get(STR qstr){
 | 2 `operator-` 递归借位 | ✓ | ✓ | ✓ |
 | 3 `operator/` 试商法 | ✓ | ✓ | ✓ |
 | 4 `copy()`/`release()` 双重释放风险 | ✓（无拷贝构造，更原始） | ✓ | ✓ |
-| 5 `deleteZero()` 边界 | ✓（`Delete_zero`） | ✓ | ✓ |
+| 5 `deleteZero()` 边界 | ✓（`Delete_zero`，空指针解引用） | ✓（空指针解引用） | ✓（空指针解引用） |
 | 6 全局静态精度 | ✓（文件级全局变量） | ✓ | ✓ |
 | 7 除法舍入判定 | ✓ | ✓ | ✓ |
 | 8 资源路径错误 | 不适用 | 不适用 | ✓ |
-| 9 `get()` 解析负号后的空串 | ✓（`Get`） | ✓ | ✓ |
+| 9 `get()` 解析负号后的空串 | ✓（`Get`，静默接受为 0） | ✓（静默接受为 0） | ✓（静默接受为 0） |
 
 三代的核心数值算法是**同一份代码的三次复制**，缺陷也随复制传播 —— 这正是 v3.0
 重写的根本理由：三代积累下来的不是能力，而是同一批 bug 的三个副本。

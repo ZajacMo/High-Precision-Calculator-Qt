@@ -1,6 +1,7 @@
 // 极简测试框架：无外部依赖，单文件聚合运行，便于在任意工具链下执行。
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <string>
