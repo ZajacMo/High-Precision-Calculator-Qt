@@ -2481,6 +2481,12 @@ cp "$S/Json.h" "$S/Json.cpp" "$S/HttpServer.h" "$S/HttpServer.cpp" src/core/
 > 与兄弟项目不再同步；差异是允许的。若要更新，以兄弟项目
 > `https://github.com/ZajacMo/Comprehensive-Calculation-Tool` 的 main 分支为准。
 > 本任务开始前应重新核对下文列出的 API 签名是否仍然成立。
+>
+> **服务端生命周期**（据兄弟项目 2026-11-10 反馈）：`stop()` 会把监听套接字置为
+> 已关闭状态，`m_socketClosed` 在 `listen()` 中重置，因此**同一个 `Server` 对象
+> 可以 start → stop → start**；但每次 `start()` 之间不能复用已关闭的句柄。
+> `stop()` 内部会 join 线程，正常路径下无残留。本项目的端到端测试若要反复启停，
+> 每次 `start()` 前确认没有残留线程即可。
 
 改命名空间：`namespace calc` → `namespace hpc`，`namespace calc::json` → `namespace hpc::json`，
 `namespace calc::http` → `namespace hpc::http`。同时把 `Json.h` 里的
