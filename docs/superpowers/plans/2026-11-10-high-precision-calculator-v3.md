@@ -4,7 +4,7 @@
 
 **Goal:** 把三份散落的高精度计算器实现合并为一个项目，产出零依赖 C++17 内核 + CLI + Web 前端 + 可选 Qt 界面，并附 Python `decimal` 差分测试作为正确性基准。
 
-**Architecture:** 沿用兄弟项目 `VS_C++Project/综合计算工具` 已验证的 v2.1「自包含内核 + Web 前端」架构。核心 `src/core/` 纯 C++17 零依赖；`BigDecimal` 采用 base-10⁹ 分块，精确运算不带精度参数、除法与超越函数接受显式 `Context`。三代原始实现保留到 `legacy/`。
+**Architecture:** 沿用兄弟项目 `VS_C++Project/Comprehensive-Calculation-Tool` 已验证的 v2.1「自包含内核 + Web 前端」架构。核心 `src/core/` 纯 C++17 零依赖；`BigDecimal` 采用 base-10⁹ 分块，精确运算不带精度参数、除法与超越函数接受显式 `Context`。三代原始实现保留到 `legacy/`。
 
 **Tech Stack:** C++17（MSVC 14.44 / MinGW g++ 11.2）、CMake 3.21+、Ninja、Qt 6.6.2（仅 GUI 目标）、Python 3（仅差分测试与端到端测试）、原生 HTML/CSS/JS（Web 前端，无 npm）
 
@@ -110,7 +110,7 @@ rm -rf legacy/oj_console_edition/cmake-build-debug legacy/oj_console_edition/.id
 
 - [ ] **Step 2: 写 `tests/test_framework.h`**
 
-从 `F:\Projects\01_courses\cpp\VS_C++Project\综合计算工具\tests\test_framework.h` 原样复制（零依赖单文件框架，已验证可用）。
+从 `F:\Projects\01_courses\cpp\VS_C++Project\Comprehensive-Calculation-Tool\tests\test_framework.h` 原样复制（零依赖单文件框架，已验证可用）。
 
 - [ ] **Step 3: 写 `tests/tst_main.cpp`**
 
@@ -2452,7 +2452,7 @@ git commit -m "feat(cli): 交互/单次/OJ 三模式命令行前端"
 - [ ] **Step 1: 复制 Json 与 HttpServer 到 `src/core/`**
 
 ```bash
-S="/f/Projects/01_courses/cpp/VS_C++Project/综合计算工具/src/core"
+S="/f/Projects/01_courses/cpp/VS_C++Project/Comprehensive-Calculation-Tool/src/core"
 cp "$S/Json.h" "$S/Json.cpp" "$S/HttpServer.h" "$S/HttpServer.cpp" src/core/
 ```
 
@@ -3469,7 +3469,7 @@ if __name__ == '__main__':
 
 - [ ] **Step 4: 写 `.github/workflows/build.yml`**
 
-照抄兄弟项目 `综合计算工具/.github/workflows/build.yml`，改为本项目的目标名
+照抄兄弟项目 `Comprehensive-Calculation-Tool/.github/workflows/build.yml`，改为本项目的目标名
 （`hpc_core` / `hpc_cli` / `hpc_server` / `hpc_tests` / `gui_smoke`），
 并在 core 作业中追加差分测试步骤：
 
