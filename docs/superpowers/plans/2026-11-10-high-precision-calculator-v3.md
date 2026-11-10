@@ -59,8 +59,13 @@ cpp/QtProject/calculator/
 │   └── screenshot.py           headless Edge 截图
 ├── docs/
 │   ├── architecture.md
-│   ├── bignum-algorithms.md
-│   └── legacy/COMPARISON.md
+│   └── bignum-algorithms.md
+├── legacy/                    三代原始实现存档
+│   ├── README.md              来源与谱系判定
+│   ├── COMPARISON.md          三代逐项对比与缺陷清单
+│   ├── qt_gui_original/       第 3 代（Qt GUI）
+│   ├── onlinejudge_calculator/ 第 1 代（最老，命令行）
+│   └── oj_console_edition/    第 2 代（命令行）
 └── .github/workflows/build.yml CI
 ```
 
@@ -90,7 +95,7 @@ cpp/QtProject/calculator/
 
 ```bash
 cd <worktree>
-mkdir -p src/core src/cli src/api src/server src/ui web tests scripts docs/legacy
+mkdir -p src/core src/cli src/api src/server src/ui web tests scripts docs
 mkdir -p legacy/qt_gui_original legacy/onlinejudge_calculator legacy/oj_console_edition
 
 # Qt GUI 原版整体移入 legacy
@@ -3340,11 +3345,13 @@ git commit -m "feat(ui): Qt 桌面界面与离屏冒烟测试"
 
 **Files:**
 - Create: `.github/workflows/build.yml`
-- Create: `scripts/run-ctest.bat`
+- Create: `scripts/run-ctest.bat`（Task 1 已建最小版本，本任务补齐/覆盖）
 - Create: `scripts/difftest.py`
 - Create: `docs/architecture.md`
 - Create: `docs/bignum-algorithms.md`
-- Modify: `README.md`、`README_CN.md`（重写）
+- Create: `README.md`（新写。注意：Task 1 已把原 `README.md`/`README_CN.md` 移到
+  `legacy/qt_gui_original/`，仓库根目录现在没有 README，需要新建而不是修改）
+- Create: `README_CN.md`（同上）
 
 **Interfaces:**
 - Consumes: 全部前置任务
