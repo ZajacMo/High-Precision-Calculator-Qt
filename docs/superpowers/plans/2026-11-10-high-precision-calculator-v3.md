@@ -146,6 +146,12 @@ int main() {
 ```cmake
 cmake_minimum_required(VERSION 3.21)
 
+# 单配置生成器（Ninja/Makefiles）下 project() 会把 CMAKE_BUILD_TYPE 初始化为
+# Debug，因此默认值必须在 project() 之前设置，否则下面的判断永远不成立。
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 project(HighPrecisionCalculator
     VERSION 3.0.0
     DESCRIPTION "高精度计算器 — 任意精度十进制内核、命令行、Web 前端与 Qt 界面"
@@ -154,10 +160,6 @@ project(HighPrecisionCalculator
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
-endif()
 
 option(BUILD_GUI    "构建 Qt 图形界面（需要 Qt 6）" OFF)
 option(BUILD_CLI    "构建命令行界面"              ON)
@@ -197,6 +199,11 @@ if(BUILD_TESTS)
     )
     target_link_libraries(hpc_tests PRIVATE hpc_core)
     target_include_directories(hpc_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    if(MSVC)
+        # /utf-8 不可省略：MSVC 默认按 GBK 代码页解析源文件，
+        # 测试文件含中文注释时会报 C4819 并导致宏展开被截断。
+        target_compile_options(hpc_tests PRIVATE /W4 /utf-8)
+    endif()
     add_test(NAME hpc_tests COMMAND hpc_tests)
 endif()
 ```
