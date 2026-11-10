@@ -15,6 +15,10 @@
 - **CMake 最低版本 3.21**，C++ 标准固定 `CMAKE_CXX_STANDARD 17`、`CXX_STANDARD_REQUIRED ON`、`CXX_EXTENSIONS OFF`。
 - **命名空间**：核心库用 `hpc`；JSON 子模块 `hpc::json`；HTTP 子模块 `hpc::http`。
 - **精度不得使用全局静态变量**：`+ - *` 不接受 `Context` 参数；除法与超越函数必须显式接收 `Context`。
+- **结构安全优先于输入校验**：legacy 的两条崩溃缺陷（#5 `deleteZero()` 循环二、
+  #10 除法舍入分支）同源 —— 都是「`->prior` 回退时假定链表不止一个节点」。
+  v3.0 的任何代码都不得依赖链表长度假设；单节点/空集合必须安全。
+  输入校验（如 `precision <= 0`）是第二道防线，不能替代结构安全。
 - **提交粒度**：每个 Task 结束时提交一次，提交信息用中文并遵循 `feat:` / `fix:` / `docs:` / `chore:` 前缀。
 - **本机工具链**（已验证存在）：MSVC `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207`、Win SDK `10.0.26100.0`、Qt `C:\Qt\6.6.2\msvc2019_64`、CMake `C:\Qt\Tools\CMake_64\bin`、Ninja `C:\Qt\Tools\Ninja`。
 - **构建脚本必须复用** `scripts\msvc-env.bat`（含 Win SDK `bin\<ver>\x64`，否则 `rc.exe`/`mt.exe` 缺失导致 CMake try-compile 失败）。
@@ -971,6 +975,16 @@ BigDecimal BigDecimal::modulo(const BigDecimal& lhs, const BigDecimal& rhs) {
 ```
 
 `roundToPrecision` —— **用字符串级实现**，避免块边界与舍入位的交互错误：
+
+> **设计要点（来自 legacy 缺陷 #5 与 #10 的共同根因）**：这两条缺陷同源 ——
+> 都是「用 `->prior` 向前走时，假定链表不止一个节点」：
+> #5 是 `deleteZero()` 的循环二（`0 * 0.11` → SIGSEGV），
+> #10 是除法收尾的舍入分支（`FracBit == 0` 且 `start == -2` → SIGSEGV）。
+> #5 的修复使结果退化为**单节点链表**，#10 随后对单节点链表做了同样的错误假设。
+>
+> 因此 v3.0 的舍入步骤必须**结构上安全**，而不仅仅是校验 `precision`：
+> 本实现走字符串级路径，**完全不做 `->prior` 回退**，单节点/空链表都安全。
+> `precision <= 0` 的校验是第二道防线（实测 `precision >= 1` 即安全）。
 
 ```cpp
 // 舍入到 context.precision 位有效数字。
