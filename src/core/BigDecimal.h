@@ -134,8 +134,9 @@ private:
     static BigDecimal decomposeForLog(const BigDecimal& value, int& exponent, int& halvings);
 
     // ln(2) 与 ln(10)：按 work 精度**实时计算**（硬编码常量在高精度下不够用）。
+    // ln2 由调用方传入 —— 一次运算里 ln(2) 会被用到好几处。
     static BigDecimal ln2Constant(const Context& work);
-    static BigDecimal ln10Constant(const Context& work);
+    static BigDecimal ln10Constant(const BigDecimal& ln2, const Context& work);
 
     // 超越函数的内部实现：work 是工作精度（含保护位），final 是最终舍入上下文。
     static BigDecimal expInternal(const BigDecimal& value, const Context& work,

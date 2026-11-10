@@ -850,8 +850,10 @@ BigDecimal BigDecimal::ln2Constant(const Context& work) {
 // ln(10)：按 work 精度实时计算。
 //
 // ln(10) = 3*ln(2) + ln(5/4)，其中 ln(5/4) = 2*atanh(1/9)。
-BigDecimal BigDecimal::ln10Constant(const Context& work) {
-    const BigDecimal ln2 = ln2Constant(work);
+//
+// ln2 由调用方传入：一次 ln 运算里 ln(2) 会被用到好几处，
+// 重算一遍 atanh 级数的代价不小。
+BigDecimal BigDecimal::ln10Constant(const BigDecimal& ln2, const Context& work) {
     const BigDecimal z = divide(BigDecimal(1), BigDecimal(9),
                                 Context{work.precision, RoundingMode::HalfEven});
     const BigDecimal lnOneAndAQuarter = multiplyByTwo(atanhSeries(z, work));
@@ -902,7 +904,7 @@ BigDecimal BigDecimal::expInternal(const BigDecimal& value, const Context& work,
     const int extraDigits = std::max(2, std::abs(magnitude) + 5);
     const Context precise{work.precision + extraDigits, RoundingMode::HalfEven};
 
-    const BigDecimal ln10 = ln10Constant(precise);
+    const BigDecimal ln10 = ln10Constant(ln2Constant(precise), precise);
 
     // k = floor(x / ln10)。除法要更高精度，否则 k 的整数部分可能因
     // 末位舍入而差 1 —— 那会让 g 从 0 跳到 ln10，级数慢一个量级。
@@ -980,7 +982,7 @@ BigDecimal BigDecimal::lnInternal(const BigDecimal& value, const Context& work) 
     //
     // 这里 e*ln(10) 与 ln(m) 的**相对**误差都约 10^-precision，
     // 且两者量级可比（|e*ln10| >= ln10 > |ln(m)|），所以没有抵消放大。
-    result = result + ln10Constant(work) * BigDecimal(exponent);
+    result = result + ln10Constant(ln2, work) * BigDecimal(exponent);
     return result;
 }
 
@@ -995,7 +997,8 @@ BigDecimal BigDecimal::log10Internal(const BigDecimal& value, const Context& wor
 
     const BigDecimal half = BigDecimal::fromString("0.5");
     const BigDecimal two(2);
-    const BigDecimal ln10 = ln10Constant(work);
+    const BigDecimal ln2 = ln2Constant(work);
+    const BigDecimal ln10 = ln10Constant(ln2, work);
 
     // 路径 1：靠近 1 的直接展开。
     if (value.compare(half) >= 0 && value.compare(two) <= 0) {
@@ -1012,7 +1015,6 @@ BigDecimal BigDecimal::log10Internal(const BigDecimal& value, const Context& wor
     int halvings = 0;
     const BigDecimal mantissa = decomposeForLog(value, exponent, halvings);
 
-    const BigDecimal ln2 = ln2Constant(work);
     const BigDecimal z = divide(mantissa - one, mantissa + one,
                                 Context{work.precision, RoundingMode::HalfEven});
     // ln(尾数) = halvings*ln(2) + 2*atanh(z)
