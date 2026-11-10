@@ -254,36 +254,64 @@ void Number::get(STR qstr){
 
 > v3.0：解析前做完整校验（空串、非法字符、仅符号等），返回明确的错误而非 UB。
 
-### 10. 除法在 `FracBit = 0` 时崩溃（可复现的空指针解引用）
+### 10. 除法在精度为 0 且 `start == -2` 时崩溃（可复现的空指针解引用）
 
-第 2 代 `number.cpp:40-45`（第 3 代同）：
+第 2 代 `number.cpp:43-45`（第 1 代 `:53-55`、第 3 代 `:44-46` 同构）：
 
 ```cpp
-result.Tail = result.Tail->insertAfter(j);   // 追加试商结果
-result.Len++ ;
-if(i < 0)
-    result.Len_frac++;
-else if(i == 0)
-    result.Unit=result.Tail;                  // 确定个位
+if (i == -(FracBit+2)) {                    // 若精度超过预设值
+    result.Tail = result.Tail->prior;        // ← 退到链表首节点之外，得到 nullptr
+    if (result.Tail->next->Data >= 5)       // ← 崩溃点：解引用 nullptr->next
+        result.Tail->Data++;
 ```
 
-试商循环的边界是 `for( i = start ; i >= - ( FracBit + 1 ) ; i-- )`。当
-**`FracBit == 0`** 时，循环区间退化为 `i >= -1`，而 `start` 通常大于 0，
-于是 `i` 会一路减到 `-1` 并继续走出循环体；此时 `result.Tail` 可能已指向链表首节点，
-再执行 `result.Tail = result.Tail->prior` 就得到 `nullptr`，
-随后的 `result.Tail->Data++` 解引用空指针。
+**触发条件比"精度为 0"更窄**：必须同时满足 `FracBit == 0` **且**
+`start == -(FracBit+2)`（即 `start == -2`）。
 
-实测（第 2 代，`Number::FracBit = 0`，输入 `-02.881332` 与 `0474` 相除）：
+成因链条（由插桩 trace 逐步确认）：
+
+1. `FracBit == 0` 时，试商循环的边界退化为 `for( i = start ; i >= -1 ; i-- )`。
+2. 若 `start == -2`，该条件**一开始就为假** —— 循环体**一次都没有执行**，
+   `i` 停在 `-2`，`result` 仍是刚构造的单节点 `Number(0)`，其 `Tail == Head`。
+3. 循环后的 `if (i == -(FracBit+2))` 恰好命中（`-2 == -2`），进入舍入分支。
+4. `result.Tail = result.Tail->prior` —— 单节点链表的首节点 `prior` 为 `nullptr`，
+   于是 `result.Tail` 被置为 `nullptr`。
+5. **紧随其后的** `result.Tail->next->Data` 解引用空指针 → SIGSEGV。
+   （`result.Tail->Data++` 那一行根本执行不到。）
+
+插桩 trace（实测输出，第 2 代，`FracBit = 0`，输入 `-02.881332` ÷ `0474`）：
 
 ```
-RUN_EXIT=139        // SIGSEGV
+[div] Len=7 Len_frac=6 Num2.Len=3 start=-2 bound=-1
+[div] after loop: i=-2 rounding-branch=1 tail==head=1
+[div] rounding branch entered; result.Tail->prior=0000000000000000
+[div] after walk: result.Tail=0000000000000000
 ```
 
-`FracBit` 是**全局静态成员**，而 GUI 的「设置精度」对话框允许把它设为 0
-（`dialog_setbit.cpp` 中只校验 `bit < 0`），因此这条路径在真实使用中可达。
+注意 trace 中**没有** "loop body ran" 一行 —— 印证了「循环体从未执行」。
+
+实测崩溃（三代均复现，退出码 139 = SIGSEGV）：
+
+```
+第 1 代：exit 139   （已用 Gen-1 源码独立复现）
+第 2 代：exit 139
+```
+
+**触发范围确实很窄**：同样在 `FracBit = 0` 下，`1/2`、`1/3`、`100/7`、`1/1000`、
+`12.34/56`、`5/2`、`10/4` 全部正常退出（exit 0），只有 `start == -2` 的输入崩溃
+（如 `1.5/474`、`2.5/474`）。用 `FracBit = 1,2,3,4` 重跑同样的输入也都不崩。
+
+**与缺陷 #5 同源**：两者都是「`->prior` 向前走时假定链表不止一个节点」——
+#5 是 `deleteZero()` 的循环二，#10 是除法收尾的舍入分支。#5 的修复使
+`result` 退化为单节点，#10 随后对这个单节点链表做了同样的错误假设。
+
+**GUI 可达性**：`FracBit` 是全局静态成员，而「设置精度」对话框只校验 `bit < 0`
+（`dialog_setbit.cpp:20`），`mainwindow.cpp:94-95` 又在 `frac_bit >= 0` 时直接写入
+`Number::FracBit`，所以 0 确实会被放行。
 
 > v3.0：精度通过 `Context` 显式传入，且 `precision <= 0` 时直接拒绝
 > （抛 `std::invalid_argument`），从根上消除「精度为 0」这一非法状态。
+> 实测 `FracBit = 1` 起即安全，故 `precision >= 1` 是正确的下界。
 
 ---
 
@@ -300,7 +328,7 @@ RUN_EXIT=139        // SIGSEGV
 | 7 除法舍入判定 | ✓ | ✓ | ✓ |
 | 8 资源路径错误 | 不适用 | 不适用 | ✓ |
 | 9 `get()` 解析负号后的空串 | ✓（`Get`，静默接受为 0） | ✓（静默接受为 0） | ✓（静默接受为 0） |
-| 10 除法在 `FracBit = 0` 时崩溃 | ✓ | ✓（实测 SIGSEGV） | ✓ |
+| 10 除法在 `FracBit = 0` 且 `start == -2` 时崩溃 | ✓（实测 SIGSEGV） | ✓（实测 SIGSEGV） | ✓ |
 
 三代的核心数值算法是**同一份代码的三次复制**，缺陷也随复制传播 —— 这正是 v3.0
 重写的根本理由：三代积累下来的不是能力，而是同一批 bug 的三个副本。
