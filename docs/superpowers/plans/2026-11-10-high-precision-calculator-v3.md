@@ -220,11 +220,17 @@ namespace hpc { }
 int main() { return 0; }
 ```
 
-`tests/tst_bigdecimal.cpp`、`tst_format.cpp`、`tst_expression.cpp` 各放一个空测试：
+`tests/tst_bigdecimal.cpp`、`tst_format.cpp`、`tst_expression.cpp` 各放一个**验证测试框架本身接线正确**的用例
+（断言真实行为，而非空断言占位）：
 
 ```cpp
 #include "test_framework.h"
-TEST(placeholder, todo) { CHECK(true); }
+
+// 占位：Task 2/5/6 起替换为真实用例。此处验证测试框架接线正确。
+TEST(placeholder, frameworkIsWired) {
+    CHECK_EQ(1 + 1, 2);
+    CHECK(std::string("abc") == "abc");
+}
 ```
 
 - [ ] **Step 7: 写 `legacy/README.md` 与 `legacy/COMPARISON.md`**
