@@ -78,8 +78,10 @@ public:
     BigDecimal operator+(const BigDecimal&) const;
     BigDecimal operator-(const BigDecimal&) const;
     BigDecimal operator*(const BigDecimal&) const;
-    // 不精确运算：需要显式精度
-    BigDecimal operator/(const BigDecimal&, const Context&) const;
+    // 不精确运算：需要显式精度。
+    // 除法用静态形式而非运算符重载 —— 二元运算符不能带 Context 参数
+    // （MSVC 报 C2804），且静态形式对「精度是第二个操作数」更贴切。
+    static BigDecimal divide(const BigDecimal&, const BigDecimal&, const Context&);
 
     static BigDecimal sqrt(const BigDecimal&, const Context&);
     static BigDecimal pow (const BigDecimal&, const BigDecimal&, const Context&);

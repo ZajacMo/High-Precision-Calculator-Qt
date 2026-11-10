@@ -836,8 +836,9 @@ git commit -m "feat(core): BigDecimal 表示层与精确四则运算"
 **Interfaces:**
 - Consumes: Task 2 的 `BigDecimal`、`Context`、`RoundingMode`
 - Produces:
-  - `BigDecimal operator/(const BigDecimal& other, const Context& context) const`（除零抛 `std::domain_error`）
-  - `static BigDecimal divide(const BigDecimal& lhs, const BigDecimal& rhs, const Context& context)`
+  - `static BigDecimal divide(const BigDecimal& lhs, const BigDecimal& rhs, const Context& context)`（除零抛 `std::domain_error`）
+    —— **不要写 `operator/`**：二元运算符不能带 `Context` 参数（MSVC 报 C2804）。
+    精度是第二个操作数，用静态形式更贴切。
   - `static BigDecimal modulo(const BigDecimal& lhs, const BigDecimal& rhs)`（除零抛 `std::domain_error`）
   - `static BigDecimal floor(const BigDecimal&, const Context&)`、`ceil`、`round`（HalfEven）
   - 私有：`static BigDecimal roundToPrecision(const BigDecimal&, const Context&)`
@@ -850,7 +851,7 @@ git commit -m "feat(core): BigDecimal 表示层与精确四则运算"
 ```cpp
     // 不精确运算：必须显式给出精度。
     // 除数为零时抛出 std::domain_error。
-    BigDecimal operator/(const BigDecimal& other, const Context& context) const;
+    // 只提供静态 divide —— 不要写 operator/：二元运算符不能带 Context 参数。
     static BigDecimal divide(const BigDecimal& lhs, const BigDecimal& rhs, const Context& context);
 
     // 取余：lhs - trunc(lhs/rhs) * rhs。除数为零时抛出 std::domain_error。
@@ -941,30 +942,38 @@ BigDecimal BigDecimal::divide(const BigDecimal& lhs, const BigDecimal& rhs, cons
     // 多算两位用于判断进位，保证舍入正确。
     const int guard = context.precision + 2;
 
-    // 被除数放大 divisor.scale_ 位以消去除数的小数位；
-    // 再放大 guard 位以保留足够的小数位。
+    // 把分子分母对齐到**共同的小数位**后再相除。
+    //
+    // 不要在这里额外乘 10^rhs.scale_ —— 那会与下面的
+    // result.scale_ = lhs.scale_ - rhs.scale_ + guard 重复计算，
+    // 使结果整整大 10 倍（1/0.5 会得到 20 而不是 2）。
+    const int commonScale = lhs.scale_ > rhs.scale_ ? lhs.scale_ : rhs.scale_;
     Blk numerator = lhs.digits_;
-    for (int i = 0; i < rhs.scale_; ++i) {
+    for (int i = 0; i < commonScale - lhs.scale_; ++i) {
         numerator = mulBlk(numerator, Blk{10});
     }
+    Blk denominator = rhs.digits_;
+    for (int i = 0; i < commonScale - rhs.scale_; ++i) {
+        denominator = mulBlk(denominator, Blk{10});
+    }
+    // 再放大 guard 位以保留足够的小数位。
     for (int i = 0; i < guard; ++i) {
         numerator = mulBlk(numerator, Blk{10});
     }
 
-    const auto divided = divideBlk(numerator, rhs.digits_);
+    const auto divided = divideBlk(numerator, denominator);
 
     BigDecimal result;
     result.digits_ = divided.first;
-    result.scale_ = lhs.scale_ - rhs.scale_ + guard;
+    result.scale_ = guard;   // 分子分母已对齐到 commonScale，商的小数位就是 guard
     result.sign_ = lhs.sign_ * rhs.sign_;
     result.normalize();
 
     return roundToPrecision(result, context);
 }
 
-BigDecimal BigDecimal::operator/(const BigDecimal& other, const Context& context) const {
-    return divide(*this, other, context);
-}
+// 注意：不要提供 operator/ —— 二元运算符不能带 Context 参数（MSVC 报 C2804）。
+// 除法一律走 static divide(lhs, rhs, context)。
 
 BigDecimal BigDecimal::modulo(const BigDecimal& lhs, const BigDecimal& rhs) {
     if (rhs.sign_ == 0) throw std::domain_error("BigDecimal: 取余的除数为零");
