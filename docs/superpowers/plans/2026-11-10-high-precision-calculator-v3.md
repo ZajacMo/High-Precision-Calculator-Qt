@@ -2476,10 +2476,49 @@ S="/f/Projects/01_courses/cpp/VS_C++Project/Comprehensive-Calculation-Tool/src/c
 cp "$S/Json.h" "$S/Json.cpp" "$S/HttpServer.h" "$S/HttpServer.cpp" src/core/
 ```
 
+> **注意**：兄弟项目会独立演进（其 `Json.*` / `HttpServer.*` 已在 2026-11-10 前后
+> 修改过 socket 所有权与 `stop()`/`serve()` 逻辑）。本项目持有**独立副本**，
+> 与兄弟项目不再同步；差异是允许的。若要更新，以兄弟项目
+> `https://github.com/ZajacMo/Comprehensive-Calculation-Tool` 的 main 分支为准。
+> 本任务开始前应重新核对下文列出的 API 签名是否仍然成立。
+
 改命名空间：`namespace calc` → `namespace hpc`，`namespace calc::json` → `namespace hpc::json`，
 `namespace calc::http` → `namespace hpc::http`。同时把 `Json.h` 里的
 `#include "Numeric.h"` 删除（Json 不需要 Numeric）。`HttpServer.cpp` 里的 Winsock
 初始化代码保留原样（已在兄弟项目验证可用）。
+
+**已核实的 API（2026-11-10 于兄弟项目源码确认，复制后请再核对一遍）**：
+
+```cpp
+// Json.h
+bool parse(const std::string& text, Value& out, std::string& error);   // 自由函数，返回 bool
+using json::Object;   // std::map<std::string, Value>
+using json::Value;
+Value::dump() const;
+const Value* Value::find(const std::string& key) const;   // 返回指针，不存在则为 nullptr
+const Object& Value::asObject() const;
+std::string Value::asString(const std::string& fallback = std::string()) const;
+double Value::asNumber(double fallback = 0.0) const;
+bool Value::isString() const;
+bool Value::isNumber() const;
+bool Value::isObject() const;
+
+// HttpServer.h
+using Handler = std::function<Response(const Request&)>;
+void route(const std::string& path, Handler handler);
+void serveStatic(const std::string& prefix, const std::string& directory);
+bool start(const std::string& host = "127.0.0.1", int port = 8080);
+bool running() const;
+int boundPort() const;
+void stop();
+// 路由只按 path 匹配，不区分 method —— 因此 POST 也能命中同一路由。
+
+// Response 静态构造
+static Response json(const std::string& body, int status = 200);
+static Response error(int status, const std::string& message);
+static Response html(const std::string& body, int status = 200);
+static Response text(const std::string& body, int status = 200);
+```
 
 - [ ] **Step 2: 在 `CMakeLists.txt` 加入 server 与 api 目标**
 
@@ -2540,32 +2579,10 @@ void registerApiRoutes(Server& server, const std::string& webRoot);
 
 - [ ] **Step 4: 写 `src/api/ApiRoutes.cpp`**
 
-**已核实的兄弟项目 API（不要自行猜测签名）：**
-
-```cpp
-// HttpServer.h
-using Handler = std::function<Response(const Request&)>;
-void route(const std::string& path, Handler handler);
-void serveStatic(const std::string& prefix, const std::string& directory);
-bool start(const std::string& host = "127.0.0.1", int port = 8080);
-bool running() const;
-int boundPort() const;
-void stop();
-// 路由只按 path 匹配，不区分 method —— 因此 POST 也能命中同一路由。
-
-// Json.h
-bool parse(const std::string& text, Value& out, std::string& error);   // 自由函数，返回 bool
-using json::Object;   // std::map<std::string, Value>
-using json::Value;
-Value::dump() const;
-const Value* Value::find(const std::string& key) const;   // 返回指针，不存在则为 nullptr
-const Object& Value::asObject() const;
-std::string Value::asString(const std::string& fallback = std::string()) const;
-double Value::asNumber(double fallback = 0.0) const;
-bool Value::isString() const;
-bool Value::isNumber() const;
-bool Value::isObject() const;
-```
+**已核实的兄弟项目 API（不要自行猜测签名）：** 见 Step 1 末尾的「已核实的 API」清单
+（`Json::parse` 是返回 `bool` 的自由函数；`Value::find` 返回指针；`HttpServer::route`
+按 path 匹配、不区分 method；服务端生命周期是 `start()` / `running()` / `boundPort()` /
+`stop()`，**没有 `run()`**）。
 
 `Request` 含 `method`、`path`、`query`、`queryParams`、`headers`、`body` 六个字段；
 POST 请求体已由 `HttpServer` 按 `Content-Length` 读入 `request.body`。
