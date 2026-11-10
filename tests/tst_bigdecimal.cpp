@@ -166,3 +166,294 @@ TEST(equals_, value) {
     CHECK(!BigDecimal::fromString("1.0").equals(BigDecimal::fromString("1.1")));
     CHECK(BigDecimal::fromString("0").equals(BigDecimal::fromString("-0")));
 }
+
+// --- Task 3：除法、舍入与 Context ---
+//
+// Context::precision 是**有效数字位**（与 Python decimal 的 prec 同义），
+// 不是小数位数。
+
+namespace {
+
+using hpc::Context;
+using hpc::RoundingMode;
+
+BigDecimal div(const std::string& a, const std::string& b, int precision,
+               RoundingMode mode = RoundingMode::HalfEven) {
+    return BigDecimal::divide(BigDecimal::fromString(a), BigDecimal::fromString(b),
+                               Context{precision, mode});
+}
+
+}  // namespace
+
+TEST(divide, basic) {
+    CHECK_EQ(div("10", "4", 10).toString(), std::string("2.5"));
+    CHECK_EQ(div("1", "2", 10).toString(), std::string("0.5"));
+    CHECK_EQ(div("7", "1", 10).toString(), std::string("7"));
+}
+
+TEST(divide, repeating) {
+    // 1/7 = 0.142857142857... 保留 10 位有效数字
+    CHECK_EQ(div("1", "7", 10).toString(), std::string("0.1428571429"));
+    CHECK_EQ(div("2", "3", 10).toString(), std::string("0.6666666667"));
+}
+
+TEST(divide, significant_digits_not_decimal_places) {
+    // 精度是**有效数字位**：整数部分会占掉有效数字位。
+    CHECK_EQ(div("100", "7", 10).toString(), std::string("14.28571429"));
+    CHECK_EQ(div("1", "7", 3).toString(), std::string("0.143"));
+    // 精度 1 时只剩 1 位有效数字。
+    CHECK_EQ(div("1", "7", 1).toString(), std::string("0.1"));
+    CHECK_EQ(div("100", "7", 1).toString(), std::string("10"));
+    // 精度 1000 也不能丢位：1/7 要给到 1000 位有效数字。
+    const std::string big = div("1", "7", 1000).toString();
+    CHECK_EQ(big.substr(0, 22), std::string("0.14285714285714285714"));
+    CHECK_EQ(big.size(), std::size_t(1002));   // "0." + 1000 位
+}
+
+TEST(divide, divide_by_zero) {
+    bool threw = false;
+    try {
+        div("1", "0", 10);
+    } catch (const std::domain_error&) { threw = true; }
+    CHECK(threw);
+
+    threw = false;
+    try {
+        BigDecimal::modulo(BigDecimal::fromString("1"), BigDecimal::fromString("0"));
+    } catch (const std::domain_error&) { threw = true; }
+    CHECK(threw);
+}
+
+TEST(divide, invalid_precision) {
+    bool threw = false;
+    try {
+        div("1", "3", 0);
+    } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+
+    threw = false;
+    try {
+        div("1", "3", -1);
+    } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+}
+
+TEST(divide, zero_dividend) {
+    CHECK_EQ(div("0", "7", 10).toString(), std::string("0"));
+    CHECK_EQ(div("0", "0.000001", 10).toString(), std::string("0"));
+    // 0 除以 0 仍然要抛除零错误。
+    bool threw = false;
+    try { div("0", "0", 10); } catch (const std::domain_error&) { threw = true; }
+    CHECK(threw);
+}
+
+TEST(divide, negative_operands) {
+    CHECK_EQ(div("-1", "7", 10).toString(), std::string("-0.1428571429"));
+    CHECK_EQ(div("1", "-7", 10).toString(), std::string("-0.1428571429"));
+    CHECK_EQ(div("-1", "-7", 10).toString(), std::string("0.1428571429"));
+}
+
+TEST(divide, fractional_operands) {
+    // 除数带小数位时不能多出一个 10^b（brief 原实现会算成 20）。
+    CHECK_EQ(div("1", "0.5", 10).toString(), std::string("2"));
+    CHECK_EQ(div("0.5", "0.25", 10).toString(), std::string("2"));
+    CHECK_EQ(div("1", "2.5", 10).toString(), std::string("0.4"));
+    CHECK_EQ(div("3", "0.5", 10).toString(), std::string("6"));
+}
+
+TEST(divide, magnitude_far_from_one) {
+    // 量级远离 1 的商：有效数字位要按**商**的量级算，不能按被除数。
+    CHECK_EQ(div("1", "1000", 10).toString(), std::string("0.001"));
+    CHECK_EQ(div("1", "0.000000001", 10).toString(), std::string("1000000000"));
+    CHECK_EQ(div("0.0000000001", "3", 10).toString(),
+             std::string("0.00000000003333333333"));
+}
+
+TEST(divide, rounding_modes) {
+    // 1/3 在 10 位有效数字下，不同模式给出不同结果。
+    CHECK_EQ(div("1", "3", 10, RoundingMode::HalfEven).toString(),
+             std::string("0.3333333333"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::HalfUp).toString(),
+             std::string("0.3333333333"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::Down).toString(),
+             std::string("0.3333333333"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::Up).toString(),
+             std::string("0.3333333334"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::Ceil).toString(),
+             std::string("0.3333333334"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::Floor).toString(),
+             std::string("0.3333333333"));
+}
+
+TEST(divide, rounding_direction_on_negatives) {
+    // 负数时 Ceil/Floor 的方向必须反过来。
+    CHECK_EQ(div("-1", "3", 10, RoundingMode::Ceil).toString(),
+             std::string("-0.3333333333"));
+    CHECK_EQ(div("-1", "3", 10, RoundingMode::Floor).toString(),
+             std::string("-0.3333333334"));
+    // 向零截断与远离零截断不区分符号。
+    CHECK_EQ(div("-1", "3", 10, RoundingMode::Down).toString(),
+             std::string("-0.3333333333"));
+    CHECK_EQ(div("-1", "3", 10, RoundingMode::Up).toString(),
+             std::string("-0.3333333334"));
+}
+
+TEST(divide, bankers_rounding_exact_half) {
+    // 正好一半时走偶数分支：
+    // 0.25 保留 1 位有效数字 -> 0.2（2 是偶数）
+    // 0.35 保留 1 位有效数字 -> 0.4（3 是奇数，要进位成 4）
+    CHECK_EQ(div("0.25", "1", 1, RoundingMode::HalfEven).toString(), std::string("0.2"));
+    CHECK_EQ(div("0.35", "1", 1, RoundingMode::HalfEven).toString(), std::string("0.4"));
+    // HalfUp 在正好一半时总是进位。
+    CHECK_EQ(div("0.25", "1", 1, RoundingMode::HalfUp).toString(), std::string("0.3"));
+    CHECK_EQ(div("0.35", "1", 1, RoundingMode::HalfUp).toString(), std::string("0.4"));
+}
+
+TEST(divide, bankers_rounding_more_than_half) {
+    // 超过一半（不是正好一半）时必须进位，不能被误判成"正好一半"。
+    // 2/3 = 0.666... 保留 1 位 -> 0.7
+    CHECK_EQ(div("2", "3", 1, RoundingMode::HalfEven).toString(), std::string("0.7"));
+    // 1/6 = 0.1666... 保留 1 位 -> 0.2
+    CHECK_EQ(div("1", "6", 1, RoundingMode::HalfEven).toString(), std::string("0.2"));
+    // 1/2 = 0.5 正好一半，保留 1 位 -> 0.5（末位 5 是奇数，要进位）
+    CHECK_EQ(div("1", "2", 1, RoundingMode::HalfEven).toString(), std::string("0.5"));
+    // 3/2 = 1.5 正好一半，保留 1 位 -> 2（1 是奇数，要进位）
+    CHECK_EQ(div("3", "2", 1, RoundingMode::HalfEven).toString(), std::string("2"));
+    // 5/2 = 2.5 正好一半，保留 1 位 -> 2（2 是偶数，不进位）
+    CHECK_EQ(div("5", "2", 1, RoundingMode::HalfEven).toString(), std::string("2"));
+}
+
+TEST(floor_ceil, value) {
+    // 0.333333 有 6 位有效数字，精度 6 时原样保留（不需要任何进位）。
+    const BigDecimal third = BigDecimal::fromString("0.333333");
+    CHECK_EQ(BigDecimal::floor(third, Context{6, RoundingMode::Floor}).toString(),
+             std::string("0.333333"));
+    CHECK_EQ(BigDecimal::ceil(third, Context{6, RoundingMode::Ceil}).toString(),
+             std::string("0.333333"));
+    // 精度降到 5 位时才有舍入发生：向下舍、向上舍都进位。
+    CHECK_EQ(BigDecimal::floor(third, Context{5, RoundingMode::Floor}).toString(),
+             std::string("0.33333"));
+    CHECK_EQ(BigDecimal::ceil(third, Context{5, RoundingMode::Ceil}).toString(),
+             std::string("0.33334"));
+}
+
+TEST(floor_ceil, direction_on_negatives) {
+    // Floor 向 -∞，Ceil 向 +∞ —— 负数时方向与直觉相反。
+    const BigDecimal value = BigDecimal::fromString("-2.555");
+    CHECK_EQ(BigDecimal::floor(value, Context{3, RoundingMode::Floor}).toString(),
+             std::string("-2.56"));
+    CHECK_EQ(BigDecimal::ceil(value, Context{3, RoundingMode::Ceil}).toString(),
+             std::string("-2.55"));
+    CHECK_EQ(BigDecimal::round(value, Context{3, RoundingMode::HalfEven}).toString(),
+             std::string("-2.56"));
+    // 正数时方向相反。
+    const BigDecimal positive = BigDecimal::fromString("2.555");
+    CHECK_EQ(BigDecimal::floor(positive, Context{3, RoundingMode::Floor}).toString(),
+             std::string("2.55"));
+    CHECK_EQ(BigDecimal::ceil(positive, Context{3, RoundingMode::Ceil}).toString(),
+             std::string("2.56"));
+}
+
+TEST(floor_ceil, carry_across_integer_part) {
+    // 进位溢出整数位时要正确进位（9.99 向上取整 -> 10）。
+    CHECK_EQ(BigDecimal::ceil(BigDecimal::fromString("9.99"), Context{2}).toString(),
+             std::string("10"));
+    CHECK_EQ(BigDecimal::floor(BigDecimal::fromString("9.99"), Context{2}).toString(),
+             std::string("9.9"));
+    CHECK_EQ(BigDecimal::ceil(BigDecimal::fromString("0.999"), Context{2}).toString(),
+             std::string("1"));
+    CHECK_EQ(BigDecimal::ceil(BigDecimal::fromString("99.9"), Context{2}).toString(),
+             std::string("100"));
+}
+
+TEST(floor_ceil, integers_are_unchanged) {
+    const BigDecimal value = BigDecimal::fromString("42");
+    CHECK_EQ(BigDecimal::floor(value, Context{6, RoundingMode::Floor}).toString(),
+             std::string("42"));
+    CHECK_EQ(BigDecimal::ceil(value, Context{6, RoundingMode::Ceil}).toString(),
+             std::string("42"));
+    CHECK_EQ(BigDecimal::round(value, Context{6, RoundingMode::HalfEven}).toString(),
+             std::string("42"));
+}
+
+TEST(round_, bankers_rounding) {
+    // round 固定用 HalfEven。
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("2.5"), Context{2}).toString(),
+             std::string("2.5"));
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("0.125"), Context{3}).toString(),
+             std::string("0.125"));
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("0.135"), Context{3}).toString(),
+             std::string("0.135"));
+    // 精度不足以容纳全部有效数字时才发生舍入：2.555 保留 2 位 -> 2.6（进位）。
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("2.555"), Context{2}).toString(),
+             std::string("2.6"));
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("-2.555"), Context{2}).toString(),
+             std::string("-2.6"));
+    // 正好一半时取偶：1.5 保留 1 位 -> 2（1 是奇数）；2.5 保留 1 位 -> 2（2 是偶数）。
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("1.5"), Context{1}).toString(),
+             std::string("2"));
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("2.5"), Context{1}).toString(),
+             std::string("2"));
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("-2.5"), Context{1}).toString(),
+             std::string("-2"));
+}
+
+TEST(modulo, sign_follows_dividend) {
+    // 取余结果符号跟随被除数（与 C 的 % 一致）。
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("7"), BigDecimal::fromString("2")).toString(),
+             std::string("1"));
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("-7"), BigDecimal::fromString("2")).toString(),
+             std::string("-1"));
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("7"), BigDecimal::fromString("-2")).toString(),
+             std::string("1"));
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("-7"), BigDecimal::fromString("-2")).toString(),
+             std::string("-1"));
+}
+
+TEST(modulo, fractional_operands) {
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("5.5"), BigDecimal::fromString("2")).toString(),
+             std::string("1.5"));
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("-5.5"), BigDecimal::fromString("2")).toString(),
+             std::string("-1.5"));
+    // 除数带小数位时余数必须小于除数。
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("1"), BigDecimal::fromString("0.3")).toString(),
+             std::string("0.1"));
+}
+
+TEST(modulo, exact_multiple_and_zero) {
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("6"), BigDecimal::fromString("3")).toString(),
+             std::string("0"));
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("0"), BigDecimal::fromString("3")).toString(),
+             std::string("0"));
+    // 比除数小的被除数，余数就是它自己。
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("2"), BigDecimal::fromString("5")).toString(),
+             std::string("2"));
+}
+
+TEST(divide, legacy_crash_inputs_are_safe) {
+    // legacy 缺陷 #10 的触发输入：除法收尾的舍入分支对单节点链表做 ->prior 回退，
+    // 退到 nullptr 后解引用崩溃。v3 的舍入走块数组路径，这些输入必须全部安全。
+    const char* numerators[] = {"1.5", "2.5", "-02.881332", "12.34", "0.1", "1"};
+    const char* denominators[] = {"474", "474", "0474", "56", "7", "3"};
+    for (const char* n : numerators) {
+        for (const char* d : denominators) {
+            // 只要求不崩溃且结果可解析。
+            const std::string result = div(n, d, 1).toString();
+            CHECK(!result.empty());
+        }
+    }
+    // 精度 1 是 legacy 里 FracBit = 0 的等价场景。
+    CHECK_EQ(div("1.5", "474", 1).toString(), std::string("0.003"));
+    CHECK_EQ(div("2.5", "474", 1).toString(), std::string("0.005"));
+    CHECK_EQ(div("-02.881332", "474", 1).toString(), std::string("-0.006"));
+}
+
+TEST(divide, no_negative_zero_output) {
+    CHECK_EQ(div("0", "3", 10).toString(), std::string("0"));
+    CHECK_EQ(div("-0", "3", 10).toString(), std::string("0"));
+    // 精度 >= 1 至少保留 1 位有效数字，所以非零值永远不会舍入成 0，
+    // 更不会输出 "-0"。
+    CHECK_EQ(div("-1", "1000000", 1, RoundingMode::Down).toString(),
+             std::string("-0.000001"));
+    CHECK_EQ(div("-0.4", "1", 1, RoundingMode::Floor).toString(), std::string("-0.4"));
+}

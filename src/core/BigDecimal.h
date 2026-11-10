@@ -7,11 +7,15 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "core/Rounding.h"
 
 namespace hpc {
+
+// 小端 base-10^9 分块序列：blocks[0] 是最低位块，blocks.back() 是最高位块。
+using Blk = std::vector<std::uint32_t>;
 
 class BigDecimal {
 public:
@@ -32,6 +36,20 @@ public:
     BigDecimal operator-(const BigDecimal& other) const;
     BigDecimal operator*(const BigDecimal& other) const;
 
+    // 不精确运算：必须显式给出精度。
+    // 除数为零时抛出 std::domain_error。
+    static BigDecimal divide(const BigDecimal& lhs, const BigDecimal& rhs, const Context& context);
+
+    // 取余：lhs - trunc(lhs/rhs) * rhs。结果符号跟随被除数（与 C 的 % 一致）。
+    // 除数为零时抛出 std::domain_error。
+    static BigDecimal modulo(const BigDecimal& lhs, const BigDecimal& rhs);
+
+    // 取整：按 context.precision 位有效数字取整（floor 向 -∞，ceil 向 +∞，
+    // round 为银行家舍入 HalfEven）。
+    static BigDecimal floor(const BigDecimal& value, const Context& context);
+    static BigDecimal ceil(const BigDecimal& value, const Context& context);
+    static BigDecimal round(const BigDecimal& value, const Context& context);
+
     // 比较：<0 表示本对象小于 other，0 表示相等，>0 表示大于。
     int compare(const BigDecimal& other) const;
     bool equals(const BigDecimal& other) const;
@@ -47,6 +65,20 @@ private:
 
     // 对齐两个数的小数位，返回对齐后共同的 scale。
     static int alignScale(BigDecimal& lhs, BigDecimal& rhs);
+
+    // 舍入到 context.precision 位有效数字。
+    static BigDecimal roundToPrecision(const BigDecimal& value, const Context& context);
+
+    // 逐块长除法 + 二分试商。返回 {商, 余数}。
+    static std::pair<Blk, Blk> divideBlk(const Blk& dividend, const Blk& divisor);
+
+    // 把精确分数 numerator/denominator 舍入到 precision 位有效数字。
+    // 返回 {舍入后的整数, 小数位数}，即 值 = 整数 * 10^(-小数位数)。
+    //
+    // 舍入判定基于长除法的**精确余数**，因此能区分「正好一半」与
+    // 「超过一半」—— 银行家舍入的偶数分支才可靠。
+    static std::pair<Blk, int> roundQuotient(const Blk& numerator, const Blk& denominator,
+                                             int precision, RoundingMode mode, bool negative);
 
     int sign_ = 0;                      // -1 / 0 / +1
     std::vector<std::uint32_t> digits_; // 小端 base-10^9 分块

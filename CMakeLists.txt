@@ -62,4 +62,14 @@ if(BUILD_TESTS)
     target_include_directories(hpc_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     hpc_set_warnings(hpc_tests)
     add_test(NAME hpc_tests COMMAND hpc_tests)
+
+    # 除法探针：供 scripts/verify_div.py 做 Python decimal 差分验证。
+    add_executable(div_probe tests/div_probe.cpp)
+    target_link_libraries(div_probe PRIVATE hpc_core)
+    hpc_set_warnings(div_probe)
+
+    # 取余/取整探针：供 scripts/verify_mod.py 做差分验证。
+    add_executable(mod_probe tests/mod_probe.cpp)
+    target_link_libraries(mod_probe PRIVATE hpc_core)
+    hpc_set_warnings(mod_probe)
 endif()

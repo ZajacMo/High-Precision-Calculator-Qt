@@ -68,6 +68,10 @@ build.ninja
 Thumbs.db
 desktop.ini
 
+# Python
+__pycache__/
+*.pyc
+
 # 环境与密钥
 .env
 .env.*
