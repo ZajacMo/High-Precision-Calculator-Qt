@@ -361,6 +361,17 @@ TEST(scientific, rejects_bad_exponent) {
     }
 }
 
+// 尾数里的 'e' 不是指数标记：报「非法字符」而不是「指数部分非法」。
+TEST(scientific, mantissa_e_is_a_bad_character) {
+    bool threw = false;
+    try { make("abe"); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+
+    threw = false;
+    try { make("1a2e3"); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+}
+
 // 不含指数的输入行为不变（既有契约）。
 TEST(scientific, plain_inputs_unchanged) {
     CHECK_EQ(make("123").toString(), std::string("123"));

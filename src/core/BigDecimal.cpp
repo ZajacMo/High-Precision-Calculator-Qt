@@ -286,14 +286,31 @@ BigDecimal BigDecimal::fromString(std::string_view text) {
     // 指数之前的尾数用与原来完全相同的规则解析（可选小数点、前导零），
     // 因此**已有输入的行为不变**：不含 'e'/'E' 的串走的是同一条路径。
     //
+    // 'e' 只有在**前面已经出现过数字**时才是指数标记；否则（"abe" 这类
+    // 输入）它只是尾数里的一个非法字符 —— 交给下面的尾数解析去报错，
+    // 错误信息才准确（"非法字符 'e'" 而不是"指数部分非法"）。
+    //
     // 指数本身必须是一个十进制整数（可带正负号），否则抛 invalid_argument。
     int exponent = 0;
     bool hasExponent = false;
+
+    // 先找到指数标记的位置：第一个「前面有数字」的 'e'/'E'。
+    std::size_t exponentMark = text.size();
+    bool seenDigitBefore = false;
     for (std::size_t i = index; i < text.size(); ++i) {
         const char c = text[i];
-        if (c != 'e' && c != 'E') continue;
+        if (c == 'e' || c == 'E') {
+            if (seenDigitBefore) {
+                exponentMark = i;
+                break;
+            }
+            continue;   // 尾数里的非法字符，交给尾数解析报错
+        }
+        if (std::isdigit(static_cast<unsigned char>(c))) seenDigitBefore = true;
+    }
 
-        std::size_t cursor = i + 1;
+    if (exponentMark != text.size()) {
+        std::size_t cursor = exponentMark + 1;
         bool exponentNegative = false;
         if (cursor < text.size() && (text[cursor] == '+' || text[cursor] == '-')) {
             exponentNegative = (text[cursor] == '-');
@@ -317,8 +334,7 @@ BigDecimal BigDecimal::fromString(std::string_view text) {
         }
         exponent = static_cast<int>(exponentNegative ? -magnitude : magnitude);
         hasExponent = true;
-        text = text.substr(0, i);
-        break;
+        text = text.substr(0, exponentMark);
     }
 
     std::string integral;
