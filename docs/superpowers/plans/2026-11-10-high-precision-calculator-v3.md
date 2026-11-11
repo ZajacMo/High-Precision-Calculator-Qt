@@ -1998,28 +1998,49 @@ git commit -m "feat(core): sqrt/pow/exp/ln/log10 超越函数实现"
 **Files:**
 - Create: `src/core/Format.h`
 - Create: `src/core/Format.cpp`
-- Modify: `src/core/BigDecimal.h`（新增 `isInteger` 与 `integerBlocks`）
+- Modify: `src/core/BigDecimal.h`（新增 `isInteger`、`integerBlocks`、`truncateToInteger`、`scale`）
 - Modify: `src/core/BigDecimal.cpp`
 - Modify: `tests/tst_format.cpp`
+- Create: `tests/format_probe.cpp`（差分测试探针）
+- Create: `scripts/verify_format.py`（Python 差分测试）
+- Modify: `CMakeLists.txt`（加入 format_probe 目标）
 
 **Interfaces:**
 - Consumes: Task 2 的 `BigDecimal`
 - Produces:
   - `namespace hpc`
-  - `std::string toBaseString(const BigDecimal& value, int base, bool uppercase = false)`（base ∈ 2..36；仅整数精确转换）
+  - `std::string toBaseString(const BigDecimal& value, int base, bool uppercase = false, int fractionDigits = 0)`
+    （base ∈ 2..36；整数部分精确无损；小数部分按目标进制截断并用 `"..."` 标记）
   - `BigDecimal fromBaseString(std::string_view text, int base)`（仅整数）
   - `enum class BitOp { And, Or, Xor }`
   - `BigDecimal bitwise(const BigDecimal& lhs, const BigDecimal& rhs, BitOp op)`（仅整数精确）
   - `BigDecimal bitwiseNot(const BigDecimal& value)`（仅整数精确）
   - `BigDecimal shiftLeft(const BigDecimal& value, int bits)`、`shiftRight(const BigDecimal& value, int bits)`
-  - `BigDecimal::isInteger()`、`BigDecimal::integerBlocks()`
+  - `BigDecimal::isInteger()`、`BigDecimal::integerBlocks()`、`BigDecimal::truncateToInteger()`、`BigDecimal::scale()`
+  - `BigDecimal::fromString` 现已支持科学计数法（`1e20`、`2.5E-3`）
 
-- [ ] **Step 1: 在 `BigDecimal.h` 加 `isInteger` 与 `integerBlocks`**
+- [x] **Step 1: 在 `BigDecimal.h` 加 `isInteger`、`integerBlocks`、`truncateToInteger`、`scale`**
 
 ```cpp
-    // 是否为整数（无小数位）。
+    // 是否为整数（没有小数位）。
     bool isInteger() const { return scale_ == 0; }
-    // 整数部分的 base-10^9 小端块。非整数时抛 std::domain_error。
+
+    // 十进制小数位的个数。
+    //
+    // 注意与 Context::precision 区分：precision 是**有效数字位**，
+    // scale 是**小数位**（十进制小数点后的位数），两者不是一个概念。
+    int scale() const { return scale_; }
+
+    // 精确地向零截断到整数（丢弃小数部分，不做舍入）。
+    //
+    // -1.5 -> -1，1.5 -> 1。与 floor 的区别：floor 向 -∞ 取整，
+    // -1.5 的 floor 是 -2。位运算与进制转换的整数部分都用这个语义。
+    BigDecimal truncateToInteger() const;
+
+    // 整数的**绝对值**的 base-10^9 小端块（digits_[0] 是最低位块）。
+    //
+    // 非整数时抛 std::domain_error —— 位运算这类「精确整数运算」的入口。
+    // 符号不在这里：符号由 sign() 单独给出。
     const std::vector<std::uint32_t>& integerBlocks() const;
 ```
 
@@ -2030,12 +2051,57 @@ const std::vector<std::uint32_t>& BigDecimal::integerBlocks() const {
     if (scale_ != 0) throw std::domain_error("BigDecimal: 该运算只支持整数");
     return digits_;
 }
+
+BigDecimal BigDecimal::truncateToInteger() const {
+    if (scale_ == 0) return *this;
+
+    // 向零截断 = 取绝对值后丢掉最低的 scale 个十进制位。
+    //
+    // 性能：逐位 divideBy10 是 O(scale × 块数) 的二次方开销 ——
+    // 高精度除法的结果 scale 可达上万位（块数千个），逐位除会退化。
+    // 因此分两步：
+    //   1) 丢掉最低 scale/9 个**整块**（一次 erase，O(块数)）；
+    //   2) 剩下的 scale%9 位用 divideBy10 逐位去掉（最多 8 次，O(块数)）。
+    // 合计 O(块数)，与 scale 的大小基本无关。
+    BigDecimal magnitude = abs(*this);
+
+    const int wholeBlocks = scale_ / kBlockDigits;
+    const int rest = scale_ % kBlockDigits;
+
+    // 第一步：丢掉最低的整块。
+    //
+    // 正确性：值 = 低位部分 + 高位部分 × 10^(9w)，而低位部分 < 10^(9w)，
+    // 因此 floor(值 / 10^(9w)) 恰好等于高位部分。
+    const std::size_t drop = std::min(static_cast<std::size_t>(wholeBlocks),
+                                      magnitude.digits_.size());
+    Blk kept(magnitude.digits_.begin() + static_cast<std::ptrdiff_t>(drop),
+             magnitude.digits_.end());
+    if (kept.empty()) kept.push_back(0);
+
+    // 第二步：再丢掉 rest 个十进制位（rest < 9）。
+    //
+    // 注意**不能**只把最低块除以 10^rest：块边界与十进制位边界不对齐时
+    // （例如 9999999999 = 9×10^9 + 999999999），除以 10^5 会让**所有**块
+    // 一起右移 5 位，而不只是最低块。因此这里用整块级的长除法逐位除。
+    for (int i = 0; i < rest; ++i) {
+        divideBy10(kept);
+    }
+
+    BigDecimal result;
+    result.digits_ = std::move(kept);
+    result.scale_ = 0;
+    result.sign_ = sign_;
+    result.normalize();
+
+    // 符号跟随原值：向零截断，-1.5 -> -1（不是 floor 的 -2）。
+    return result;
+}
 ```
 
-- [ ] **Step 2: 写 `src/core/Format.h`**
+- [x] **Step 2: 写 `src/core/Format.h`**
 
 ```cpp
-// 进制转换与位运算：只对整数精确支持。
+// 进制转换与位运算：整数部分精确无损，位运算仅对整数有意义。
 #pragma once
 
 #include <string>
@@ -2045,62 +2111,173 @@ const std::vector<std::uint32_t>& BigDecimal::integerBlocks() const {
 
 namespace hpc {
 
-// 把整数转换为 base 进制字符串。base 取值 2..36。
-// 非整数输入抛 std::domain_error。
-std::string toBaseString(const BigDecimal& value, int base, bool uppercase = false);
+// 把 value 转成 base 进制字符串。base 取值 2..36，非法 base 抛 std::invalid_argument。
+//
+// 整数部分**精确无损**；负值带前导负号；零输出 "0"。
+//
+// 小数部分：按目标进制逐位提取，最多输出 fractionDigits 位。该进制下无法
+// 有限表示时，末尾用 "..." 显式标记截断 —— 不做无声的近似。
+// fractionDigits 为 0 时按 value 自身的十进制精度自动推算位数
+// （取最小的 D 使 base^D >= 10^小数位数，因此不会丢失输入自身的精度）。
+// 整数输入不输出小数点，也不带标记。
+//
+// 小数部分的**尾随零会被去掉**（与 BigDecimal::toString 的做法一致）：
+// 该进制下能有限表示的值给出最短的精确形式（0.5 在二进制下是 "0.1"），
+// 只有确实发生了截断时才补上 "..." 标记。
+std::string toBaseString(const BigDecimal& value, int base, bool uppercase = false,
+                          int fractionDigits = 0);
 
-// 解析 base 进制整数字符串。base 取值 2..36。
-// 含小数点或非法字符时抛 std::invalid_argument。
+// 解析 base 进制整数字符串（可带前导正负号）。base 取值 2..36。
+// 空串、非法字符、数字超出进制范围、含小数点时抛 std::invalid_argument。
+//
+// 只支持整数：任意进制的小数在十进制内核里未必能精确表示（1/3 在三进制下
+// 无法有限表示），接受它就等于引入无声的近似。输出侧的小数部分用 "..."
+// 标记截断，解析侧则直接拒绝。
 BigDecimal fromBaseString(std::string_view text, int base);
 
 enum class BitOp { And, Or, Xor };
 
-// 整数位运算。任一操作数非整数时抛 std::domain_error。
+// 整数位运算，采用**无限位**二进制补码语义（与 Python 的 int 运算一致）：
+// 负数按符号扩展参与运算，运算结果仍是精确整数。
+// 任一操作数非整数时抛 std::domain_error。
 BigDecimal bitwise(const BigDecimal& lhs, const BigDecimal& rhs, BitOp op);
-// 按位取反。
+
+// 按位取反：~x = -x - 1。非整数输入抛 std::domain_error。
 BigDecimal bitwiseNot(const BigDecimal& value);
-// 左移 bits 位（相当于乘以 2^bits）。
+
+// 左移 bits 位（相当于乘以 2^bits）。非整数输入抛 std::domain_error；
+// bits 为负抛 std::invalid_argument；结果位数超限抛 std::overflow_error。
 BigDecimal shiftLeft(const BigDecimal& value, int bits);
-// 右移 bits 位（相当于整除 2^bits）。
+
+// 右移 bits 位（相当于整除 2^bits），负数**向 -∞ 取整**（与 Python 的 >> 一致）：
+// -1 >> 100 == -1。
 BigDecimal shiftRight(const BigDecimal& value, int bits);
 
 }  // namespace hpc
 ```
 
-- [ ] **Step 3: 写 `src/core/Format.cpp`**
+- [x] **Step 3: 写 `src/core/Format.cpp`**
 
 ```cpp
 #include "core/Format.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace hpc {
 namespace {
 
-const char* kDigitsLower = "0123456789abcdefghijklmnopqrstuvwxyz";
-const char* kDigitsUpper = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+constexpr std::uint64_t kBase = 1000000000ULL;   // 10^9
+constexpr int kBlockDigits = 9;
 
-constexpr std::uint64_t kBase = 1000000000ULL;
+// 进制字符表。
+const char kDigitsLower[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+const char kDigitsUpper[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-// 把小端 base-10^9 块转为十进制字符串（高位在前）。
-std::string toDecimalString(const std::vector<std::uint32_t>& blocks) {
-    if (blocks.size() == 1 && blocks[0] == 0) return "0";
+// 小数部分默认输出的最大位数：超过就截断并标记。
+//
+// 位数由「值的十进制小数位数」推出（见 fractionDigitCount），
+// 但要设上限：一个小数位很多的值在二进制下可能需要成千上万位。
+constexpr int kMaxFractionDigits = 4096;
+
+// 左移位数的上限：2^bits 的十进制位数约是 bits 的 0.301 倍，
+// 位数过大说明调用方失控，应当报错而不是继续消耗内存。
+constexpr int kMaxShiftBits = 1000000;
+
+// 小端 base-10^9 块序列：blocks[0] 是最低位块。
+using Blk = std::vector<std::uint32_t>;
+
+// --- 块序列的基础运算 -------------------------------------------------
+
+// 去掉高位的零块，但至少保留一个块表示 0。
+Blk trimBlk(Blk blocks) {
+    while (blocks.size() > 1 && blocks.back() == 0) blocks.pop_back();
+    if (blocks.empty()) blocks.push_back(0);
+    return blocks;
+}
+
+// 块序列是否表示 0。
+bool isZeroBlk(const Blk& blocks) {
+    return blocks.size() == 1 && blocks[0] == 0;
+}
+
+// 比较两块序列（均为小端）：<0 / 0 / >0。
+int compareBlk(const Blk& lhs, const Blk& rhs) {
+    if (lhs.size() != rhs.size()) return lhs.size() < rhs.size() ? -1 : 1;
+    for (std::size_t i = lhs.size(); i-- > 0;) {
+        if (lhs[i] != rhs[i]) return lhs[i] < rhs[i] ? -1 : 1;
+    }
+    return 0;
+}
+
+// 块序列乘以 base（base <= 36，块内不会溢出 64 位）。
+Blk multiplyBlkByBase(const Blk& blocks, std::uint64_t base) {
+    Blk result(blocks.size(), 0);
+    std::uint64_t carry = 0;
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        const std::uint64_t current = static_cast<std::uint64_t>(blocks[i]) * base + carry;
+        result[i] = static_cast<std::uint32_t>(current % kBase);
+        carry = current / kBase;
+    }
+    while (carry) {
+        result.push_back(static_cast<std::uint32_t>(carry % kBase));
+        carry /= kBase;
+    }
+    return trimBlk(std::move(result));
+}
+
+// 块序列加一个小的非负数（addend < kBase）。
+void addToBlk(Blk& blocks, std::uint64_t addend) {
+    std::uint64_t add = addend;
+    for (std::size_t k = 0; k < blocks.size() && add; ++k) {
+        const std::uint64_t current = static_cast<std::uint64_t>(blocks[k]) + add;
+        blocks[k] = static_cast<std::uint32_t>(current % kBase);
+        add = current / kBase;
+    }
+    if (add) blocks.push_back(static_cast<std::uint32_t>(add));
+}
+
+// 块序列除以 base，返回 {商, 余数}。商为小端块，余数 < base。
+//
+// 这是长除法的块级实现：把整个块序列当作一个大端数字，
+// 逐块做「余数 * 10^9 + 块」再除以 base。
+std::pair<Blk, std::uint64_t> divideBlkByBase(const Blk& blocks, std::uint64_t base) {
+    Blk quotient(blocks.size(), 0);
+    std::uint64_t remainder = 0;
+    for (std::size_t i = blocks.size(); i-- > 0;) {
+        const std::uint64_t current = remainder * kBase + blocks[i];
+        quotient[i] = static_cast<std::uint32_t>(current / base);
+        remainder = current % base;
+    }
+    return {trimBlk(std::move(quotient)), remainder};
+}
+
+// --- 块序列与字符串互转 -----------------------------------------------
+
+// 把小端 base-10^9 块转为十进制数字串（高位在前，无前导零）。
+std::string blocksToDecimalString(const Blk& blocks) {
+    if (blocks.empty()) return "0";
     std::string digits = std::to_string(blocks.back());
     char buffer[16];
     for (std::size_t i = blocks.size() - 1; i-- > 0;) {
-        std::snprintf(buffer, sizeof buffer, "%09u", blocks[i]);
+        std::snprintf(buffer, sizeof buffer, "%09u", static_cast<unsigned>(blocks[i]));
         digits += buffer;
     }
     return digits;
 }
 
-// 十进制字符串（小端块表示的整数）转回 base-10^9 小端块。
-std::vector<std::uint32_t> blocksFromDecimal(const std::string& text) {
-    std::vector<std::uint32_t> blocks;
+// 十进制数字串（小端块表示的整数）转回 base-10^9 小端块。
+Blk blocksFromDecimalString(const std::string& text) {
+    Blk blocks;
     std::size_t end = text.size();
     while (end > 0) {
-        const std::size_t start = end >= 9 ? end - 9 : 0;
+        const std::size_t start = end >= static_cast<std::size_t>(kBlockDigits)
+                                      ? end - static_cast<std::size_t>(kBlockDigits) : 0;
         std::uint32_t value = 0;
         for (std::size_t i = start; i < end; ++i) {
             value = value * 10 + static_cast<std::uint32_t>(text[i] - '0');
@@ -2108,18 +2285,82 @@ std::vector<std::uint32_t> blocksFromDecimal(const std::string& text) {
         blocks.push_back(value);
         end = start;
     }
-    while (blocks.size() > 1 && blocks.back() == 0) blocks.pop_back();
-    if (blocks.empty()) blocks.push_back(0);
-    return blocks;
+    return trimBlk(std::move(blocks));
 }
 
-// 小端 base-10^9 块转二进制字符串（高位在前）。
-std::string toBinaryString(const std::vector<std::uint32_t>& blocks) {
-    std::string bits;
+// 块序列乘以 2^bits（bits <= 32）。
+//
+// 块内不会溢出 64 位：块值 < 10^9 < 2^30，2^32 × 2^30 = 2^62。
+Blk multiplyBlkByPowerOfTwo(const Blk& blocks, int bits) {
+    const std::uint64_t factor = 1ULL << bits;
+    Blk result(blocks.size(), 0);
+    std::uint64_t carry = 0;
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        const std::uint64_t current = static_cast<std::uint64_t>(blocks[i]) * factor + carry;
+        result[i] = static_cast<std::uint32_t>(current % kBase);
+        carry = current / kBase;
+    }
+    while (carry) {
+        result.push_back(static_cast<std::uint32_t>(carry % kBase));
+        carry /= kBase;
+    }
+    return trimBlk(std::move(result));
+}
+
+// 块序列加一个小整数（addend < 2^32）。
+void addSmallToBlk(Blk& blocks, std::uint64_t addend) {
+    std::uint64_t add = addend;
+    for (std::size_t k = 0; k < blocks.size() && add; ++k) {
+        const std::uint64_t current = static_cast<std::uint64_t>(blocks[k]) + add;
+        blocks[k] = static_cast<std::uint32_t>(current % kBase);
+        add = current / kBase;
+    }
+    while (add) {
+        blocks.push_back(static_cast<std::uint32_t>(add % kBase));
+        add /= kBase;
+    }
+}
+
+// 块序列除以 2^bits（bits <= 32），返回 {商, 余数}。
+//
+// 块内不会溢出 64 位：余数 < 2^32，2^32 × 10^9 + 10^9 < 2^63。
+std::pair<Blk, std::uint64_t> divideBlkByPowerOfTwo(const Blk& blocks, int bits) {
+    const std::uint64_t divisor = 1ULL << bits;
+    Blk quotient(blocks.size(), 0);
+    std::uint64_t remainder = 0;
     for (std::size_t i = blocks.size(); i-- > 0;) {
-        const std::uint32_t value = blocks[i];
+        const std::uint64_t current = remainder * kBase + blocks[i];
+        quotient[i] = static_cast<std::uint32_t>(current / divisor);
+        remainder = current % divisor;
+    }
+    return {trimBlk(std::move(quotient)), remainder};
+}
+
+// --- 二进制字符串工具 -------------------------------------------------
+
+// 小端块序列转成二进制字符串（高位在前，无前导零）。
+//
+// 反复除以 2^32，每次得到 32 个二进制位 —— 复杂度 O(位数/32 × 块数)，
+// 比逐位除以 2（O(位数 × 块数)）快一个数量级。
+//
+// 注意：块的基数是 **10^9**，不是 2^32，因此不能「每块取 32 位」直接拼；
+// 必须真的做除法。
+std::string blocksToBinary(const Blk& blocks) {
+    std::vector<std::uint32_t> chunks;   // 最低位块在前
+    Blk current = blocks;
+    while (!isZeroBlk(current)) {
+        const auto divided = divideBlkByPowerOfTwo(current, 32);
+        chunks.push_back(static_cast<std::uint32_t>(divided.second));
+        current = divided.first;
+    }
+
+    // 从高位块到低位块输出，每块 32 位（高位在前）。
+    std::string bits;
+    bits.reserve(chunks.size() * 32);
+    for (std::size_t i = chunks.size(); i-- > 0;) {
+        const std::uint32_t chunk = chunks[i];
         for (int bit = 31; bit >= 0; --bit) {
-            bits.push_back(((value >> bit) & 1u) ? '1' : '0');
+            bits.push_back(((chunk >> bit) & 1u) ? '1' : '0');
         }
     }
     const std::size_t first = bits.find('1');
@@ -2127,57 +2368,217 @@ std::string toBinaryString(const std::vector<std::uint32_t>& blocks) {
     return bits.substr(first);
 }
 
-// 二进制字符串转回 base-10^9 小端块。
-std::vector<std::uint32_t> blocksFromBinary(const std::string& bits) {
-    std::vector<std::uint32_t> value{0};
-    for (std::size_t i = bits.size(); i-- > 0;) {
-        std::uint64_t carry = bits[i] == '1' ? 1 : 0;
-        for (std::size_t k = 0; k < value.size(); ++k) {
-            const std::uint64_t cur = static_cast<std::uint64_t>(value[k]) * 2 + carry;
-            value[k] = static_cast<std::uint32_t>(cur % kBase);
-            carry = cur / kBase;
+// 二进制字符串转回小端 base-10^9 块。
+//
+// 按 32 位一组做 Horner 法：value = value * 2^32 + chunk。
+// 复杂度 O(位数/32 × 块数)。
+Blk blocksFromBinary(const std::string& bits) {
+    Blk value{0};
+    std::size_t index = 0;
+
+    // 头部不足 32 位的一组。
+    const std::size_t head = bits.size() % 32;
+    if (head != 0) {
+        std::uint32_t chunk = 0;
+        for (std::size_t i = 0; i < head; ++i) {
+            chunk = (chunk << 1) | ((bits[i] == '1') ? 1u : 0u);
         }
-        if (carry) value.push_back(static_cast<std::uint32_t>(carry));
+        value = multiplyBlkByPowerOfTwo(value, static_cast<int>(head));
+        addSmallToBlk(value, chunk);
+        index = head;
     }
-    while (value.size() > 1 && value.back() == 0) value.pop_back();
-    return value;
+
+    for (; index < bits.size(); index += 32) {
+        std::uint32_t chunk = 0;
+        for (std::size_t i = 0; i < 32; ++i) {
+            chunk = (chunk << 1) | ((bits[index + i] == '1') ? 1u : 0u);
+        }
+        value = multiplyBlkByPowerOfTwo(value, 32);
+        addSmallToBlk(value, chunk);
+    }
+    return trimBlk(std::move(value));
+}
+
+// 左侧补零到指定宽度。
+std::string padLeft(const std::string& text, std::size_t width) {
+    if (text.size() >= width) return text;
+    return std::string(width - text.size(), '0') + text;
+}
+
+// 逐位取反（'0' <-> '1'）。
+std::string invertBits(const std::string& bits) {
+    std::string result(bits.size(), '0');
+    for (std::size_t i = 0; i < bits.size(); ++i) {
+        result[i] = (bits[i] == '1') ? '0' : '1';
+    }
+    return result;
+}
+
+// 二进制字符串加一（最低位在**末尾**）。溢出时返回全零。
+//
+// 结果必须从**原串**出发：进位链上的 '1' 变 '0'，遇到的第一个 '0' 变 '1'，
+// 更高位原样保留。若从全零开始，更高位会被错误地抹成 0。
+std::string addOneBinary(const std::string& bits) {
+    std::string result = bits;
+    std::size_t position = bits.size();
+    while (position > 0) {
+        --position;
+        if (bits[position] == '0') {
+            result[position] = '1';
+            return result;
+        }
+        result[position] = '0';   // 进位链上的 1 变 0
+    }
+    return result;   // 全是 1：溢出，结果全零
+}
+
+// 把整数的幅值（绝对值）转成 width 位的**二进制补码**表示。
+//
+// 负数的补码 = 幅值的补码取反加一。因为 |v| < 2^(width-1)，
+// 其 width 位表示的最高位是 0，取反后最高位是 1，加一不会溢出。
+//
+// magnitudeBits 是幅值的二进制表示（高位在前，无前导零），
+// 由调用方算好 —— 同一个操作数在运算里要用多次，不能重复转换。
+std::string toTwosComplement(const std::string& magnitudeBits, int sign,
+                              std::size_t width) {
+    const std::string padded = padLeft(magnitudeBits, width);
+    if (sign >= 0) return padded;
+    return addOneBinary(invertBits(padded));
+}
+
+// 把 width 位的二进制补码解释回整数。
+BigDecimal fromTwosComplement(const std::string& bits) {
+    if (bits.empty()) return BigDecimal(0);
+    if (bits[0] == '0') {
+        return BigDecimal::fromString(blocksToDecimalString(blocksFromBinary(bits)));
+    }
+    // 最高位是 1：负数。取反加一得到幅值。
+    const std::string magnitude = addOneBinary(invertBits(bits));
+    const BigDecimal value = BigDecimal::fromString(blocksToDecimalString(blocksFromBinary(magnitude)));
+    return BigDecimal(0) - value;
+}
+
+// --- 其他工具 ---------------------------------------------------------
+
+// 校验 base 合法。
+void checkBase(int base, const char* who) {
+    if (base < 2 || base > 36) {
+        throw std::invalid_argument(std::string(who) + ": base 必须在 2..36");
+    }
+}
+
+// 取整数（0 <= 值 < 10^9）的数值。
+//
+// 整数部分的每一步都被限制在 [0, base)，base <= 36，因此它一定落在
+// 单个块里，直接读块即可。
+std::uint32_t smallIntegerValue(const BigDecimal& value) {
+    const Blk& blocks = value.integerBlocks();
+    return blocks.empty() ? 0u : blocks[0];
+}
+
+// 小数部分默认输出多少位（base 进制）。
+//
+// 目标是让输出携带的精度不少于值自身的小数位数：找出最小的 D，
+// 使 base^D >= 10^scale。整除用块级运算，不依赖浮点数。
+int fractionDigitCount(const BigDecimal& value, int base) {
+    const int scale = value.scale();
+    if (scale <= 0) return 0;
+
+    // target = 10^scale
+    const Blk target = blocksFromDecimalString("1" + std::string(static_cast<std::size_t>(scale), '0'));
+    Blk power{1};
+    int digits = 0;
+    while (digits < kMaxFractionDigits) {
+        power = multiplyBlkByBase(power, static_cast<std::uint64_t>(base));
+        ++digits;
+        if (compareBlk(power, target) >= 0) break;
+    }
+    return digits;
 }
 
 }  // namespace
 
-std::string toBaseString(const BigDecimal& value, int base, bool uppercase) {
-    if (base < 2 || base > 36) throw std::invalid_argument("toBaseString: base 必须在 2..36");
-    if (!value.isInteger()) throw std::domain_error("toBaseString: 只支持整数");
-    if (value.isZero()) return "0";
-
+std::string toBaseString(const BigDecimal& value, int base, bool uppercase, int fractionDigits) {
+    checkBase(base, "toBaseString");
     const char* table = uppercase ? kDigitsUpper : kDigitsLower;
-    std::vector<std::uint32_t> current = value.integerBlocks();
+
+    // 整数部分：精确无损。负值带前导负号。
+    const BigDecimal integer = value.truncateToInteger();
+    Blk current = integer.integerBlocks();
+
     std::string out;
-    while (!(current.size() == 1 && current[0] == 0)) {
-        std::uint64_t remainder = 0;
-        std::vector<std::uint32_t> quotient(current.size(), 0);
-        for (std::size_t i = current.size(); i-- > 0;) {
-            const std::uint64_t value64 = remainder * kBase + current[i];
-            quotient[i] = static_cast<std::uint32_t>(value64 / base);
-            remainder = value64 % base;
-        }
-        out.push_back(table[remainder]);
-        while (quotient.size() > 1 && quotient.back() == 0) quotient.pop_back();
-        current = quotient;
+    while (!isZeroBlk(current)) {
+        const auto divided = divideBlkByBase(current, static_cast<std::uint64_t>(base));
+        out.push_back(table[divided.second]);
+        current = divided.first;
     }
+    if (out.empty()) out.push_back(table[0]);
     std::reverse(out.begin(), out.end());
+
+    // 小数部分：按目标进制逐位提取。该进制下无法有限表示时，
+    // 末尾用 "..." 显式标记截断 —— 不做无声的近似。
+    if (value.scale() > 0) {
+        const int digits = (fractionDigits > 0) ? fractionDigits
+                                               : fractionDigitCount(value, base);
+        if (digits > 0) {
+            // 小数部分 = value - 整数部分（保留原符号），再取绝对值。
+            BigDecimal remaining = BigDecimal::abs(value - integer);
+
+            std::string fractionText;
+            bool truncated = false;
+            for (int i = 0; i < digits; ++i) {
+                // remaining * base 的整数部分就是下一位，剩余部分继续迭代。
+                const BigDecimal scaled = remaining * BigDecimal(static_cast<std::int64_t>(base));
+                const BigDecimal whole = scaled.truncateToInteger();
+                fractionText.push_back(table[smallIntegerValue(whole)]);
+                remaining = scaled - whole;
+                if (remaining.isZero()) break;
+            }
+            if (!remaining.isZero()) truncated = true;
+
+            if (truncated) {
+                // 发生截断时**保留全部 digits 位**：末位可能是展开中的真实
+                // 数字，删掉它会改变数值（"0.0100…" 与 "0.01…" 含义不同）。
+                out.push_back('.');
+                out += fractionText;
+                out += "...";
+            } else {
+                // 精确表示：去掉尾随零，给出最短的精确形式
+                // （0.5 在二进制下是 "0.1"，不是 "0.1000"）。
+                while (!fractionText.empty() && fractionText.back() == '0') {
+                    fractionText.pop_back();
+                }
+                if (!fractionText.empty()) {
+                    out.push_back('.');
+                    out += fractionText;
+                }
+            }
+        }
+    }
+
+    // 负号放在最前面（整数部分为 0 时也要保留：-0.5 显示为 "-0.5"）。
+    if (value.sign() < 0) out.insert(out.begin(), '-');
     return out;
 }
 
 BigDecimal fromBaseString(std::string_view text, int base) {
-    if (base < 2 || base > 36) throw std::invalid_argument("fromBaseString: base 必须在 2..36");
-    if (text.find('.') != std::string_view::npos) {
-        throw std::invalid_argument("fromBaseString: 只支持整数");
-    }
+    checkBase(base, "fromBaseString");
     if (text.empty()) throw std::invalid_argument("fromBaseString: 空字符串");
 
-    std::vector<std::uint32_t> value{0};
-    for (char c : text) {
+    std::size_t index = 0;
+    bool negative = false;
+    if (text[index] == '+' || text[index] == '-') {
+        negative = (text[index] == '-');
+        ++index;
+    }
+    if (index >= text.size()) throw std::invalid_argument("fromBaseString: 没有数字");
+
+    Blk value{0};
+    for (; index < text.size(); ++index) {
+        const char c = text[index];
+        if (c == '.') {
+            throw std::invalid_argument("fromBaseString: 只支持整数，不接受小数点");
+        }
         int digit;
         if (c >= '0' && c <= '9') digit = c - '0';
         else if (c >= 'a' && c <= 'z') digit = c - 'a' + 10;
@@ -2185,158 +2586,287 @@ BigDecimal fromBaseString(std::string_view text, int base) {
         else throw std::invalid_argument(std::string("fromBaseString: 非法字符 '") + c + "'");
         if (digit >= base) throw std::invalid_argument("fromBaseString: 数字超出进制范围");
 
-        // value = value * base
-        std::uint64_t carry = 0;
-        for (std::size_t k = 0; k < value.size(); ++k) {
-            const std::uint64_t cur = static_cast<std::uint64_t>(value[k]) * base + carry;
-            value[k] = static_cast<std::uint32_t>(cur % kBase);
-            carry = cur / kBase;
-        }
-        if (carry) value.push_back(static_cast<std::uint32_t>(carry));
-
-        // value += digit
-        std::uint64_t add = static_cast<std::uint64_t>(digit);
-        for (std::size_t k = 0; k < value.size() && add; ++k) {
-            const std::uint64_t cur = static_cast<std::uint64_t>(value[k]) + add;
-            value[k] = static_cast<std::uint32_t>(cur % kBase);
-            add = cur / kBase;
-        }
-        if (add) value.push_back(static_cast<std::uint32_t>(add));
+        // value = value * base + digit
+        value = multiplyBlkByBase(value, static_cast<std::uint64_t>(base));
+        addToBlk(value, static_cast<std::uint64_t>(digit));
     }
-    while (value.size() > 1 && value.back() == 0) value.pop_back();
-    return BigDecimal::fromString(toDecimalString(value));
+
+    const std::string decimal = blocksToDecimalString(value);
+    if (negative) return BigDecimal::fromString("-" + decimal);
+    return BigDecimal::fromString(decimal);
 }
 
 BigDecimal bitwise(const BigDecimal& lhs, const BigDecimal& rhs, BitOp op) {
     if (!lhs.isInteger() || !rhs.isInteger()) {
         throw std::domain_error("bitwise: 只支持整数");
     }
-    const std::string a = toBinaryString(lhs.integerBlocks());
-    const std::string b = toBinaryString(rhs.integerBlocks());
-    const std::size_t width = std::max(a.size(), b.size());
+    switch (op) {
+        case BitOp::And:
+        case BitOp::Or:
+        case BitOp::Xor:
+            break;
+        default:
+            throw std::invalid_argument("bitwise: 未知位运算");
+    }
+
+    // 采用**无限位**二进制补码语义（与 Python 的 int 运算一致）：
+    // 负数的表示是符号扩展到无穷多位的补码。
+    //
+    // 有限串无法直接表达无穷符号扩展，但只要宽度足够，结果就与无限宽
+    // 度一致。宽度取 W = max(幅值位数) + 1：
+    //   and / or 的结果幅值不超过两者的最大值；
+    //   xor 在「一正一负」时幅值不超过 a + |b| < 2^(W-1)；
+    //   xor 在「两负」时结果为正且幅值不超过两者的最大值。
+    // 因此 W 位的有符号范围足以容纳结果。
+    //
+    // 幅值的二进制串只转换一次：宽度要用它的长度，补码也要用它。
+    const std::string bitsA = blocksToBinary(lhs.integerBlocks());
+    const std::string bitsB = blocksToBinary(rhs.integerBlocks());
+    const std::size_t width = std::max(bitsA.size(), bitsB.size()) + 1;
+
+    const std::string a = toTwosComplement(bitsA, lhs.sign(), width);
+    const std::string b = toTwosComplement(bitsB, rhs.sign(), width);
     std::string result(width, '0');
     for (std::size_t i = 0; i < width; ++i) {
-        const char ca = i < a.size() ? a[a.size() - 1 - i] : '0';
-        const char cb = i < b.size() ? b[b.size() - 1 - i] : '0';
+        const bool ca = (a[i] == '1');
+        const bool cb = (b[i] == '1');
         switch (op) {
-            case BitOp::And: result[width - 1 - i] = (ca == '1' && cb == '1') ? '1' : '0'; break;
-            case BitOp::Or:  result[width - 1 - i] = (ca == '1' || cb == '1') ? '1' : '0'; break;
-            case BitOp::Xor: result[width - 1 - i] = (ca != cb) ? '1' : '0'; break;
+            case BitOp::And: result[i] = (ca && cb) ? '1' : '0'; break;
+            case BitOp::Or:  result[i] = (ca || cb) ? '1' : '0'; break;
+            case BitOp::Xor: result[i] = (ca != cb) ? '1' : '0'; break;
         }
     }
-    return BigDecimal::fromString(toDecimalString(blocksFromBinary(result)));
+    return fromTwosComplement(result);
 }
 
 BigDecimal bitwiseNot(const BigDecimal& value) {
     if (!value.isInteger()) throw std::domain_error("bitwiseNot: 只支持整数");
-    // ~x = -x - 1
-    return (BigDecimal::fromString("-1") - value) - BigDecimal(1);
+    // ~x = -x - 1（对任何整数都成立，包括 x = 0 与 x = -1）。
+    return (BigDecimal(0) - value) - BigDecimal(1);
 }
 
 BigDecimal shiftLeft(const BigDecimal& value, int bits) {
     if (!value.isInteger()) throw std::domain_error("shiftLeft: 只支持整数");
     if (bits < 0) throw std::invalid_argument("shiftLeft: 位数不能为负");
-    BigDecimal result = value;
-    for (int i = 0; i < bits; ++i) result = result * BigDecimal(2);
-    return result;
+    if (bits > kMaxShiftBits) throw std::overflow_error("shiftLeft: 位数过大");
+    if (value.isZero() || bits == 0) return value;
+
+    // 精确地乘以 2^bits：走 BigDecimal 的精确乘法（十进制表示下 2 的幂
+    // 无损，只是位数增长）。用平方倍增而不是逐次乘 2，复杂度从
+    // O(bits) 次乘法降到 O(log bits) 次。
+    BigDecimal factor(1);
+    BigDecimal two(2);
+    int remaining = bits;
+    while (remaining > 0) {
+        if (remaining & 1) factor = factor * two;
+        remaining >>= 1;
+        if (remaining > 0) two = two * two;
+    }
+    return value * factor;
 }
 
 BigDecimal shiftRight(const BigDecimal& value, int bits) {
     if (!value.isInteger()) throw std::domain_error("shiftRight: 只支持整数");
     if (bits < 0) throw std::invalid_argument("shiftRight: 位数不能为负");
-    // 右移是精确的整数除法：除数是 2 的幂，结果一定整除，
-    // 所以精度只需覆盖商的位数，无需写死一个巨大值
-    // （precision=1000000 会让单次除法超过 3 分钟）。
-    // 商的位数 = 原值位数 + bits 的十进制位数 + 1，足够保险。
-    BigDecimal result = value;
-    int decimalDigits = 0;
-    for (BigDecimal probe = value; !probe.isZero(); probe = probe * BigDecimal(10)) {
-        ++decimalDigits;
-        if (decimalDigits > 4096) break;   // 防御：避免病态输入导致死循环
+    if (value.isZero() || bits == 0) return value;
+
+    // 右移 = 整除 2^bits。**在二进制上做**才能保证无损：十进制块上
+    // 除以 2^k 是错的（10^9 不是 2 的幂）。
+    //
+    // 负数**向 -∞ 取整**（与 Python 的 >> 一致）：-1 >> 100 == -1。
+    // 即 magnitude_result = ceil(|v| / 2^bits)。
+    const std::string bitsOfValue = blocksToBinary(value.integerBlocks());
+    std::string shifted;
+    bool hasRemainder = false;
+    if (static_cast<std::size_t>(bits) >= bitsOfValue.size()) {
+        shifted = "0";
+        hasRemainder = (bitsOfValue.find('1') != std::string::npos);
+    } else {
+        const std::size_t cut = bitsOfValue.size() - static_cast<std::size_t>(bits);
+        shifted = bitsOfValue.substr(0, cut);
+        hasRemainder = (bitsOfValue.find('1', cut) != std::string::npos);
     }
-    const int precision = decimalDigits + bits / 3 + 2;
-    for (int i = 0; i < bits; ++i) {
-        result = BigDecimal::divide(result, BigDecimal(2),
-                                    Context{precision, RoundingMode::Down});
+
+    BigDecimal magnitude = BigDecimal::fromString(
+        blocksToDecimalString(blocksFromBinary(shifted)));
+    if (value.sign() < 0) {
+        // 负数向 -∞ 取整：幅值向上取整后再取负。
+        if (hasRemainder) magnitude = magnitude + BigDecimal(1);
+        return BigDecimal(0) - magnitude;
     }
-    return result;
+    return magnitude;
 }
 
 }  // namespace hpc
 ```
 
-- [ ] **Step 4: 写 `tests/tst_format.cpp`**
+- [x] **Step 4: `BigDecimal::fromString` 支持科学计数法**
+
+Task 4 遗留的缺口：内核原本不支持 `'e'` 记法。**扩展 `fromString`** 而不是
+在 Format 层另开一路 —— 因为科学计数法是**十进制字面量**的语法，
+属于数值表示层；`Format` 只负责「换一种基数表示同一个值」。
+
+实现要点（`BigDecimal.cpp`）：
 
 ```cpp
-#include "test_framework.h"
+    // 科学计数法：把指数部分分离出来。
+    //
+    // 指数之前的尾数用与原来完全相同的规则解析（可选小数点、前导零），
+    // 因此**已有输入的行为不变**：不含 'e'/'E' 的串走的是同一条路径。
+    //
+    // 指数本身必须是一个十进制整数（可带正负号），否则抛 invalid_argument。
+    int exponent = 0;
+    bool hasExponent = false;
+    for (std::size_t i = index; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c != 'e' && c != 'E') continue;
 
-#include <stdexcept>
+        std::size_t cursor = i + 1;
+        bool exponentNegative = false;
+        if (cursor < text.size() && (text[cursor] == '+' || text[cursor] == '-')) {
+            exponentNegative = (text[cursor] == '-');
+            ++cursor;
+        }
+        if (cursor >= text.size() || !std::isdigit(static_cast<unsigned char>(text[cursor]))) {
+            throw std::invalid_argument("BigDecimal: 指数部分非法");
+        }
+        long long magnitude = 0;
+        while (cursor < text.size() && std::isdigit(static_cast<unsigned char>(text[cursor]))) {
+            // 上限保护：避免 "1e99999999999" 之类的输入把内存吃光。
+            if (magnitude > kMaxExponentMagnitude) {
+                throw std::invalid_argument("BigDecimal: 指数过大");
+            }
+            magnitude = magnitude * 10 + (text[cursor] - '0');
+            ++cursor;
+        }
+        // 指数后面不允许再有别的字符（"1e5e6" 必须报错而不是丢掉 "e6"）。
+        if (cursor != text.size()) {
+            throw std::invalid_argument("BigDecimal: 指数后面有多余的字符");
+        }
+        exponent = static_cast<int>(exponentNegative ? -magnitude : magnitude);
+        hasExponent = true;
+        text = text.substr(0, i);
+        break;
+    }
+```
 
-#include "core/Format.h"
+尾数解析完后应用指数（**精确**移位，不引入舍入）：
 
-using hpc::BigDecimal;
+```cpp
+    if (hasExponent) {
+        if (exponent > 0) {
+            result.digits_ = shiftLeftDecimal(result.digits_, exponent);
+        } else if (exponent < 0) {
+            result.scale_ += -exponent;
+        }
+        result.normalize();
+    }
+```
 
-TEST(base, to_hex) {
-    CHECK_EQ(hpc::toBaseString(BigDecimal::fromString("255"), 16), std::string("ff"));
-    CHECK_EQ(hpc::toBaseString(BigDecimal::fromString("255"), 16, true), std::string("FF"));
-    CHECK_EQ(hpc::toBaseString(BigDecimal::fromString("0"), 2), std::string("0"));
-    CHECK_EQ(hpc::toBaseString(BigDecimal::fromString("10"), 2), std::string("1010"));
-    CHECK_EQ(hpc::toBaseString(BigDecimal::fromString("64"), 8), std::string("100"));
-}
+指数上限 `kMaxExponentMagnitude = 1000000`（正负两个方向都要限：
+正指数是天文数字，负指数是极小的分数，两者都会撑爆内存）。
 
-TEST(base, round_trip) {
+- [x] **Step 5: 写 `tests/tst_format.cpp`**
+
+覆盖：base 2..36 的**每一个**进制的往返性质（整数、负数、1000 位大数）、
+进制字符表上下两套、非法 base、空串、非法字符、数字越界、小数点、
+`+`/`-` 前缀、负零、位运算的负数（无限位补码语义）、`~0 == -1`、`~(-1) == 0`、
+移位 0/1/31/32/33/63/64/100/1000/200 位、负数右移向 -∞ 取整、
+移位与右移互逆、小数部分的整数部分精确 + 截断标记 + 尾随零去掉、
+科学计数法的解析与非法输入。
+
+**往返性质**（本任务的核心不变量）：
+
+```cpp
+TEST(base, round_trip_all_bases) {
     const std::string original = "123456789012345678901234567890";
-    const BigDecimal value = BigDecimal::fromString(original);
-    for (int base : {2, 8, 10, 16, 36}) {
+    const BigDecimal value = make(original);
+    for (int base = 2; base <= 36; ++base) {
         const std::string encoded = hpc::toBaseString(value, base);
         CHECK_EQ(hpc::fromBaseString(encoded, base).toString(), original);
     }
 }
-
-TEST(base, from_base) {
-    CHECK_EQ(hpc::fromBaseString("ff", 16).toString(), std::string("255"));
-    CHECK_EQ(hpc::fromBaseString("1010", 2).toString(), std::string("10"));
-    CHECK_EQ(hpc::fromBaseString("777", 8).toString(), std::string("511"));
-}
-
-TEST(bitwise, and_or_xor) {
-    CHECK_EQ(hpc::bitwise(BigDecimal::fromString("255"), BigDecimal::fromString("15"), hpc::BitOp::And).toString(),
-             std::string("15"));
-    CHECK_EQ(hpc::bitwise(BigDecimal::fromString("255"), BigDecimal::fromString("15"), hpc::BitOp::Or).toString(),
-             std::string("255"));
-    CHECK_EQ(hpc::bitwise(BigDecimal::fromString("255"), BigDecimal::fromString("15"), hpc::BitOp::Xor).toString(),
-             std::string("240"));
-    CHECK_EQ(hpc::bitwise(BigDecimal::fromString("0"), BigDecimal::fromString("0"), hpc::BitOp::Xor).toString(),
-             std::string("0"));
-}
-
-TEST(bitwise, shift) {
-    CHECK_EQ(hpc::shiftLeft(BigDecimal::fromString("1"), 8).toString(), std::string("256"));
-    CHECK_EQ(hpc::shiftRight(BigDecimal::fromString("256"), 8).toString(), std::string("1"));
-}
-
-TEST(bitwise, rejects_fraction) {
-    bool threw = false;
-    try {
-        hpc::bitwise(BigDecimal::fromString("1.5"), BigDecimal::fromString("1"), hpc::BitOp::And);
-    } catch (const std::domain_error&) { threw = true; }
-    CHECK(threw);
-}
 ```
 
-- [ ] **Step 5: 构建并运行测试**
+- [x] **Step 6: 写差分测试 `tests/format_probe.cpp` 与 `scripts/verify_format.py`**
+
+探针读入一行命令（用 `|` 分隔字段），输出结果：
+
+```
+tobase <base> <uppercase 0|1> <fractionDigits> <十进制值>
+frombase <base> <base进制字符串>
+and|or|xor <十进制值A> <十进制值B>
+not <十进制值>
+shl <十进制值> <位数>
+shr <十进制值> <位数>
+```
+
+`scripts/verify_format.py` 的参考实现：
+
+- 进制转换：手工实现 base 2..36 的格式化（语义与 CPython 的 `int(s, base)` 对齐）
+- 位运算：直接用 Python 的 int（无限位二进制补码语义，正是本实现的目标语义）
+- 右移：Python 的 `>>`（负数向 -∞ 取整）
+- 小数部分：用 `fractions.Fraction` 精确做，独立复现「整数部分精确 +
+  尾随零去掉 + 截断标记」的规则
+
+**实测结果**（本实现）：
+
+| 项 | 结果 |
+|----|------|
+| 差分测试 | **1699 / 1699 通过** |
+| 单元测试 | **92 / 92 个用例，失败 0 个断言** |
+| MSVC 构建 | 零警告 |
+| GCC 构建 | 零警告 |
+
+其余三个差分测试（除法 / 超越函数 / 取模）在本任务改动 `fromString`
+之后**仍然全绿**（484/484、730/730、1323/1323）。
+
+- [x] **Step 7: 构建并运行测试**
 
 ```bash
 ./scripts/build-core.bat && ./scripts/run-ctest.bat
+python scripts/verify_format.py ./build/format_probe.exe
 ```
 预期：全部通过。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 8: 提交**
 
 ```bash
-git add src/core tests/tst_format.cpp
+git add src/core tests/tst_format.cpp tests/format_probe.cpp scripts/verify_format.py CMakeLists.txt
 git commit -m "feat(core): 进制转换与整数位运算"
 ```
+
+---
+
+#### 初稿缺陷清单（本任务修正的 8 处）
+
+| # | 位置 | 缺陷 | 后果 |
+|---|------|------|------|
+| 1 | `toBinaryString` | 逐块「取 32 位」直接拼成二进制串 —— 但块的基数是 **10^9**，不是 2^32 | **静默算错**：`9223372036854775807` 的二进制被算成 `166980072253701675007` 而不是 `9223372036854775807`。改成真的做除以 2^32 的长除法 |
+| 2 | `addOneBinary` | 从全零串开始加一，进位链之外的高位被抹成 0 | 负数的补码全错：`5 \| -3` 得 `5`（应为 `-3`）、`5 ^ -3` 得 `4`（应为 `-8`） |
+| 3 | `shiftRight` | 用 `BigDecimal::divide` 逐位除以 2，精度按 `decimalDigits + bits/3 + 2` 估算 | 除法会**按有效数字位舍入**，右移因此不精确；且 `decimalDigits` 是用 `probe * 10` 循环数出来的，O(n²)。改成**在二进制上直接移位**，完全无损且 O(位数/32) |
+| 4 | `shiftRight` 的负数语义 | brief 用 `RoundingMode::Down`（向零截断） | 与 Python 的 `>>`（向 -∞）不一致：`-1 >> 100` 得 `0` 而不是 `-1`。改为向 -∞ 取整 |
+| 5 | `bitwise` 的负数 | 直接把两个数的**幅值**二进制串按位运算 | 负数参与运算的结果全错。改成**无限位二进制补码**语义（宽度取 max(幅值位数)+1） |
+| 6 | `fromBaseString` | 不处理前导 `-`，且 `+` 也不支持 | `-ff` 解析成非法字符。补上符号处理 |
+| 7 | `toBaseString` 的小数部分 | brief 直接拒绝非整数输入 | 与规格 §2.5「显式标注截断」冲突。实现为：整数部分精确无损，小数部分按目标进制截断并用 `"..."` 标记 |
+| 8 | `toBaseString` 的负数 | 符号被忽略（只处理了幅值） | `-255` 在十六进制下输出 `ff` 而不是 `-ff` |
+
+另外两处**实测发现的性能/正确性问题**（初稿没有、但实现过程中暴露）：
+
+| # | 位置 | 问题 | 修法 |
+|---|------|------|------|
+| 9 | `truncateToInteger` | 只把最低块除以 10^rest，块边界与十进制位边界不对齐时全错 | 改为「丢掉整块 + 整块级长除法逐位除」，O(块数) |
+| 10 | `blocksToBinary` / `blocksFromBinary` | 逐位 Horner 法是 O(位数 × 块数) | 改为每次处理 32 位，O(位数/32 × 块数) |
+
+#### 语义决策（与 brief 的差异）
+
+| 项 | brief | 本实现 | 理由 |
+|----|-------|--------|------|
+| 负数位运算 | 未定义 | 无限位二进制补码（与 Python 的 int 一致） | 唯一自然且与主流语言一致的定义；Python 的 `int` 是事实上的基准 |
+| 负数右移 | 向零截断 | 向 -∞ 取整（与 Python 的 `>>` 一致） | 同上 |
+| 小数转进制 | 抛 `domain_error` | 整数部分精确 + 小数部分截断并用 `"..."` 标记 | 规格 §2.5 明确要求「显式标注截断，不做无声的近似」 |
+| 截断标记字符 | 无 | ASCII 的 `"..."` | 中文 `…` 在 Windows 的 GBK 代码页下会破坏控制台输出与 Python 子进程的解码 |
+| 科学计数法 | 不支持 | 扩展 `BigDecimal::fromString` | 科学计数法是十进制**字面量**的语法，属于数值表示层；`Format` 只负责换基数 |
 
 ---
 
