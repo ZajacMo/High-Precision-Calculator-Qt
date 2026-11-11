@@ -5733,7 +5733,9 @@ printf '4\n+ 1 2\n- 5 3\n* 2.5 4\n/ 10 4\n' | ./build/hpc_cli --oj
 ```
 预期依次输出：`3`、`2`、`10`、`2.5`。
 
-**关键**：OJ 模式的输出必须与 legacy 完全一致。用 legacy 的可执行文件对照：
+**关键**：OJ 模式的**协议**（输入格式、`ERROR` 触发条件、千位分隔符、除数阈值、
+舍入位数）必须与 legacy 对齐；legacy 的**算术缺陷与崩溃不刻意复现**。
+用 legacy 的可执行文件对照：
 
 ```bash
 printf '4\n+ 1 2\n- 5 3\n* 2.5 4\n/ 10 4\n' | ./build/hpc_cli --oj > /tmp/new.txt
