@@ -3669,7 +3669,7 @@ inline constexpr int kMaxExpressionNestingDepth = 256;
 //
 //   expression := term (('+' | '-') term)*
 //   term       := unary (('*' | '/' | '%') unary)*
-//   unary      := ('+' | '-') unary | primary
+//   unary      := ('+' | '-')* primary
 //   primary    := number | '(' expression ')' | name '(' args ')'
 //
 // 数字支持十进制小数、**科学计数法**（1e20、2.5E-3）与 0x/0b/0o 前缀
@@ -4202,6 +4202,7 @@ BigDecimal evaluate(std::string_view expression, const Context& context) {
 ```cpp
 #include "test_framework.h"
 
+#include <exception>
 #include <string>
 
 #include "core/Expression.h"
@@ -4212,6 +4213,10 @@ using hpc::ExpressionError;
 using hpc::RoundingMode;
 
 namespace {
+
+// volatile 读取不会被常量折叠，从而保证断言在运行时求值，
+// 否则 MSVC /W4 会因常量条件表达式报 C4127。
+volatile int kOne = 1;
 
 // 求值并返回结果。
 //
@@ -4480,11 +4485,26 @@ TEST(expression, divisionByZero) {
     CHECK(evalOrError("1/0").rfind("!", 0) == 0);
     CHECK(evalOrError("1/(2-2)").rfind("!", 0) == 0);
     CHECK(evalOrError("1%0").rfind("!", 0) == 0);
-    // 抛的是 ExpressionError（不是内核的 domain_error）。
+    // 抛的必须是 **ExpressionError**，而不是内核的 domain_error。
+    //
+    // 这里不能只用 tryEval —— 它只捕获 ExpressionError，内核的
+    // domain_error 若漏出来会**一路传播出去**，而测试框架的 main
+    // **不捕获**异常：整个测试二进制直接终止，后面几十个用例一个都
+    // 跑不到，失败原因也被淹没。所以要显式地 catch 住 std::exception，
+    // 断言「漏出来的不是别的东西」。
     int position = -1;
     std::string message;
     CHECK(!tryEval("1/0", position, message));
-    CHECK(!tryEval("1/0", position, message));
+
+    bool threwExpressionError = false;
+    try {
+        hpc::evaluate("1/0", Context{20, RoundingMode::HalfEven});
+    } catch (const ExpressionError&) {
+        threwExpressionError = true;
+    } catch (const std::exception&) {
+        threwExpressionError = false;
+    }
+    CHECK(threwExpressionError);
 }
 
 TEST(expression, domainErrorsAreExpressionErrors) {
@@ -4509,6 +4529,32 @@ TEST(expression, domainErrorsAreExpressionErrors) {
         caughtAsExpressionError = false;
     }
     CHECK(caughtAsExpressionError);
+}
+
+// 零底数的次幂：三种情形必须分清。
+//
+// 内核的契约（BigDecimal.h 的「定义域之外抛 std::domain_error」）：
+//   - 零的**负**数次幂 → 定义域错误
+//   - 零的**零**次幂   → 定义域错误（decimal 规范里也是非法运算）
+//   - 零的**正**数次幂 → 0（**不是**错误！与 Python 的 decimal 一致）
+//
+// 最后一条最容易搞错：非整数指数走的是 exp(b·ln a) 那条超越函数的路，
+// 而 ln(0) 是未定义的 —— 但 0^正数仍然有定义 0，内核为此专门在
+// 「负底数未定义」之前先判零底数。
+TEST(expression, zeroBasePower) {
+    // 整数指数。
+    CHECK_EQ(eval("pow(0,2)").toString(), std::string("0"));
+    CHECK_EQ(eval("pow(0,10)").toString(), std::string("0"));
+    // 非整数指数：**有定义**，结果是 0。
+    CHECK_EQ(eval("pow(0,0.5)").toString(), std::string("0"));
+    CHECK_EQ(eval("pow(0,1.5)").toString(), std::string("0"));
+    CHECK_EQ(eval("pow(0,2.5)").toString(), std::string("0"));
+    // 零次幂与负数次幂：定义域错误。
+    CHECK(evalOrError("pow(0,0)").rfind("!", 0) == 0);
+    CHECK(evalOrError("pow(0,-1)").rfind("!", 0) == 0);
+    CHECK(evalOrError("pow(0,-0.5)").rfind("!", 0) == 0);
+    // 负底数的非整数次幂仍然是错误（这条不能被零底数的规则带跑）。
+    CHECK(evalOrError("pow(-2,0.5)").rfind("!", 0) == 0);
 }
 
 TEST(expression, unknownFunction) {
@@ -4751,6 +4797,25 @@ TEST(expression, structuralSafety) {
     CHECK(evalOrError("1/0.0").rfind("!", 0) == 0);
     CHECK(evalOrError("1/(0*5)").rfind("!", 0) == 0);
 }
+
+// --- 负向自测 ---
+//
+// 验证断言失败**确实会被计数**。
+//
+// 若 reportFailure 退化成空操作，上面的用例照样全绿，而这套测试的
+// 全部意义就在于「失败能被检出」。failureCount() 返回引用，可存可
+// 复原；复原后 main 的 before/after 差值为 0，全局计数仍是 0，
+// 本用例本身判为 ok（main 会打印一行 FAIL，但那是**故意**的）。
+//
+// 这个自测放在**每个**测试文件里，而不是集中一处：每个文件的断言
+// 都必须自己证明「失败能被检出」，否则某个文件里的断言全部失效
+// （比如 CHECK 宏被误改）时，那个文件会**静默地**全绿。
+TEST(expression, frameworkDetectsFailures) {
+    const int before = ::testing::failureCount();
+    CHECK(kOne == 2);                                     // 故意失败
+    CHECK(::testing::failureCount() == before + 1);
+    ::testing::failureCount() = before;                   // 复原，避免污染全局计数
+}
 ```
 
 - [x] **Step 4: 写 `tests/expression_probe.cpp`（差分探针）**
@@ -4859,16 +4924,22 @@ int main(int argc, char** argv) {
 不接受 Context），所以这些用例用 Fraction 精确比较；只有除法与超越函数
 才按精度舍入。求值模型必须与内核一致，否则差分会报一堆假阳性。
 
-**实测**：1589 / 1589 通过。
+**零底数的次幂**：参考实现必须与内核的契约一致（`BigDecimal.h` 的
+「定义域之外抛 std::domain_error」）：零的**负**数次幂与**零**次幂是
+定义域错误，零的**正**数次幂是 `0`（**不是**错误，与 Python 的
+`decimal` 一致）。非整数指数的用例生成器要**能取到零底数** ——
+否则 `0^正数` 这条路径永远测不到，一旦内核改错，差分根本不会报警。
+
+**实测**：1595 / 1595 通过。
 
 - [x] **Step 6: 构建并运行测试**
 
 ```bash
 ./scripts/build-core.bat && ./scripts/run-ctest.bat
 ```
-预期：全部通过（142 / 142）。
+预期：全部通过（144 / 144）。
 
-**实测**：MSVC 与 GCC 都是 142 / 142，零警告。
+**实测**：MSVC 与 GCC 都是 144 / 144，零警告。
 
 - [x] **Step 7: 提交**
 
@@ -4945,15 +5016,21 @@ brief 的代码是**从未运行过的初稿**。下表的每一行都由
 
 #### 差分测试的变异验证
 
-差分脚本本身也要证明「能抓错」。往实现里注入两个已知的错误，确认脚本
+差分脚本本身也要证明「能抓错」。往实现里注入已知的错误，确认脚本
 报出对应的失败数：
 
 | 注入的错误 | 差分脚本的结果 |
 |------------|---------------|
-| `-` 改成**右结合**（`a-b-c` 变成 `a-(b-c)`） | 1549 / 1589 —— 40 个用例失败 |
-| 取余的符号跟随**除数**（应为被除数） | 1412 / 1589 —— 177 个用例失败 |
+| `-` 改成**右结合**（`a-b-c` 变成 `a-(b-c)`） | 1326 / 1595 —— 269 个用例失败 |
+| 取余的符号跟随**除数**（应为被除数） | 1540 / 1595 —— 55 个用例失败 |
+| `0^正数` 改成**定义域错误**（应返回 0） | 1579 / 1595 —— 16 个用例失败 |
+| `0^正数` 改成返回 **1**（应返回 0） | 1579 / 1595 —— 16 个用例失败 |
 
-两次注入都在还原后回到 1589 / 1589。
+后两行是**复审补上的**：原先的参考实现把 `0^非整数指数` 一律当成错误，
+于是这两个注入都测不出来 —— 差分脚本对着**错误**的实现报 1589 / 1589
+全绿。参考实现改正后，同样的注入立刻被抓出来。
+
+四次注入都在还原后回到 1595 / 1595。
 
 ### Task 7: 命令行前端
 

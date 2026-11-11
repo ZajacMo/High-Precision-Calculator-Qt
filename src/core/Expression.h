@@ -44,7 +44,7 @@ inline constexpr int kMaxExpressionNestingDepth = 256;
 //
 //   expression := term (('+' | '-') term)*
 //   term       := unary (('*' | '/' | '%') unary)*
-//   unary      := ('+' | '-') unary | primary
+//   unary      := ('+' | '-')* primary
 //   primary    := number | '(' expression ')' | name '(' args ')'
 //
 // 数字支持十进制小数、**科学计数法**（1e20、2.5E-3）与 0x/0b/0o 前缀
