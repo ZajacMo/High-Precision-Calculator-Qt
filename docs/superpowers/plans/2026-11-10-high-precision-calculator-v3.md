@@ -1273,10 +1273,30 @@ git commit -m "feat(core): 除法、舍入策略与显式 Context 精度"
     // 定义域之外抛 std::domain_error：
     //   sqrt：负数
     //   ln / log10：非正数
-    //   pow：负底数的非整数次幂、零的负数次幂
+    //   pow：负底数的非整数次幂、零的负数次幂、零的零次幂
     //
     // 结果规模超出可计算范围时抛 std::overflow_error（exp 的参数过大、
-    // pow 的整数指数过大）。
+    // pow 的整数指数过大、pow 的结果位数过大）。
+    //
+    // 精度超出上限时抛 std::invalid_argument：
+    //
+    //   - sqrt / exp / ln / log10 与 pow 的**非整数指数**分支：
+    //     context.precision > kMaxTranscendentalPrecision。
+    //     这五个入口的工作精度是平方级的（见 kMaxTranscendentalPrecision
+    //     的实测数据），p=1600 时 pow(2, 0.5) 要跑 151 s，p=99990 更是
+    //     永远算不完 —— 而且失败方式**不一致**（有的精度下内层的 divide
+    //     恰好抛异常，有的精度下则一路挂起）。统一的 std::invalid_argument
+    //     让调用方拿到确定的行为。
+    //
+    //   - divide / roundToPrecision / floor / ceil / round：
+    //     context.precision > kMaxPrecision。除法的代价随精度线性增长，
+    //     p=100000 时单次要几十秒 —— 能算完，但已经不值得。
+    //
+    // 注意两者的区别：**pow 的整数指数分支不受
+    // kMaxTranscendentalPrecision 约束** —— 整数次幂走的是精确的快速幂，
+    // 代价由 kMaxIntegerPower（指数）与 kMaxPowerResultDigits（结果位数）
+    // 单独约束，与超越函数的工作精度毫无关系。pow(10, 100000) 在
+    // precision=2000 下完全合法。
 
     // 平方根。
     static BigDecimal sqrt(const BigDecimal& value, const Context& context);
@@ -1323,57 +1343,14 @@ constexpr int kMaxExpArgumentExponent = 5;
 // 足以把 k 定死（差 1 位会在后面被修正回来，见 expInternal）。
 constexpr int kExpProbePrecision = 20;
 
-// 超越函数的精度上限。
+// 超越函数的精度上限、整数幂的指数与结果位数上限、科学计数法的指数上限
+// 都是**公开契约**，声明在 BigDecimal.h（见那里的实测数据）。
 //
-// 与 divide / roundToPrecision 的 kMaxPrecision 不同：超越函数的
-// 工作精度是**平方级**的。实测（本机 GCC -O2，最坏情况是 pow(2, 0.5)）：
-//
-//   p=200  →    413 ms
-//   p=400  →   3.4 s
-//   p=800  →    22 s
-//   p=1600 →   151 s
-//   p=1000（exp）→  23 s
-//
-// 也就是说 kMaxPrecision = 100000 对超越函数而言远远不够 ——
-// 它们在 p=1600 时就已经要两分半，p=99990 更是永远算不完。
-//
-// 所以超越函数单独用一个上限，取 1000：最坏情况约 40 秒，
-// 属于「可接受的慢」而不是「永远算不完」。
-//
-// 这是**产品决策**而非数学限制 —— 真正需要更高精度的调用方
-// 应该分批求值（例如先用 1000 位求出前导部分再细化）。
-constexpr int kMaxTranscendentalPrecision = 1000;
-
-// 整数幂的指数上限。
-constexpr long long kMaxIntegerPower = 100000;
-
-// 整数幂结果的位数上限（防止 10^100000 这类天文数字）。
-//
-// 上限按**结果的十进制位数**估算，整数位与小数位都算在内。
-//
-// 估算式：结果位数 <= power × (底数的有效位数 + 底数的小数位数)。
-//
-// 底数 |b| 有 s 位有效数字、t 位小数时，|b| ∈ [10^(s-1-t), 10^(s-t))，
-// 于是 |b^power| 的位数不超过 power × (s + t)：
-//   - 值 >= 1 时：整数位 <= power × (s - t) <= power × (s + t)
-//   - 值 <  1 时：小数位 <= power × (t - s + 1) <= power × (s + t)
-//
-// 所以这个估算**总是 >= 实际位数**（最多高估 3 倍），上限因此是硬约束。
-//
-// 只看底数的整数位数会完全漏掉小数底数：0.001 的整数位数是 -2，
-// 那个「整数位数 > 0」的判据会把整个护栏跳过，而结果的**小数位数**
-// 恰恰是按 power 线性增长的 —— 0.001^100000 需要 30 万位小数。
-//
-// 实测（本机 GCC -O2，precision=20）：
-//
-//   pow(2, 100000)              511 ms     结果 3 万位
-//   pow(3, 100000)             1325 ms     结果 4.8 万位
-//   pow(10, 100000)            8041 ms     结果 10 万位
-//   pow(0.001, 100000)        67598 ms     结果 30 万位小数
-//
-// 30 万位已经要一分多钟，所以上限取 30 万：
-// 估算 <= 30 万 ⟹ 实际位数 <= 30 万 ⟹ 单次不超过一分多钟。
-constexpr int kMaxPowerResultDigits = 300000;
+//   inline constexpr int      kMaxPrecision = 100000;
+//   inline constexpr int      kMaxTranscendentalPrecision = 1000;
+//   inline constexpr long long kMaxIntegerPower = 100000;
+//   inline constexpr int      kMaxPowerResultDigits = 300000;
+//   inline constexpr long long kMaxExponentMagnitude = 1000000;
 
 // 十进制整数的最大位数（用于 long long 溢出保护）。
 constexpr int kMaxIntegerDigits = 18;
@@ -1936,14 +1913,21 @@ BigDecimal BigDecimal::log10Internal(const BigDecimal& value, const Context& wor
 BigDecimal BigDecimal::pow(const BigDecimal& base, const BigDecimal& exponent,
                            const Context& context) {
     if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
-    if (context.precision > kMaxTranscendentalPrecision) {
-        throw std::invalid_argument("BigDecimal: precision 超出超越函数的上限");
-    }
 
     // 整数指数走快速幂，结果精确。
     //
     // 判定「整数」用 scale_ == 0（值本身就是整数），而不是解析字符串 ——
     // brief 原实现手工解析字符串成 long long，超过 10^18 的指数会静默溢出。
+    //
+    // 注意这里**没有** kMaxTranscendentalPrecision 的闸：整数次幂是**精确**
+    // 运算，代价由 kMaxIntegerPower（指数）与 kMaxPowerResultDigits
+    // （结果位数）约束，与超越函数的工作精度毫无关系。
+    //
+    // 早先的版本把超越函数的闸放在 pow 的最前面，于是 pow(2, 100) 在
+    // precision=2000 时被拒 —— 那是一个它根本不该管的能力：
+    // 「超越函数」的上限按定义就不适用于精确的整数次幂。
+    // pow(10, 100000) 在 precision=2000 下完全合法（结果 10 万位，
+    // 实测约 7 s）。
     if (exponent.scale_ == 0) {
         // 指数过大时直接报溢出，而不是让乘法算出天量数字。
         if (abs(exponent).compare(BigDecimal(static_cast<std::int64_t>(kMaxIntegerPower))) > 0) {
@@ -1976,6 +1960,13 @@ BigDecimal BigDecimal::pow(const BigDecimal& base, const BigDecimal& exponent,
 
     // 非整数指数：pow(a,b) = exp(b·ln a)。
     //
+    // 这一条才是真正的超越函数路径，工作精度是平方级的，因此受
+    // kMaxTranscendentalPrecision 约束 —— 闸门放在**这条分支上**，
+    // 而不是 pow 的入口。
+    if (context.precision > kMaxTranscendentalPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出超越函数的上限");
+    }
+
     // 零底数要先单独处理：0^正数 = 0 是有定义的（与 Python 一致），
     // 不能落进「负底数未定义」那条路。
     if (base.isZero()) {
@@ -2080,6 +2071,19 @@ python scripts/verify_func.py ./build/func_probe.exe
 
 单元测试：`67 / 67 个用例，失败 0 个断言`。
 
+**复审后追加的回归用例**（`tests/tst_transcendental.cpp`）：
+
+- `pow, integer_exponent_ignores_transcendental_ceiling` — 精度高于
+  `kMaxTranscendentalPrecision` 时，**整数指数**的幂必须照常算出且精确
+  （`pow(2, 100)` @ p=2000 得 `1267650600228229401496703205376`）。
+- `pow, non_integer_exponent_still_rejects_precision_above_ceiling` — 非整数
+  指数仍抛 `std::invalid_argument`；恰好在上限上（p=1000）则允许。
+- `pow, integer_exponent_result_digits_limit_still_applies` — 整数次幂**真正**的
+  上限仍然生效：`0.001^100000` 与 `2^(10^20)` 抛 `std::overflow_error`。
+
+以及 `tests/tst_bigdecimal.cpp` 的 `scientific, enforces_exponent_limit_exactly`：
+`1e999999` 接受、`1e1000001`/`1e1000009`/`1e1000010`/`1e9999999` 拒绝。
+
 - [x] **Step 9: 提交**
 
 ```bash
@@ -2133,6 +2137,34 @@ git commit -m "feat(core): sqrt/pow/exp/ln/log10 超越函数实现"
 - **缺陷 10**：新增 `kMaxTranscendentalPrecision = 1000`。超越函数的工作精度是**平方级**的
   （实测 `pow(2, 0.5)`：p=200 → 413 ms，p=1600 → 151 s），所以 100000 这个上限对它们远远不够。
   五个入口统一抛 `std::invalid_argument`。
+
+**复审发现的 2 处 Important**（上面三处挂起缺陷的修复本身是对的，数学与
+2790 个新旧用例逐字节一致；问题出在修复引入的两处副作用）：
+
+| # | 位置 | 缺陷 | 后果 |
+|---|------|------|------|
+| 11 | `pow` 的精度闸门位置 | 闸门放在 `pow` 的**最前面**，在 `exponent.scale_ == 0` 的整数指数分支**之前** | 精确的整数次幂被当成超越函数而被拒。`pow(10, 100000)`（p=1000 时合法、结果精确、约 7 s）与 `pow(2, 100)`（p=2000）在修复前都能算，修复后一律抛「precision 超出超越函数的上限」。上限的名字就叫「超越函数」，而精确整数次幂不是超越函数 —— 整数次幂的代价由 `kMaxIntegerPower`（指数）与 `kMaxPowerResultDigits`（结果位数）约束，与超越函数的工作精度毫无关系 |
+| 12 | `BigDecimal.cpp` 的指数守卫注释 | 注释写的是「检查必须**在把当前位折进 magnitude 之后**做」，而代码仍是折进**之前**检查 | 注释与代码互相矛盾，实际接受的上限是 10^7 而不是文档写的 10^6（`1e1000009`/`1e1000010`/`1e9999999` 全部被接受）。已随 Task 5 的评审修复一并改掉（检查改为 `magnitude > (kMaxExponentMagnitude - digit) / 10`） |
+
+修正要点：
+
+- **缺陷 11**：闸门下移到 `pow` 的**非整数指数**分支。那条分支才是真正的
+  超越函数路径（`exp(b·ln a)`），工作精度是平方级的；整数指数分支走的是
+  精确的快速幂，不受此约束。
+- **缺陷 12**：见 Task 5 的「评审修复清单」第 13 条。
+
+**另外补上的 2 处 Minor**：
+
+- **前端给的精度上限要跟内核对齐**。Task 7/8/9 原本写的是
+  「Web API 接受 precision ≤ 100000、Web UI `max="10000"`、Qt `setRange(1, 10000)`」，
+  而内核对超越函数的上限是 1000 —— 用户会拿到一个用不了的取值。
+  现在三处都改成 1000（`kMaxTranscendentalPrecision`），命令行帮助里把
+  两个上限都写清楚。
+- **头文件要写明新异常**。`BigDecimal.h` 的超越函数注释里补上
+  「precision 超出上限抛 `std::invalid_argument`」，并区分
+  `kMaxTranscendentalPrecision`（超越函数）与 `kMaxPrecision`（除法/舍入）。
+  上限常量本身也提到头文件里 —— 那是**公开契约**，前端要靠它判断能请求
+  多大的精度。
 
 ---
 
@@ -3928,6 +3960,12 @@ git commit -m "feat(core): 表达式解析与求值器"
   - `hpc_cli -e "<表达式>"` —— 单次求值
   - `hpc_cli --oj` —— 批量 OJ 协议（与原命令行版完全一致）
 
+> **精度上限**：`-p/--precision` 的上限是 `kMaxPrecision`（100000），
+> 但表达式里一旦出现超越函数（sqrt/exp/ln/log10/pow），精度就受
+> `kMaxTranscendentalPrecision`（1000）约束 —— 内核会抛
+> `std::invalid_argument`。帮助文本要把这两个上限都写清楚，
+> 否则用户只能在撞到异常之后才知道有上限。
+
 - [ ] **Step 1: 写 `src/cli/main.cpp`**
 
 ```cpp
@@ -3961,9 +3999,18 @@ void printUsage() {
   函数        sqrt(x) abs(x) pow(x,y) exp(x) ln(x) log10(x)
 
 选项:
-  -p, --precision <n>   有效数字位数（默认 30）
+  -p, --precision <n>   有效数字位数（默认 30，上限 100000）
   -b, --base <n>        输出进制，2..36（默认 10）
   -h, --help            显示本帮助
+
+精度上限（内核的公开契约，见 BigDecimal.h）：
+  除法/舍入   kMaxPrecision                = 100000
+  超越函数     kMaxTranscendentalPrecision = 1000
+  （sqrt / exp / ln / log10，以及 pow 的**非整数指数**分支）
+
+注意：表达式里只要用到超越函数，精度就不能超过 1000 —— 再高内核会抛
+std::invalid_argument（工作精度是平方级的，p=1600 时 pow(2, 0.5) 要跑 151 s）。
+pow 的**整数指数**分支不受这个限制（那是精确的快速幂）。
 
 OJ 批量协议（与原命令行版一致）:
   首行是测试组数，随后每行是 "运算符 数字1 数字2"。
@@ -4151,6 +4198,13 @@ git commit -m "feat(cli): 交互/单次/OJ 三模式命令行前端"
   - `POST /api/convert` body `{"value": "...", "from": 16, "to": 10}`
   - `POST /api/bitwise` body `{"op": "&", "lhs": "...", "rhs": "..."}`
 
+> **精度上限**：`precision` 字段夹到 `kMaxTranscendentalPrecision`（1000）。
+> `/api/evaluate` 的表达式里可以用超越函数（sqrt/exp/ln/log10/pow），
+> 那些函数的内核上限就是 1000 —— 放行更高的值只会让用户拿到一个
+> 「precision 超出超越函数的上限」的 400，而不是一个算得出来的结果。
+> Web UI 的 `<input type="number">` 的 `max` 同样取 1000，
+> 两个界面上限必须与内核一致，否则 UI 会提供用不了的取值。
+
 - [ ] **Step 1: 复制 Json 与 HttpServer 到 `src/core/`**
 
 ```bash
@@ -4331,11 +4385,20 @@ std::string stringField(const Object& body, const std::string& key,
 }
 
 // 取有效数字位数，缺省 30，越界回落到 30。
+//
+// 上限取 kMaxTranscendentalPrecision（1000）而不是 kMaxPrecision（100000）：
+// /api/evaluate 的表达式里可以出现 sqrt / exp / ln / log10 / pow，
+// 那些函数的工作精度是平方级的 —— p=1600 时 pow(2, 0.5) 要跑 151 s，
+// p=99990 更是永远算不完。内核对它们统一抛 std::invalid_argument。
+//
+// 这里提前夹到 1000，是为了让**请求本身**带着一个可用的精度，
+// 而不是让用户拿到一个「precision 超出超越函数的上限」的 400。
+// 只做加减乘除的表达式其实能到 100000 位，那条路走 /api/arithmetic。
 int precisionField(const Object& body) {
     const auto it = body.find("precision");
     if (it == body.end() || !it->second.isNumber()) return 30;
     const int precision = static_cast<int>(it->second.asNumber(30));
-    return precision > 0 && precision <= 100000 ? precision : 30;
+    return precision > 0 && precision <= hpc::kMaxTranscendentalPrecision ? precision : 30;
 }
 
 Response handleHealth(const Request&) {
@@ -4565,7 +4628,7 @@ int main(int argc, char** argv) {
             <label for="expr">表达式</label>
             <input id="expr" type="text" value="1/3 + 2*sqrt(9)" autocomplete="off">
             <div class="controls">
-                <label>精度 <input id="precision" type="number" value="30" min="1" max="10000"></label>
+                <label>精度 <input id="precision" type="number" value="30" min="1" max="1000"></label>
                 <label>输出进制
                     <select id="base">
                         <option value="10">10</option>
@@ -4779,6 +4842,11 @@ git commit -m "feat(web): REST API、内置 HTTP 服务与原生 Web 前端"
 - Consumes: Task 2-6 的核心接口
 - Produces: `hpc_gui` 可执行文件（仅 `-DBUILD_GUI=ON` 时构建）；`gui_smoke` 离屏渲染测试
 
+> **精度上限**：精度选择框的范围是 `1 .. kMaxTranscendentalPrecision`（1000）。
+> 表达式框里可以用 sqrt/exp/ln/log10/pow，那些函数的内核上限就是 1000 ——
+> 让用户能选到 10000 却拿回一个「precision 超出超越函数的上限」的错误，
+> 是界面上限与内核上限不一致造成的，不是内核的问题。
+
 - [ ] **Step 1: 在 `CMakeLists.txt` 加入 GUI 目标**
 
 ```cmake
@@ -4891,7 +4959,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     auto* controls = new QHBoxLayout();
     controls->addWidget(new QLabel("精度", central));
     precision_ = new QSpinBox(central);
-    precision_->setRange(1, 10000);
+    // 上限取 kMaxTranscendentalPrecision：表达式里可以用 sqrt/exp/ln/log10，
+    // 它们的精度上限是 1000（再高内核抛 std::invalid_argument）。
+    precision_->setRange(1, hpc::kMaxTranscendentalPrecision);
     precision_->setValue(30);
     controls->addWidget(precision_);
 
