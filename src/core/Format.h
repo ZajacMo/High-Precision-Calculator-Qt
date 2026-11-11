@@ -14,13 +14,16 @@ namespace hpc {
 //
 // 小数部分：按目标进制逐位提取，最多输出 fractionDigits 位。该进制下无法
 // 有限表示时，末尾用 "..." 显式标记截断 —— 不做无声的近似。
-// fractionDigits 为 0 时按 value 自身的十进制精度自动推算位数
-// （取最小的 D 使 base^D >= 10^小数位数，因此不会丢失输入自身的精度）。
+// fractionDigits 为 0 时自动推算位数：
+//   - 该进制下**能**有限表示 → 位数取**精确展开长度**（由值的最简分数
+//     算出，而不是按 log 估算）；
+//   - **不能**有限表示 → 位数取最小的 D 使 base^D >= 10^小数位数。
 // 整数输入不输出小数点，也不带标记。
 //
 // 小数部分的**尾随零会被去掉**（与 BigDecimal::toString 的做法一致）：
 // 该进制下能有限表示的值给出最短的精确形式（0.5 在二进制下是 "0.1"），
-// 只有确实发生了截断时才补上 "..." 标记。
+// 只有确实发生了截断时才补上 "..." 标记 —— 标记是如实的，值算得完就没有
+// 标记。
 std::string toBaseString(const BigDecimal& value, int base, bool uppercase = false,
                           int fractionDigits = 0);
 

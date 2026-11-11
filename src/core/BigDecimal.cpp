@@ -328,10 +328,15 @@ BigDecimal BigDecimal::fromString(std::string_view text) {
         long long magnitude = 0;
         while (cursor < text.size() && std::isdigit(static_cast<unsigned char>(text[cursor]))) {
             // 上限保护：避免 "1e99999999999" 之类的输入把内存吃光。
-            if (magnitude > kMaxExponentMagnitude) {
+            //
+            // 检查放在**折进当前位之后**：先检查再折的话，最后一位会把
+            // magnitude 顶到 10 × 上限，实际接受的上限就是 10 倍
+            // （1e1000009 会被接受，而文档写的是 1e6）。
+            const long long digit = text[cursor] - '0';
+            if (magnitude > (kMaxExponentMagnitude - digit) / 10) {
                 throw std::invalid_argument("BigDecimal: 指数过大");
             }
-            magnitude = magnitude * 10 + (text[cursor] - '0');
+            magnitude = magnitude * 10 + digit;
             ++cursor;
         }
         // 指数后面不允许再有别的字符（"1e5e6" 必须报错而不是丢掉 "e6"）。

@@ -80,6 +80,14 @@ public:
     // 符号不在这里：符号由 sign() 单独给出。
     const std::vector<std::uint32_t>& integerBlocks() const;
 
+    // **分子**（绝对值）的 base-10^9 小端块。
+    //
+    // 值 = ±numerator * 10^(-scale)。整数时与 integerBlocks() 相同。
+    //
+    // 与 integerBlocks() 的区别：这里**不要求**值是整数 —— 小数值的分子
+    // 同样有意义（进制转换要靠它判断该值能否在目标进制下有限表示）。
+    const std::vector<std::uint32_t>& numeratorBlocks() const { return digits_; }
+
     // --- 超越函数 ---
     //
     // 这些函数本质上不精确，必须显式给出精度：结果按 context.precision

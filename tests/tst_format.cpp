@@ -194,6 +194,86 @@ TEST(base, integer_has_no_fraction_marker) {
     CHECK(hpc::toBaseString(make("0"), 10).find(".") == std::string::npos);
 }
 
+// --- 回归：虚假截断标记 -------------------------------------------------
+//
+// 「..." 标记的含义是「**确实**没写完」。旧实现用「最小的 D 使
+// base^D >= 10^scale」估算小数位数，那个估算只在 base 是 2 或 5 的幂时
+// 才等价；base 同时带 2 与 5 且指数不等时（20 = 2^2·5、30 = 2·3·5）
+// 估算值短于真实展开长度，于是输出挂上了一个**并不存在**的截断标记。
+
+TEST(base, exact_expansion_has_no_truncation_marker) {
+    // 0.00001 在二十进制下精确等于 0.0001c（1/20^4 = 1/160000 = 0.00000625，
+    // 而 0.00001 = 1/100000 = 1/(2^5·5^5)，在二十进制下需要 5 位）。
+    CHECK_EQ(hpc::toBaseString(make("0.00001"), 20), std::string("0.0001c"));
+    CHECK(hpc::toBaseString(make("0.00001"), 20).find("...") == std::string::npos);
+
+    // 0.0001 在三十进制下精确等于 0.002l。
+    CHECK_EQ(hpc::toBaseString(make("0.0001"), 30), std::string("0.002l"));
+    CHECK(hpc::toBaseString(make("0.0001"), 30).find("...") == std::string::npos);
+
+    // 显式位数给出的展开与自动位数一致。
+    CHECK_EQ(hpc::toBaseString(make("0.00001"), 20, false, 5), std::string("0.0001c"));
+    CHECK_EQ(hpc::toBaseString(make("0.0001"), 30, false, 4), std::string("0.002l"));
+}
+
+// 三十进制是 2、3、5 的公倍数，而十进制只带 2 与 5 —— 因此同一个值在
+// 三十进制下的展开长度与十进制不同。两者都必须精确。
+TEST(base, bases_with_unequal_two_and_five_exponents) {
+    // 0.0001 = 1/10000 = 1/(2^4·5^4)。
+    //   二十进制 = 2^2·5 → 展开长度 max(4/2, 4/1) = 4。
+    //   三十进制 = 2·3·5  → 展开长度 max(4/1, 4/1) = 4。
+    //   十进制   = 2·5    → 展开长度 max(4/1, 4/1) = 4。
+    CHECK_EQ(hpc::toBaseString(make("0.0001"), 10), std::string("0.0001"));
+    CHECK_EQ(hpc::toBaseString(make("0.0001"), 20), std::string("0.000g"));
+    CHECK_EQ(hpc::toBaseString(make("0.0001"), 30), std::string("0.002l"));
+
+    // 0.0625 = 1/16 = 1/2^4：二进制 4 位，其余进制需要更多位。
+    CHECK_EQ(hpc::toBaseString(make("0.0625"), 2), std::string("0.0001"));
+    CHECK(hpc::toBaseString(make("0.0625"), 20).find("...") == std::string::npos);
+    CHECK(hpc::toBaseString(make("0.0625"), 30).find("...") == std::string::npos);
+}
+
+// 十进制下**任何**有限小数都精确表示 —— 即使小数位超过 4096。
+//
+// 旧实现把 4096 当成「十进制展开的上限」，于是 1e-4097 会被打上截断
+// 标记，尽管它在十进制下是精确的（4097 位小数）。
+TEST(base, terminating_decimal_never_truncated_in_base_ten) {
+    const std::string at4096 = hpc::toBaseString(make("1e-4096"), 10);
+    CHECK(at4096.find("...") == std::string::npos);
+    CHECK_EQ(at4096, std::string("0.") + std::string(4095, '0') + "1");
+
+    const std::string at4097 = hpc::toBaseString(make("1e-4097"), 10);
+    CHECK(at4097.find("...") == std::string::npos);
+    CHECK_EQ(at4097, std::string("0.") + std::string(4096, '0') + "1");
+}
+
+// 真实截断仍然要带标记：该值在目标进制下**无法**有限表示。
+TEST(base, genuine_truncation_is_still_marked) {
+    // 1/3 在三进制下是 0.111…（无限循环）。
+    const std::string ternary = hpc::toBaseString(make("0.3333333333333333333333333"), 3);
+    CHECK(ternary.find("...") != std::string::npos);
+
+    // 0.5 在三进制下也是 0.111…（1/2 = 0.111…_3）。
+    const std::string half = hpc::toBaseString(make("0.5"), 3);
+    CHECK(half.find("...") != std::string::npos);
+    CHECK_EQ(half, std::string("0.111..."));
+
+    // 0.5 在二进制下是精确的 0.1，不带标记。
+    CHECK(hpc::toBaseString(make("0.5"), 2).find("...") == std::string::npos);
+}
+
+// 调用方显式指定 fractionDigits 时，位数不足**就是**截断，必须标记。
+TEST(base, explicit_fraction_digits_budget_truncates) {
+    // 0.5 在二进制下是精确的 0.1，但要 3 位就会补零 —— 那不是截断，
+    // 精确表示仍然去掉尾随零。
+    CHECK_EQ(hpc::toBaseString(make("0.5"), 2, false, 3), std::string("0.1"));
+
+    // 1/3 在十进制下需要无限位，指定 5 位就是截断。
+    const std::string third = hpc::toBaseString(make("0.3333333333333333333333333"), 10, false, 5);
+    CHECK(third.find("...") != std::string::npos);
+    CHECK_EQ(third, std::string("0.33333..."));
+}
+
 // --- 位运算 -----------------------------------------------------------
 
 TEST(bitwise, and_or_xor) {

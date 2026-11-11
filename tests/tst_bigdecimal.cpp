@@ -516,3 +516,53 @@ TEST(normalize, trailing_zero_strip) {
     CHECK_EQ(half.toString(), std::string("0.5"));
     CHECK(half.compare(BigDecimal::fromString("0.5")) == 0);
 }
+
+// 回归：科学计数法的指数上限曾被**放松了 10 倍**。
+//
+// 旧的守卫在把当前数字折进 magnitude **之前**检查：
+//
+//     if (magnitude > kMaxExponentMagnitude) throw ...;
+//     magnitude = magnitude * 10 + digit;
+//
+// 于是最后一位会把 magnitude 顶到 10 × 上限 —— 实际上限是 10^7 而不是
+// 文档写的 10^6，1e1000009 因此被接受。
+//
+// 现在检查放在折进之后，实际接受的上限与文档一致。
+TEST(scientific, enforces_exponent_limit_exactly) {
+    // 上限之内：接受，且 scale 正好等于指数。
+    CHECK(BigDecimal::fromString("1e1000000").scale() == 0);
+    CHECK(BigDecimal::fromString("1e1000000").toString().size() == 1000001);
+
+    // 超过上限：拒绝。
+    const char* tooLarge[] = {"1e1000001", "1e1000009", "1e1000010", "1e9999999"};
+    for (const char* text : tooLarge) {
+        bool threw = false;
+        try { BigDecimal::fromString(text); } catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+    }
+
+    // 负指数同样受限。
+    bool threw = false;
+    try { BigDecimal::fromString("1e-1000001"); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+
+    // 上限之内的负指数可以接受。
+    CHECK(BigDecimal::fromString("1e-1000000").scale() == 1000000);
+}
+
+// 指数上限必须同时挡住「荒唐的指数」与「荒唐的分配」。
+//
+// 1e-1000000 有 100 万位小数 —— scale 很大，但那是**允许**的（上限之内）。
+// 真正要挡住的是超过上限的那些：否则 scale 会到 10^7，
+// 一个字面量就能撑爆内存。
+TEST(scientific, exponent_limit_bounds_the_scale) {
+    // 超上限：抛异常，而不是分配 1000 万位的 scale。
+    bool threw = false;
+    try { BigDecimal::fromString("1e-10000000"); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+
+    // 超上限的正指数同样被挡住。
+    threw = false;
+    try { BigDecimal::fromString("1e10000000"); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+}

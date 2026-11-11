@@ -20,9 +20,23 @@ const char kDigitsUpper[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 // 小数部分默认输出的最大位数：超过就截断并标记。
 //
-// 位数由「值的十进制小数位数」推出（见 fractionDigitCount），
-// 但要设上限：一个小数位很多的值在二进制下可能需要成千上万位。
+// 这个上限只用来兜住「该进制下**无法**有限表示」时的输出长度 ——
+// 那种情况下展开是无限的，必须在某处停下并标记。
+//
+// 能有限表示的值不受这个上限约束：它的展开长度是可以算出来的
+// （见 exactFractionDigits），必须给完整，否则「...」标记就成了谎报。
 constexpr int kMaxFractionDigits = 4096;
+
+// 展开工作量的上限（单位：块运算次数）。
+//
+// 展开的代价是 O(位数 × 块数)：每提取一位都要把整个余数乘一次进制。
+// 一个 10^6 位小数的值转成二进制需要 10^11 次块运算 —— 那不是「慢」，
+// 而是永远算不完。
+//
+// 触及上限时抛 std::overflow_error：这与「截断」不同 —— 截断要输出一个
+// 不精确的结果并标记它，而这里直接拒绝，因为该值本来是**可以**精确表示的，
+// 只是算不起。谎报截断比报错更糟。
+constexpr long long kMaxExpansionWork = 100000000LL;
 
 // 左移位数的上限：2^bits 的十进制位数约是 bits 的 0.301 倍，
 // 位数过大说明调用方失控，应当报错而不是继续消耗内存。
@@ -306,19 +320,287 @@ void checkBase(int base, const char* who) {
     }
 }
 
-// 取整数（0 <= 值 < 10^9）的数值。
+// 10 的小幂表（10^0 .. 10^8）。
+constexpr std::uint32_t kPow10[kBlockDigits] = {
+    1u, 10u, 100u, 1000u, 10000u, 100000u, 1000000u, 10000000u, 100000000u};
+
+// 块序列就地除以一个小的正整数（divisor <= 5）。
 //
-// 整数部分的每一步都被限制在 [0, base)，base <= 36，因此它一定落在
-// 单个块里，直接读块即可。
-std::uint32_t smallIntegerValue(const BigDecimal& value) {
-    const Blk& blocks = value.integerBlocks();
-    return blocks.empty() ? 0u : blocks[0];
+// 块内不会溢出 64 位：余数 < divisor，当前值 < 5 * 10^9。
+void divideBlkBySmall(Blk& blocks, std::uint32_t divisor) {
+    std::uint64_t remainder = 0;
+    for (std::size_t i = blocks.size(); i-- > 0;) {
+        const std::uint64_t current = remainder * kBase + blocks[i];
+        blocks[i] = static_cast<std::uint32_t>(current / divisor);
+        remainder = current % divisor;
+    }
+    blocks = trimBlk(std::move(blocks));
 }
 
-// 小数部分默认输出多少位（base 进制）。
+// 分子（绝对值）能被 prime 整除的次数（上限 cap）。
+//
+// prime 只取 2 或 5，而块的基数 10^9 = 2^9 · 5^9 —— 因此**整除性只看
+// 最低块**：M = m_0 + 10^9 · H，v_p(10^9 · H) >= 9，所以当
+// v_p(m_0) < 9 时 v_p(M) = v_p(m_0)（两个加数的 2-adic 赋值不同）。
+//
+// 常见情况只查最低块就够了（v_2 的命中率 511/512）。
+//
+// 罕见情况（最低块恰好含 9 个以上 prime 因子）才走逐次相除，那条路是
+// O(赋值 × 块数)，因此设一道工作量闸。
+int valuationCapped(const Blk& numerator, std::uint32_t prime, int cap) {
+    if (cap <= 0) return 0;
+
+    // 第一级：只看最低块。
+    std::uint32_t low = numerator[0];
+    int quick = 0;
+    while (quick < 31 && low % prime == 0) { ++quick; low /= prime; }
+    if (quick >= cap) return cap;
+    if (quick < 9) return quick;
+
+    // 第二级：最低两块合成一个 64 位数。v_p(D) < 18 时同样是答案。
+    if (numerator.size() >= 2) {
+        const std::uint64_t pair =
+            static_cast<std::uint64_t>(numerator[0]) +
+            static_cast<std::uint64_t>(numerator[1]) * kBase;
+        std::uint64_t rest = pair;
+        int count = 0;
+        while (count < 63 && rest % prime == 0) { ++count; rest /= prime; }
+        if (count >= cap) return cap;
+        if (count < 18) return count;
+    }
+
+    // 罕见路径：逐次相除。
+    Blk value = numerator;
+    const long long blockCount = static_cast<long long>(value.size());
+    int count = 0;
+    while (count < cap) {
+        if (value[0] % prime != 0) break;
+        divideBlkBySmall(value, prime);
+        ++count;
+        if (static_cast<long long>(count) * blockCount > kMaxExpansionWork) {
+            throw std::overflow_error("toBaseString: 小数位过多，无法展开");
+        }
+    }
+    return count;
+}
+
+// base 中 prime 的指数（base 能被 prime 整除的次数）。
+int factorExponent(int base, std::uint32_t prime) {
+    int count = 0;
+    while (base % prime == 0) {
+        base /= prime;
+        ++count;
+    }
+    return count;
+}
+
+// ceil(a / b)，a >= 0，b > 0。
+int ceilDiv(int a, int b) { return (a + b - 1) / b; }
+
+// 该值在 base 进制下的**精确**小数位数；返回 -1 表示无法有限表示。
+//
+// 值 = ±N / 10^s（N 是分子的绝对值，s 是十进制小数位）。
+// base 进制下存在有限展开 ⟺ ∃k: 10^s | N · base^k，而
+//
+//   v2(N · base^k) = v2(N) + k · v2(base) >= s
+//   v5(N · base^k) = v5(N) + k · v5(base) >= s
+//
+// 必须**同时**成立。满足这两条的最小 k 就是精确位数。
+//
+// 关于分子的选取：整数部分不影响展开长度 —— 对 p ∈ {2, 5}，
+// v_p(整数部分 × 10^s) >= s，而 v_p(N) < s 时 v_p(分子) = v_p(N)，
+// 所以「分子的 2/5 因子个数（上限 s）」与「小数部分的分子」相同。
+int exactFractionDigits(const BigDecimal& value, int base) {
+    const int scale = value.scale();
+    if (scale <= 0) return 0;
+
+    const int baseTwo = factorExponent(base, 2);
+    const int baseFive = factorExponent(base, 5);
+
+    const Blk& numerator = value.numeratorBlocks();
+    const int two = valuationCapped(numerator, 2, scale);
+    const int five = valuationCapped(numerator, 5, scale);
+
+    // base 里没有的质因子必须已经被分子消掉，否则展开是无限的。
+    if (baseTwo == 0 && two < scale) return -1;
+    if (baseFive == 0 && five < scale) return -1;
+
+    int digits = 0;
+    if (baseTwo > 0 && two < scale) {
+        digits = std::max(digits, ceilDiv(scale - two, baseTwo));
+    }
+    if (baseFive > 0 && five < scale) {
+        digits = std::max(digits, ceilDiv(scale - five, baseFive));
+    }
+    return digits;
+}
+
+// 取块序列的最低 scale 位十进制数字（**定宽**）。
+//
+// 块是**小端**的（blocks[0] 是最低位块），所以最低 scale 位十进制数字
+// 就在 blocks[0..] 里，而不是最高的几块。
+//
+// 两处必须讲究：
+//
+// 1. **掩掉 scale 以上的位**。scale 不是 9 的倍数时，最高的那个块里只有
+//    低 rest 位属于小数部分，高位必须被掩掉 —— 否则余数比 10^scale 大，
+//    展开出来的数字会整体偏移。
+//
+// 2. **定宽**（高位补零而不是裁剪）。余数的宽度决定了展开时
+//    「除以 10^scale」的切分位置，裁掉高位零会让余数在下一步少掉一块，
+//    于是切分点错位 —— 展开出的数字会**逐位偏移**。
+Blk lowDecimalDigits(const Blk& blocks, int scale) {
+    const int whole = scale / kBlockDigits;
+    const int rest = scale % kBlockDigits;
+    const int width = whole + (rest > 0 ? 1 : 0);
+
+    Blk low(static_cast<std::size_t>(width), 0);
+    for (int i = 0; i < whole; ++i) {
+        if (i < static_cast<int>(blocks.size())) {
+            low[static_cast<std::size_t>(i)] = blocks[static_cast<std::size_t>(i)];
+        }
+    }
+    if (rest > 0) {
+        const std::uint32_t block = (whole < static_cast<int>(blocks.size()))
+                                        ? blocks[static_cast<std::size_t>(whole)] : 0u;
+        low[static_cast<std::size_t>(whole)] = block % kPow10[rest];
+    }
+    return low;
+}
+
+// 块序列乘以 base（base <= 36），**不裁剪**高位零块。
+//
+// 展开时余数必须保持定宽（见 lowDecimalDigits），因此这里不能用会裁剪
+// 高位零块的 multiplyBlkByBase —— 裁掉一块，下一步「除以 10^scale」的
+// 切分点就会错位。
+void multiplyBlkByBaseKeepingWidth(Blk& blocks, std::uint64_t base) {
+    std::uint64_t carry = 0;
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        const std::uint64_t current = static_cast<std::uint64_t>(blocks[i]) * base + carry;
+        blocks[i] = static_cast<std::uint32_t>(current % kBase);
+        carry = current / kBase;
+    }
+    if (carry) blocks.push_back(static_cast<std::uint32_t>(carry));
+}
+
+// 块序列是否全为零。
+bool isAllZeroBlk(const Blk& blocks) {
+    for (const std::uint32_t block : blocks) {
+        if (block != 0) return false;
+    }
+    return true;
+}
+
+// 从 T 中取出数字位与余数：T = digit · 10^scale + remainder。
+//
+// 调用方保证 T < base · 10^scale，因此 digit 是一个**数字位**（< base），
+// 且 remainder < 10^scale。
+//
+// 10^scale = 10^(9·whole) · 10^rest。令 high = floor(T / 10^(9·whole))，
+// 则 high 至多占两块（high < base · 10^rest <= 36 · 10^8 < 10^18），于是
+//
+//   digit     = floor(high / 10^rest)
+//   remainder = (T 的低 whole 块) + (high mod 10^rest) · 10^(9·whole)
+//
+// 余数在「10^rest 的倍数」这一层上被切掉，因此 remainder < 10^scale。
+// 余数保持**定宽**（scale 位十进制数字所需的块数），以便下一步的切分点
+// 与本步一致。
+std::pair<int, Blk> splitDigitAndRemainder(const Blk& t, int scale, int base) {
+    const int whole = scale / kBlockDigits;
+    const int rest = scale % kBlockDigits;
+
+    // high = floor(T / 10^(9·whole))，至多占两块。
+    std::uint64_t high = 0;
+    if (whole < static_cast<int>(t.size())) {
+        high = t[static_cast<std::size_t>(whole)];
+        if (whole + 1 < static_cast<int>(t.size())) {
+            high += static_cast<std::uint64_t>(t[static_cast<std::size_t>(whole + 1)]) * kBase;
+        }
+    }
+
+    const std::uint32_t divisor = kPow10[rest];
+    const std::uint64_t digit = high / divisor;
+    if (digit >= static_cast<std::uint64_t>(base)) {
+        throw std::overflow_error("toBaseString: 小数展开异常");
+    }
+    const std::uint32_t lowPart = static_cast<std::uint32_t>(high % divisor);
+
+    // 余数 = 低 whole 块 + lowPart 放在第 whole 块（定宽）。
+    Blk low(static_cast<std::size_t>(whole), 0);
+    for (int i = 0; i < whole; ++i) {
+        if (i < static_cast<int>(t.size())) {
+            low[static_cast<std::size_t>(i)] = t[static_cast<std::size_t>(i)];
+        }
+    }
+    if (rest > 0) low.push_back(lowPart);
+
+    return {static_cast<int>(digit), std::move(low)};
+}
+
+// 十进制下的小数位：分子的最后 scale 位十进制数字（不足时左侧补零）。
+//
+// 十进制是内核的**原生**表示，这个特判把「逐位展开」换成「直接取数字」：
+// 十进制展开的第 k 位就是分子第 (scale - k) 位的十进制数字，因此结果与
+// 逐位展开**完全一致**，代价却从 O(位数 × 块数) 降到 O(位数)。
+//
+// 十进制下任何有限小数都能精确表示，所以这条路径永远不带截断标记。
+std::string decimalFractionDigits(const BigDecimal& value) {
+    const int scale = value.scale();
+    const std::string digits = blocksToDecimalString(value.numeratorBlocks());
+    if (static_cast<int>(digits.size()) >= scale) {
+        return digits.substr(digits.size() - static_cast<std::size_t>(scale));
+    }
+    return std::string(static_cast<std::size_t>(scale) - digits.size(), '0') + digits;
+}
+
+// 展开 digits 位小数的工作量检查。
+//
+// 每提取一位都要把整个余数乘一次进制并按十进制位切开，代价 O(块数)。
+//
+// 块数按**最坏情况**估：余数始终 < 1，它的小数位不超过 scale，整数位最多
+// 1 位，因此块数不超过 scale/9 + 1。用分子的块数估会严重低估 ——
+// 分子的块数可能只有 1，而余数的块数会随展开线性增长。
+void checkExpansionWork(const BigDecimal& value, int digits) {
+    const long long blocks = static_cast<long long>(value.scale()) / 9 + 2;
+    if (static_cast<long long>(digits) * blocks > kMaxExpansionWork) {
+        throw std::overflow_error("toBaseString: 小数位过多，无法展开");
+    }
+}
+
+// 按 base 进制逐位提取小数部分，最多 digits 位。
+//
+// fractionText 是提取到的数字（未去尾随零）；truncated 表示余数非零 ——
+// 也就是**确实**没写完，末尾的 "..." 是如实的标记。
+//
+// 算法是 base 进制下的长除法：余数 R 满足 0 <= R < 10^scale，
+// 每一步 T = R · base，数字位 = floor(T / 10^scale)，新余数 = T mod 10^scale。
+// 除以 10^scale 就是「按十进制位切开」，块级实现是 O(块数)。
+void expandFraction(const BigDecimal& value, int base, int digits, const char* table,
+                    std::string& fractionText, bool& truncated) {
+    const int scale = value.scale();
+
+    // 小数部分的分子：分子绝对值的最低 scale 位十进制数字（定宽）。
+    Blk remainder = lowDecimalDigits(value.numeratorBlocks(), scale);
+
+    fractionText.clear();
+    fractionText.reserve(static_cast<std::size_t>(digits));
+    for (int i = 0; i < digits; ++i) {
+        if (isAllZeroBlk(remainder)) break;
+        multiplyBlkByBaseKeepingWidth(remainder, static_cast<std::uint64_t>(base));
+        const auto split = splitDigitAndRemainder(remainder, scale, base);
+        fractionText.push_back(table[split.first]);
+        remainder = split.second;
+    }
+    truncated = !isAllZeroBlk(remainder);
+}
+
+// 小数部分默认输出多少位（base 进制）—— 只用于**无法**有限表示的情形。
 //
 // 目标是让输出携带的精度不少于值自身的小数位数：找出最小的 D，
 // 使 base^D >= 10^scale。整除用块级运算，不依赖浮点数。
+//
+// 这个位数是**显示位数**，不是「精确位数」：能有限表示的值走
+// exactFractionDigits，那条路径给出的是真正算出来的长度。
 int fractionDigitCount(const BigDecimal& value, int base) {
     const int scale = value.scale();
     if (scale <= 0) return 0;
@@ -357,26 +639,49 @@ std::string toBaseString(const BigDecimal& value, int base, bool uppercase, int 
     // 小数部分：按目标进制逐位提取。该进制下无法有限表示时，
     // 末尾用 "..." 显式标记截断 —— 不做无声的近似。
     if (value.scale() > 0) {
-        const int digits = (fractionDigits > 0) ? fractionDigits
-                                               : fractionDigitCount(value, base);
-        if (digits > 0) {
-            // 小数部分 = value - 整数部分（保留原符号），再取绝对值。
-            BigDecimal remaining = BigDecimal::abs(value - integer);
+        // 小数位的**预算**（最多输出多少位）。
+        //
+        // 三种情形：
+        //
+        // 1. 调用方显式指定了 fractionDigits：那就是预算本身。值需要更多位
+        //    时**确实**发生了截断，必须标记。
+        //
+        // 2. 自动位数且该进制下能有限表示：预算取**精确展开长度**。
+        //    这正是不能用「最小的 D 使 base^D >= 10^scale」那个估算的地方 ——
+        //    估算只保证位数不少于值的十进制精度，不保证展开得完。base 同时
+        //    带有 2 与 5 且指数不等时（20 = 2^2·5、30 = 2·3·5），估算值会短于
+        //    真实展开长度，于是输出末尾会挂上一个**并不存在**的截断标记
+        //    （0.00001 在二十进制下精确等于 0.0001c，却被打成「0.0001...」）。
+        //
+        // 3. 自动位数且无法有限表示：展开是无限的，必须停在某个预算上，
+        //    并如实标记（见 fractionDigitCount）。
+        const int exactDigits = exactFractionDigits(value, base);
+        int budget;
+        bool exactlyRepresentable;
+        if (fractionDigits > 0) {
+            budget = fractionDigits;
+            exactlyRepresentable = false;
+        } else if (exactDigits >= 0) {
+            budget = exactDigits;
+            exactlyRepresentable = true;
+        } else {
+            budget = fractionDigitCount(value, base);
+            exactlyRepresentable = false;
+        }
 
+        if (budget > 0) {
             std::string fractionText;
             bool truncated = false;
-            for (int i = 0; i < digits; ++i) {
-                // remaining * base 的整数部分就是下一位，剩余部分继续迭代。
-                const BigDecimal scaled = remaining * BigDecimal(static_cast<std::int64_t>(base));
-                const BigDecimal whole = scaled.truncateToInteger();
-                fractionText.push_back(table[smallIntegerValue(whole)]);
-                remaining = scaled - whole;
-                if (remaining.isZero()) break;
+            if (base == 10 && exactlyRepresentable) {
+                // 十进制是内核的原生表示，直接取数字即可，代价 O(位数)。
+                fractionText = decimalFractionDigits(value);
+            } else {
+                checkExpansionWork(value, budget);
+                expandFraction(value, base, budget, table, fractionText, truncated);
             }
-            if (!remaining.isZero()) truncated = true;
 
             if (truncated) {
-                // 发生截断时**保留全部 digits 位**：末位可能是展开中的真实
+                // 发生截断时**保留全部 budget 位**：末位可能是展开中的真实
                 // 数字，删掉它会改变数值（"0.0100…" 与 "0.01…" 含义不同）。
                 out.push_back('.');
                 out += fractionText;

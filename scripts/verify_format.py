@@ -103,6 +103,9 @@ def build_cases():
         '0.5', '-0.5', '1.5', '-1.5', '0.1', '2.25', '123.456',
         '0.3333333333333333333333333', '-0.3333333333333333333333333',
         '0.0625', '12.5', '0.0000001', '99999.99999',
+        # 回归：base 同时带 2 与 5 且指数不等时（20 = 2^2·5、30 = 2·3·5），
+        # 旧的「log 估算」会短于真实展开长度，从而挂上并不存在的截断标记。
+        '0.00001', '0.0001', '0.02', '0.125',
     ]
     for text in fraction_texts:
         for base in (2, 3, 8, 10, 16, 36):
@@ -110,6 +113,18 @@ def build_cases():
             cases.append((f'tobase|{base}|0|0|{text}', None))   # 特殊比对
             # 固定位数（5 位）
             cases.append((f'tobase|{base}|0|5|{text}', None))   # 特殊比对
+
+    # 回归：二十进制与三十进制（自动位数）必须给出**完整**的精确展开。
+    # 0.00001 = 0.0001c（二十进制），0.0001 = 0.002l（三十进制）。
+    cases.append(('tobase|20|0|0|0.00001', '0.0001c'))
+    cases.append(('tobase|30|0|0|0.0001', '0.002l'))
+    cases.append(('tobase|20|0|0|0.0001', '0.000g'))
+    cases.append(('tobase|30|0|0|0.00001', '0.00083'))
+
+    # 回归：十进制下**任何**有限小数都精确表示，绝不带截断标记 ——
+    # 即使小数位超过 4096（旧的 4096 位上限会误标截断）。
+    cases.append(('tobase|10|0|0|1e-4096', '0.' + '0' * 4095 + '1'))
+    cases.append(('tobase|10|0|0|1e-4097', '0.' + '0' * 4096 + '1'))
 
     # --- 科学计数法 ---
     # fromBaseString 只接受整数，因此这一组用 tobase 走十进制输出比对。
@@ -181,12 +196,56 @@ def build_cases():
     return cases
 
 
+def exact_fraction_length(magnitude, base: int):
+    """该值在 base 进制下的精确小数位数；None 表示无法有限表示。
+
+    值是最简分数 p/q。base 进制下存在有限展开 ⟺ q 的每个质因子都整除 base。
+    展开长度 = 各质因子 p 需要的 k 之最大值，其中 k·v_p(base) >= v_p(q)。
+    """
+    denominator = magnitude.denominator
+    exponents = []
+    for prime in (2, 5):
+        count = 0
+        while denominator % prime == 0:
+            denominator //= prime
+            count += 1
+        exponents.append(count)
+    if denominator != 1:
+        return None
+
+    base_factors = []
+    rest = base
+    for prime in (2, 5):
+        count = 0
+        while rest % prime == 0:
+            rest //= prime
+            count += 1
+        base_factors.append(count)
+
+    length = 0
+    for index, prime in enumerate((2, 5)):
+        needed = exponents[index]
+        if needed == 0:
+            continue
+        if base_factors[index] == 0:
+            return None
+        length = max(length, -(-needed // base_factors[index]))
+    return length
+
+
 def expected_fraction(text: str, base: int, digits: int) -> str:
     """独立实现「带小数部分的进制输出」作为参考。
 
     参考语义：整数部分精确；小数部分按目标进制逐位提取，
     有限表示则去掉尾随零并结束，否则保留全部位并标记 '...'。
     这里用 Python 的 fractions 精确做，避免浮点误差。
+
+    digits == 0 时走**自动位数**：
+      - 该进制下能有限表示 → 位数取**精确展开长度**（不是 log 估算）。
+        估算（最小的 D 使 base^D >= 10^scale）只在 base 是 2 或 5 的幂时
+        才等价；base 同时带 2 与 5 且指数不等时（20 = 2^2·5、30 = 2·3·5）
+        估算值会短于真实展开长度。
+      - 不能有限表示 → 位数取最小的 D 使 base^D >= 10^scale，并截断标记。
     """
     from fractions import Fraction
 
@@ -199,15 +258,19 @@ def expected_fraction(text: str, base: int, digits: int) -> str:
 
     out = py_to_base(whole, base)
     if digits <= 0:
-        # 自动位数：最小的 D 使 base^D >= 10^scale。
         scale = len(text.split('.')[1]) if '.' in text else 0
-        digits = 0
-        power = 1
-        while power < 10 ** scale:
-            power *= base
-            digits += 1
-        if digits == 0:
-            digits = 1
+        exact = exact_fraction_length(magnitude, base)
+        if exact is not None:
+            digits = exact
+        else:
+            digits = 0
+            power = 1
+            while power < 10 ** scale:
+                power *= base
+                digits += 1
+            if digits == 0:
+                digits = 1
+            digits = min(digits, 4096)
 
     fraction_text = ''
     truncated = False
