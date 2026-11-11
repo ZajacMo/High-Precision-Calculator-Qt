@@ -274,6 +274,164 @@ TEST(base, explicit_fraction_digits_budget_truncates) {
     CHECK_EQ(third, std::string("0.33333..."));
 }
 
+// --- 回归：质因子赋值算错导致**提前**截断 -------------------------------
+//
+// 展开长度由「最简分数的分母在该进制下的赋值」决定。旧实现算赋值时用了
+// 一条**不成立**的捷径：「整除性只看最低块」。
+//
+// 设分子 M = m_0 + 10^9·H（m_0 是最低块）。因为 v_p(10^9·H) >= 9，所以
+// **当 v_p(m_0) < 9 时** v_p(M) = v_p(m_0) —— 这一步是对的。
+//
+// 但旧实现**在检查「quick < 9」之前就把 cap 返回了**，于是 quick >= 9 的
+// 情形被当成了「赋值 >= cap」。而实际上 quick >= 9 时 m_0 与 10^9·H
+// 可能**互相抵消**（赋值相同），v_p(M) 可以**大于** v_p(m_0) —— 捷径
+// 的结论不可信。
+//
+// 后果是展开被**提前**截断（无声的精度损失），并且把本来无限的展开
+// 误报成有限（exactFractionDigits 返回了错误的有限长度）。
+//
+// 四个复现值（期望值由 Python 的 fractions.Fraction 精确算出）：
+//
+//   0.1009765625 base 2  → 非有限，D = 34
+//   0.1009765625 base 8  → 非有限，D = 12
+//   0.1000001024  base 5  → 非有限，D = 15
+//   0.1000001024  base 25 → 非有限，D = 8
+
+namespace {
+
+// 小数部分的位数（不含 "..." 标记）与是否带截断标记。
+void splitFraction(const std::string& text, std::size_t& digits, bool& truncated) {
+    const std::size_t dot = text.find('.');
+    CHECK(dot != std::string::npos);
+    const std::string fraction = text.substr(dot + 1);
+    truncated = fraction.size() >= 3 &&
+                fraction.compare(fraction.size() - 3, 3, "...") == 0;
+    digits = truncated ? fraction.size() - 3 : fraction.size();
+}
+
+}  // namespace
+
+TEST(base, valuation_underestimate_does_not_truncate_early) {
+    struct Case {
+        const char* text;
+        int base;
+        std::size_t digits;   // 期望的小数位数
+    };
+    // 期望值由 fractions.Fraction 精确算出（无法有限表示 → D 取最小的
+    // D 使 base^D >= 10^scale）。
+    const Case cases[] = {
+        {"0.1009765625", 2, 34},
+        {"0.1009765625", 8, 12},
+        {"0.1000001024", 5, 15},
+        {"0.1000001024", 25, 8},
+    };
+
+    for (const Case& c : cases) {
+        const std::string text = hpc::toBaseString(make(c.text), c.base);
+        std::size_t digits = 0;
+        bool truncated = false;
+        splitFraction(text, digits, truncated);
+        // 位数必须**恰好**是期望值：早了是精度损失，晚了是多余的位。
+        CHECK_EQ(digits, c.digits);
+        // 这四个值在该进制下都**不能**有限表示，因此必须带截断标记。
+        CHECK(truncated);
+    }
+}
+
+// 同一个值在十进制下能有限表示，因此绝不带标记（回归对照）。
+TEST(base, valuation_bug_does_not_affect_decimal) {
+    const std::string text = hpc::toBaseString(make("0.1009765625"), 10);
+    CHECK(text.find("...") == std::string::npos);
+    CHECK_EQ(text, std::string("0.1009765625"));
+}
+
+// 旧实现把 0.1009765625 在**五进制**下误报成有限（长度 10，且不带
+// 标记）。它实际上是无限的：分母 10^10 = 2^10·5^10，而五进制只带 5，
+// 2^10 消不掉。
+TEST(base, non_terminating_is_reported_as_non_terminating) {
+    const std::string text = hpc::toBaseString(make("0.1009765625"), 5);
+    CHECK(text.find("...") != std::string::npos);
+
+    std::size_t digits = 0;
+    bool truncated = false;
+    splitFraction(text, digits, truncated);
+    CHECK(truncated);
+    // 期望 15 位（最小的 D 使 5^D >= 10^10）。
+    CHECK_EQ(digits, static_cast<std::size_t>(15));
+}
+
+// --- 回归：工作量上限不再抛异常，而是截断并标记 -----------------------
+//
+// 展开代价是 O(位数 × 块数)。旧的实现触及 kMaxExpansionWork 时抛
+// std::overflow_error，把一个本来能给出结果的请求整个拒掉。
+//
+// 现在超限时**截断**并如实标记「...」—— 「...」的含义本来就是
+// 「展开被截断了」，而报错是把请求拒之门外。计算器用户更愿意看到一个
+// 带标记的近似值，也不要一个空洞的异常。
+
+TEST(base, expansion_work_limit_truncates_instead_of_throwing) {
+    // scale = 100000 位的小数转成二进制需要约 100000 × 11112 次块运算，
+    // 远超 kMaxExpansionWork（10^8）。
+    //
+    // 构造方式：1e-100000 是一个纯十进制有限小数，在二进制下**无法**有限
+    // 表示（分母含 5），因此走的是「自动位数 + 截断」路径。
+    const BigDecimal value = make("1e-100000");
+
+    bool threw = false;
+    std::string text;
+    try {
+        text = hpc::toBaseString(value, 2);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(!threw);
+
+    // 截断时必须**带标记**（如实说明没写完）。
+    CHECK(text.find("...") != std::string::npos);
+    // 位数必须**小于**自动预算（10^100000 在二进制下需要 332193 位）。
+    const std::size_t dot = text.find('.');
+    CHECK(dot != std::string::npos);
+    const std::string fraction = text.substr(dot + 1);
+    CHECK(fraction.size() >= 3);
+    CHECK(fraction.compare(fraction.size() - 3, 3, "...") == 0);
+    CHECK(fraction.size() - 3 < 332193u);
+}
+
+// 显式请求一个远超工作量的位数时，同样是**截断 + 标记**，而不是异常。
+TEST(base, explicit_huge_budget_truncates_instead_of_throwing) {
+    const BigDecimal value = make("1e-50000");
+
+    bool threw = false;
+    std::string text;
+    try {
+        text = hpc::toBaseString(value, 2, false, 1000000);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(!threw);
+    CHECK(text.find("...") != std::string::npos);
+}
+
+// 工作量之内的小数仍然**精确**展开（截断不能传染到普通用例）。
+TEST(base, values_within_work_limit_stay_exact) {
+    // 1e-1000 在二进制下有 3322 位展开，仍在工作量上限之内 —— 但它
+    // 在二进制下**不能**有限表示，因此带标记。
+    const std::string binary = hpc::toBaseString(make("1e-1000"), 2);
+    CHECK(binary.find("...") != std::string::npos);
+    std::size_t digits = 0;
+    bool truncated = false;
+    splitFraction(binary, digits, truncated);
+    CHECK(truncated);
+    // 1000 位十进制 → 3322 位二进制（1000 × log2(10) = 3321.9）。
+    CHECK_EQ(digits, static_cast<std::size_t>(3322));
+
+    // 十进制下永远精确。
+    const std::string decimal = hpc::toBaseString(make("1e-1000"), 10);
+    CHECK(decimal.find("...") == std::string::npos);
+    CHECK_EQ(decimal, std::string("0.") + std::string(999, '0') + "1");
+}
+
+
 // --- 位运算 -----------------------------------------------------------
 
 TEST(bitwise, and_or_xor) {

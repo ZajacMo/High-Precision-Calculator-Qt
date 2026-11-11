@@ -33,9 +33,13 @@ constexpr int kMaxFractionDigits = 4096;
 // 一个 10^6 位小数的值转成二进制需要 10^11 次块运算 —— 那不是「慢」，
 // 而是永远算不完。
 //
-// 触及上限时抛 std::overflow_error：这与「截断」不同 —— 截断要输出一个
-// 不精确的结果并标记它，而这里直接拒绝，因为该值本来是**可以**精确表示的，
-// 只是算不起。谎报截断比报错更糟。
+// 触及上限时**不报错**，而是停在算得动的地方并如实标记「...」：
+// 「...」的含义本来就是「展开被截断了」，而报错是把一个本来能给出
+// （哪怕是截断的）结果的请求整个拒掉 —— 计算器用户更愿意看到一个
+// 带标记的近似值，也不要一个空洞的异常。
+//
+// 这与「谎报截断」是相反的错误：谎报截断是把截断说成完整；这里
+// 明确说「没算完」。
 constexpr long long kMaxExpansionWork = 100000000LL;
 
 // 左移位数的上限：2^bits 的十进制位数约是 bits 的 0.301 倍，
@@ -324,10 +328,12 @@ void checkBase(int base, const char* who) {
 constexpr std::uint32_t kPow10[kBlockDigits] = {
     1u, 10u, 100u, 1000u, 10000u, 100000u, 1000000u, 10000000u, 100000000u};
 
-// 块序列就地除以一个小的正整数（divisor <= 5）。
+// 块序列除以一个 64 位正整数，返回余数（块序列就地变成商）。
 //
-// 块内不会溢出 64 位：余数 < divisor，当前值 < 5 * 10^9。
-void divideBlkBySmall(Blk& blocks, std::uint32_t divisor) {
+// divisor 必须是 2 或 5 的幂 —— 这样每一步的「余数 · 10^9 + 块」都
+// 不会溢出 64 位：余数 < divisor，当前值 < divisor · 10^9 <= 2^32 · 10^9
+// = 4.3·10^18 < 1.8·10^19 = 2^64。
+std::uint64_t divideBlkByPower(Blk& blocks, std::uint64_t divisor) {
     std::uint64_t remainder = 0;
     for (std::size_t i = blocks.size(); i-- > 0;) {
         const std::uint64_t current = remainder * kBase + blocks[i];
@@ -335,18 +341,41 @@ void divideBlkBySmall(Blk& blocks, std::uint32_t divisor) {
         remainder = current % divisor;
     }
     blocks = trimBlk(std::move(blocks));
+    return remainder;
+}
+
+// 块序列除以 divisor 的余数（不修改块序列）。
+//
+// divisor 必须是 2 或 5 的幂（见 divideBlkByPower 的溢出论证）。
+std::uint64_t remainderBlk(const Blk& blocks, std::uint64_t divisor) {
+    std::uint64_t remainder = 0;
+    for (std::size_t i = blocks.size(); i-- > 0;) {
+        const std::uint64_t current = remainder * kBase + blocks[i];
+        remainder = current % divisor;
+    }
+    return remainder;
 }
 
 // 分子（绝对值）能被 prime 整除的次数（上限 cap）。
 //
+// 返回 min(v_p(M), cap)；返回 -1 表示「工作量超限，算不出来」。
+//
 // prime 只取 2 或 5，而块的基数 10^9 = 2^9 · 5^9 —— 因此**整除性只看
-// 最低块**：M = m_0 + 10^9 · H，v_p(10^9 · H) >= 9，所以当
-// v_p(m_0) < 9 时 v_p(M) = v_p(m_0)（两个加数的 2-adic 赋值不同）。
+// 最低块**：M = m_0 + 10^9 · H，且 v_p(10^9 · H) >= 9。
 //
-// 常见情况只查最低块就够了（v_2 的命中率 511/512）。
+// 但「只看最低块」**只在两个加数的赋值不同时**才成立：
 //
-// 罕见情况（最低块恰好含 9 个以上 prime 因子）才走逐次相除，那条路是
-// O(赋值 × 块数)，因此设一道工作量闸。
+//   v_p(m_0) <  9 → 与 v_p(10^9·H) >= 9 必然不同 → v_p(M) = v_p(m_0)（精确）；
+//   v_p(m_0) >= 9 → 两者**可能相同**（m_0 恰好也含 9 个 p 因子），
+//                    此时 m_0 与 10^9·H 可能互相抵消，v_p(M) 可以**大于**
+//                    v_p(m_0) —— 便宜路径的结论不可信。
+//
+// 旧实现在这里直接把 cap（或 quick）当答案返回，于是**低估**了赋值：
+// m_0 = 2^scale·k、10^9·H 恰好抵消的情形下会算出一个偏大的赋值，
+// 于是展开被**提前**截断（无声的精度损失），并把本来无限的展开误报成
+// 有限。
+//
+// 因此便宜路径只在**能证明**赋值就是答案时才用，其余一律走精确路径。
 int valuationCapped(const Blk& numerator, std::uint32_t prime, int cap) {
     if (cap <= 0) return 0;
 
@@ -354,34 +383,66 @@ int valuationCapped(const Blk& numerator, std::uint32_t prime, int cap) {
     std::uint32_t low = numerator[0];
     int quick = 0;
     while (quick < 31 && low % prime == 0) { ++quick; low /= prime; }
-    if (quick >= cap) return cap;
-    if (quick < 9) return quick;
 
-    // 第二级：最低两块合成一个 64 位数。v_p(D) < 18 时同样是答案。
-    if (numerator.size() >= 2) {
-        const std::uint64_t pair =
-            static_cast<std::uint64_t>(numerator[0]) +
-            static_cast<std::uint64_t>(numerator[1]) * kBase;
-        std::uint64_t rest = pair;
-        int count = 0;
-        while (count < 63 && rest % prime == 0) { ++count; rest /= prime; }
-        if (count >= cap) return cap;
-        if (count < 18) return count;
-    }
+    // 分子只有一个块时它**就是**整个分子：赋值已知，无需再猜。
+    //
+    // 单块的赋值一定 < 31（2^29 < 10^9 < 2^30，5^12 < 10^9 < 5^13），
+    // 所以上面的循环不会提前截断 quick。
+    if (numerator.size() == 1) return quick >= cap ? cap : quick;
 
-    // 罕见路径：逐次相除。
+    // quick < 9：两个加数的赋值必不同，v_p(M) = quick（精确）。
+    if (quick < 9) return quick >= cap ? cap : quick;
+
+    // quick >= 9：只能确定 v_p(M) >= 9。cap <= 9 时答案就是 cap。
+    if (cap <= 9) return cap;
+
+    // 第二级：最低两块合成一个 64 位数（M 的低 18 位十进制数字）。
+    // v_p(10^18 · H) >= 18，所以 count < 18 时 v_p(M) = count（仍是精确的）。
+    const std::uint64_t pair =
+        static_cast<std::uint64_t>(numerator[0]) +
+        static_cast<std::uint64_t>(numerator[1]) * kBase;
+    std::uint64_t rest = pair;
+    int count = 0;
+    while (count < 63 && rest % prime == 0) { ++count; rest /= prime; }
+    if (count < 18) return count >= cap ? cap : count;
+
+    // count >= 18：只能确定 v_p(M) >= 18。cap <= 18 时答案就是 cap。
+    if (cap <= 18) return cap;
+
+    // 第三级：精确路径 —— 逐次相除。
+    //
+    // 为了少跑几遍，每次尽量除以 p^k（k 取「p^k · 10^9 不溢出 64 位」
+    // 的最大值）：p = 2 时 k = 32，p = 5 时 k = 13。
+    const int chunk = (prime == 2) ? 32 : 13;
+    std::uint64_t chunkDivisor = 1;
+    for (int i = 0; i < chunk; ++i) chunkDivisor *= prime;
+
     Blk value = numerator;
     const long long blockCount = static_cast<long long>(value.size());
-    int count = 0;
-    while (count < cap) {
-        if (value[0] % prime != 0) break;
-        divideBlkBySmall(value, prime);
-        ++count;
-        if (static_cast<long long>(count) * blockCount > kMaxExpansionWork) {
-            throw std::overflow_error("toBaseString: 小数位过多，无法展开");
-        }
+    long long work = 0;
+    int exact = 0;
+
+    // 整块相除：只有 p^chunk 整除时才除，否则退回单个 p。
+    while (exact + chunk <= cap) {
+        if (remainderBlk(value, chunkDivisor) != 0) break;
+        divideBlkByPower(value, chunkDivisor);
+        exact += chunk;
+        work += blockCount;
+        if (work > kMaxExpansionWork) return -1;
     }
-    return count;
+
+    // 收尾：单个 p 因子。
+    //
+    // 整除性只看最低块：M ≡ m_0 (mod 10^9)，而 p | 10^9，所以
+    // 「M 被 p 整除」等价于「最低块被 p 整除」。
+    while (exact < cap) {
+        if (value[0] % prime != 0) break;
+        divideBlkByPower(value, prime);
+        ++exact;
+        work += blockCount;
+        if (work > kMaxExpansionWork) return -1;
+    }
+    return exact;
 }
 
 // base 中 prime 的指数（base 能被 prime 整除的次数）。
@@ -417,9 +478,21 @@ int exactFractionDigits(const BigDecimal& value, int base) {
     const int baseTwo = factorExponent(base, 2);
     const int baseFive = factorExponent(base, 5);
 
+    // 十进制特判：**任何**有限十进制小数在十进制下都精确表示，位数就是
+    // scale 本身。
+    //
+    // 这条特判不只是优化 —— 它把十进制路径与「赋值计算」彻底解耦。
+    // 赋值计算是唯一可能触及工作量上限的环节（见 valuationCapped），而
+    // 十进制不该因为它失败就退化。内核的原生表示本来就知道答案。
+    if (base == 10) return scale;
+
     const Blk& numerator = value.numeratorBlocks();
     const int two = valuationCapped(numerator, 2, scale);
     const int five = valuationCapped(numerator, 5, scale);
+
+    // 赋值算不出来（工作量超限）：不能断言该值能有限表示 —— 保守地当作
+    // 「不能」，让调用方走截断路径。那只是少给几位，而不会谎称精确。
+    if (two < 0 || five < 0) return -1;
 
     // base 里没有的质因子必须已经被分子消掉，否则展开是无限的。
     if (baseTwo == 0 && two < scale) return -1;
@@ -553,18 +626,23 @@ std::string decimalFractionDigits(const BigDecimal& value) {
     return std::string(static_cast<std::size_t>(scale) - digits.size(), '0') + digits;
 }
 
-// 展开 digits 位小数的工作量检查。
+// 展开 digits 位小数的工作量上限：算出最多能算多少位。
 //
 // 每提取一位都要把整个余数乘一次进制并按十进制位切开，代价 O(块数)。
 //
 // 块数按**最坏情况**估：余数始终 < 1，它的小数位不超过 scale，整数位最多
 // 1 位，因此块数不超过 scale/9 + 1。用分子的块数估会严重低估 ——
 // 分子的块数可能只有 1，而余数的块数会随展开线性增长。
-void checkExpansionWork(const BigDecimal& value, int digits) {
+//
+// 返回**实际能展开的位数**（<= digits）。触及上限时**不报错**，而是
+// 少给几位并由调用方标记「...」—— 见 kMaxExpansionWork 的说明。
+int affordableExpansionDigits(const BigDecimal& value, int digits) {
+    if (digits <= 0) return 0;
     const long long blocks = static_cast<long long>(value.scale()) / 9 + 2;
-    if (static_cast<long long>(digits) * blocks > kMaxExpansionWork) {
-        throw std::overflow_error("toBaseString: 小数位过多，无法展开");
-    }
+    if (blocks <= 0) return digits;
+    const long long affordable = kMaxExpansionWork / blocks;
+    if (affordable >= digits) return digits;
+    return static_cast<int>(affordable);
 }
 
 // 按 base 进制逐位提取小数部分，最多 digits 位。
@@ -676,12 +754,21 @@ std::string toBaseString(const BigDecimal& value, int base, bool uppercase, int 
                 // 十进制是内核的原生表示，直接取数字即可，代价 O(位数)。
                 fractionText = decimalFractionDigits(value);
             } else {
-                checkExpansionWork(value, budget);
-                expandFraction(value, base, budget, table, fractionText, truncated);
+                // 预算超过工作量上限时**截断**而不是报错：算得动多少给多少，
+                // 剩下的用「...」如实标记（见 kMaxExpansionWork）。
+                const int affordable = affordableExpansionDigits(value, budget);
+                if (affordable > 0) {
+                    expandFraction(value, base, affordable, table, fractionText, truncated);
+                }
+                // 预算没算完 —— 展开一定没写完，标记是如实的。
+                //
+                // 注意这个判断**不能**放进 expandFraction 里：它会把
+                // truncated 覆盖成「余数是否为零」，从而丢掉「预算本身
+                // 就不够」这个事实。
+                if (affordable < budget) truncated = true;
             }
-
             if (truncated) {
-                // 发生截断时**保留全部 budget 位**：末位可能是展开中的真实
+                // 发生截断时**保留全部算出来的位**：末位可能是展开中的真实
                 // 数字，删掉它会改变数值（"0.0100…" 与 "0.01…" 含义不同）。
                 out.push_back('.');
                 out += fractionText;
