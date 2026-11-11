@@ -309,8 +309,15 @@ def evaluate_function(name, arg_nodes, mode, precision):
             # 整数指数：精确快速幂，但结果仍按精度舍入。
             return 'rounded', quantize_sig(value, precision, mode)
         # 非整数指数：exp(b·ln a)。
+        #
+        # 零底数要单独处理：0^正数 = 0 是**有定义的**（与 Python 的
+        # decimal 一致），不能落进「负底数未定义」那条路。
         if base == 0:
-            return 'error', None
+            # 零的负数次幂未定义；零的零次幂同样未定义（decimal 规范里
+            # 是非法运算）。内核在这两种情况下抛 domain_error。
+            if exponent <= 0:
+                return 'error', None
+            return 'exact', Fraction(0)
         if base < 0:
             return 'error', None
         with localcontext() as ctx:
@@ -440,7 +447,9 @@ def build_cases():
 
     # 7) pow：整数指数与非整数指数。
     for _ in range(40):
-        base = random.choice([2, 3, 5, 10])
+        # 底数里含 0：整数指数下的 0^正数 = 0、0^负数与 0^0 都是定义域
+        # 错误，三条分支都要被覆盖到。
+        base = random.choice([0, 2, 3, 5, 10])
         power = random.choice([-4, -2, -1, 0, 1, 2, 3, 7, 10])
         mode = random.choice(MODES)
         precision = random.choice([5, 20])
@@ -449,7 +458,10 @@ def build_cases():
 
     for _ in range(30):
         scale = random.choice([1, 3, 6])
-        base_numerator = random.randint(1, 100 * 10 ** scale)
+        # 底数要能取到 0：0^非整数**正**指数 = 0 是**有定义的**（与
+        # Python 的 decimal 一致），不取 0 就永远测不到这条路径 ——
+        # 而一旦内核在这里改错，差分脚本根本不会报警。
+        base_numerator = random.choice([0, random.randint(1, 100 * 10 ** scale)])
         power_numerator = random.randint(1, 5 * 10 ** scale)
         mode = random.choice(MODES)
         precision = random.choice([5, 20])
@@ -457,6 +469,17 @@ def build_cases():
         fp = literal(Fraction(power_numerator, 10 ** scale))
         add('pow(%s,%s)' % (frac_text(fb[1]), frac_text(fp[1])),
             ('func', 'pow', [fb, fp]), precision, mode)
+
+    # 7b) 零底数的**显式**用例：0^0.5 = 0（不是错误！）、0^(-1) 与 0^0
+    #      是定义域错误。参考值由 oracle 算出，不是手写的常量 ——
+    #      手写常量就绕过了「oracle 自己也会算错」这个失效模式。
+    for power_value in (Fraction(1, 2), Fraction(-1), Fraction(0),
+                        Fraction(3, 2), Fraction(-1, 2), Fraction(5, 4)):
+        mode = random.choice(MODES)
+        precision = random.choice([5, 20])
+        fp = literal(power_value)
+        add('pow(0,%s)' % frac_text(power_value),
+            ('func', 'pow', [literal(Fraction(0)), fp]), precision, mode)
 
     # 8) 科学计数法与进制字面量。
     for exponent in (-20, -10, -5, 0, 5, 10, 20):
