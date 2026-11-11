@@ -1,12 +1,13 @@
 // 内置 HTTP 服务：只监听回环地址，供本地使用。
 //
-// 用法：hpc_server [--host 127.0.0.1] [--port 8098] [--web-root <目录>]
+// 用法：hpc_server [--host 127.0.0.1] [--port 8098] [--web-root <目录>] [--no-browser]
 //
 // 默认只监听回环地址，不会暴露到局域网。
 //
 // 该文件**不**自动打开浏览器：兄弟项目用 std::system 拉起浏览器，那条路径
 // 要把命令行拼成一条 shell 命令，而 host 来自用户输入。这里不做这件事 ——
-// 服务起来后把 URL 打印出来就够了。
+// 服务起来后把 URL 打印出来就够了。`--no-browser` 仍然被接受（恒等操作），
+// 只是为了兼容按兄弟项目方式写的调用脚本。
 //
 // Ctrl+C 的处理：装一个控制台处理器，只翻转一个标志位，主循环看到它就退出，
 // 随后 Server 的析构函数调用 stop()，stop() 会 join 服务线程 —— 进程干净地
@@ -118,14 +119,28 @@ int main(int argc, char** argv) {
             host = argv[++i];
         } else if (argument == "--web-root" && i + 1 < argc) {
             webRoot = argv[++i];
+        } else if (argument == "--no-browser") {
+            // 接受这个参数只是为了**兼容兄弟项目的调用方式** ——
+            // 本服务本来就**从不**自动打开浏览器（那条路径要经过
+            // shell 拼命令，而 host 来自用户输入）。
+            //
+            // 所以这个开关是恒等操作：传不传，行为都一样。
+            // 未知参数直接报错退出比「静默忽略」好 —— 拼错参数名
+            // （比如 --no-brwoser）会让用户以为生效了。
         } else if (argument == "--help" || argument == "-h") {
             std::cout << "用法: hpc_server [--host 127.0.0.1] [--port 8098] "
-                         "[--web-root <目录>]\n";
+                         "[--web-root <目录>] [--no-browser]\n"
+                         "\n"
+                         "  --host        监听地址，默认 127.0.0.1（只监听回环地址）\n"
+                         "  --port        监听端口，默认 8098\n"
+                         "  --web-root    前端资源目录，默认取可执行文件同级的 web/\n"
+                         "  --no-browser  兼容项：本服务**从不**自动打开浏览器，\n"
+                         "                启动后请手动访问上面打印的 URL\n";
             return 0;
         } else {
             std::cerr << "未知参数: " << argument << "\n";
             std::cerr << "用法: hpc_server [--host 127.0.0.1] [--port 8098] "
-                         "[--web-root <目录>]\n";
+                         "[--web-root <目录>] [--no-browser]\n";
             return 2;
         }
     }

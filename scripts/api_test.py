@@ -8,6 +8,11 @@
 因此响应体不是纯 ASCII —— 本脚本**显式**用 utf-8 解码，
 而不是依赖 locale 的默认编码。在 GBK 控制台下用 text=True 读会抛
 UnicodeDecodeError。
+
+**本脚本自己的输出**也要显式设成 UTF-8：Windows 的控制台默认是 GBK
+（本机代码页 936），不加这一行的话，上面那些中文标签会显示成乱码。
+reconfigure() 只影响 stdout/stderr 的编码，不影响读文件与网络，
+也不改变退出码。
 """
 import json
 import os
@@ -16,6 +21,18 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+# Windows 控制台默认是 GBK：中文标签会显示成乱码。
+# 显式切到 UTF-8，脚本的输出才读得懂。
+#
+# errors="replace" 是为了**不因为一个坏字节而崩掉整个测试** ——
+# 一个打印失败不该让测试结果变成「未知」。
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        # Python < 3.7 没有 reconfigure；那时靠环境的 PYTHONIOENCODING。
+        pass
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8099
 BASE = f"http://127.0.0.1:{PORT}"
@@ -61,8 +78,11 @@ def startServer():
         sys.exit(2)
 
     print(f"启动服务：{executable} --port {PORT}")
+    # 带上 --no-browser：这个开关在本服务里是恒等操作（本服务从不自动
+    # 打开浏览器），但显式传出来能让「测试脚本不该弹出浏览器窗口」
+    # 这件事在**别的**实现上也成立。
     server_process = subprocess.Popen(
-        [executable, "--port", str(PORT)],
+        [executable, "--port", str(PORT), "--no-browser"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
