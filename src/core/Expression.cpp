@@ -325,7 +325,21 @@ private:
                 ++cursor;
             }
             if (cursor < text_.size() && isDigit(text_[cursor])) {
+                // 指数的绝对值有上限（与内核的 kMaxExponentMagnitude 同一个），
+                // 超了就直接报错 —— 不去构造那个上百万位的移位。
+                //
+                // 检查放在**把当前位折进 magnitude 之后**（与内核一致）：
+                // 先检查再折的话，最后一位会把 magnitude 顶到 10 × 上限，
+                // 实际接受的上限就是 10 倍。
+                long long magnitude = 0;
                 while (cursor < text_.size() && isDigit(text_[cursor])) {
+                    const long long digit = text_[cursor] - '0';
+                    if (magnitude > (kMaxExponentMagnitude - digit) / 10) {
+                        // 位置指向那个 'e'，与 "1e" / "1e+" 的处理一致 ——
+                        // 出错的是**指数**，不是指数里的某个数字。
+                        failAt("非法的数字：指数过大", mark);
+                    }
+                    magnitude = magnitude * 10 + digit;
                     ++cursor;
                 }
                 position_ = cursor;
