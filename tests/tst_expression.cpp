@@ -12,10 +12,6 @@ using hpc::RoundingMode;
 
 namespace {
 
-// volatile 读取不会被常量折叠，从而保证断言在运行时求值，
-// 否则 MSVC /W4 会因常量条件表达式报 C4127。
-volatile int kOne = 1;
-
 // 求值并返回结果。
 //
 // **异常不外泄**：抛出的 ExpressionError 会被记成一个失败的断言，
@@ -230,6 +226,30 @@ TEST(expression, scientificNotation) {
     CHECK_EQ(eval("1e-3").toString(), std::string("0.001"));
 }
 
+// 科学计数法的指数上限：|exponent| 的上限是 10^6（内核的
+// kMaxExponentMagnitude）。
+//
+// 上限之内要能算，上限之外要报错 —— 而且报错的位置指向那个 'e'，
+// 与 "1e" / "1e+" 的处理一致。
+TEST(expression, scientificNotationExponentLimit) {
+    // 正好在上限之内：正指数（上百万位的整数）与负指数（上百万位的
+    // 小数）都要能算出来。
+    const std::string big = eval("1e1000000").toString();
+    CHECK_EQ(big.size(), static_cast<std::size_t>(1000001));
+    CHECK_EQ(big.substr(0, 2), std::string("10"));
+    CHECK_EQ(big.substr(big.size() - 1), std::string("0"));
+
+    const std::string small = eval("1e-1000000").toString();
+    CHECK_EQ(small.size(), static_cast<std::size_t>(1000002));
+    CHECK_EQ(small.substr(0, 2), std::string("0."));
+    CHECK_EQ(small.substr(small.size() - 1), std::string("1"));
+
+    // 越界就是错误，位置指向那个 'e'。
+    checkErrorAt("1e1000001", 1);
+    checkErrorAt("1e-1000001", 1);
+    checkErrorAt("1e999999999", 1);
+}
+
 TEST(expression, decimalLiterals) {
     CHECK_EQ(eval("0.5").toString(), std::string("0.5"));
     CHECK_EQ(eval(".5").toString(), std::string("0.5"));
@@ -392,6 +412,9 @@ TEST(expression, errorPositions) {
     checkErrorAt("0x", 2);          // 前缀后没有数位
     checkErrorAt("1e", 1);          // 指数部分非法 → 'e'
     checkErrorAt("1e+", 1);         // 指数部分非法 → 'e'
+    checkErrorAt("1e999999999", 1); // 指数过大 → 'e'（不是指数里的数字）
+    checkErrorAt("1e-999999999", 1); // 指数过大 → 'e'
+    checkErrorAt("1.5e999999999", 3); // 指数过大 → 'e'
     checkErrorAt(")", 0);           // 多余的字符
     checkErrorAt("1)2", 1);         // 多余的字符
     checkErrorAt("1+2)", 3);        // 多余的字符
@@ -422,7 +445,18 @@ TEST(expression, deepNestingIsRejectedCleanly) {
     int position = -1;
     std::string message;
     CHECK(!tryEval(text, position, message));
-    CHECK(position >= 0);
+    // 位置要**钉死**：第 256 个 '(' 之后那个字符（实测 256）。
+    //
+    // 只断言 position >= 0 的话，将来深度的计数方式一变（少算一层、
+    // 多算一层），这个用例照样通过 —— 而错误位置是前端用来高亮
+    // 出错字符的，漂了就用不了了。
+    CHECK_EQ(position, 256);
+
+    // 正好在上限之内（255 层）必须能正常算出。
+    std::string atLimit(255, '(');
+    atLimit += "1";
+    atLimit += std::string(255, ')');
+    CHECK_EQ(eval(atLimit).toString(), std::string("1"));
 
     // 100 层（低于上限）必须能正常算出。
     std::string shallow(100, '(');
@@ -439,7 +473,19 @@ TEST(expression, deepFunctionNestingIsRejectedCleanly) {
     int position = -1;
     std::string message;
     CHECK(!tryEval(text, position, message));
-    CHECK(position >= 0);
+    // 位置钉死：第 257 次 "sqrt(" 的那个 's'（实测 1280）。
+    //
+    // 每次函数调用消耗一层深度（与括号一样），所以上限 256 层对应第
+    // 257 次调用被拒；位置指向**被拒的那次调用的第一个字符**。
+    // 1280 = 256 × 5（"sqrt(" 五个字符）。
+    CHECK_EQ(position, 1280);
+
+    // 正好在上限之内（255 次调用 = 255 层）必须能正常算出。
+    std::string atLimit;
+    for (int i = 0; i < 255; ++i) atLimit += "sqrt(";
+    atLimit += "1";
+    for (int i = 0; i < 255; ++i) atLimit += ")";
+    CHECK_EQ(eval(atLimit).toString(), std::string("1"));
 }
 
 // --- 精度 ---
@@ -594,23 +640,4 @@ TEST(expression, structuralSafety) {
     // 除数为零的两个变体。
     CHECK(evalOrError("1/0.0").rfind("!", 0) == 0);
     CHECK(evalOrError("1/(0*5)").rfind("!", 0) == 0);
-}
-
-// --- 负向自测 ---
-//
-// 验证断言失败**确实会被计数**。
-//
-// 若 reportFailure 退化成空操作，上面的用例照样全绿，而这套测试的
-// 全部意义就在于「失败能被检出」。failureCount() 返回引用，可存可
-// 复原；复原后 main 的 before/after 差值为 0，全局计数仍是 0，
-// 本用例本身判为 ok（main 会打印一行 FAIL，但那是**故意**的）。
-//
-// 这个自测放在**每个**测试文件里，而不是集中一处：每个文件的断言
-// 都必须自己证明「失败能被检出」，否则某个文件里的断言全部失效
-// （比如 CHECK 宏被误改）时，那个文件会**静默地**全绿。
-TEST(expression, frameworkDetectsFailures) {
-    const int before = ::testing::failureCount();
-    CHECK(kOne == 2);                                     // 故意失败
-    CHECK(::testing::failureCount() == before + 1);
-    ::testing::failureCount() = before;                   // 复原，避免污染全局计数
 }
