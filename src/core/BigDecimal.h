@@ -59,6 +59,27 @@ public:
     bool isZero() const;
     int sign() const { return sign_; }
 
+    // 是否为整数（没有小数位）。
+    bool isInteger() const { return scale_ == 0; }
+
+    // 十进制小数位的个数。
+    //
+    // 注意与 Context::precision 区分：precision 是**有效数字位**，
+    // scale 是**小数位**（十进制小数点后的位数），两者不是一个概念。
+    int scale() const { return scale_; }
+
+    // 精确地向零截断到整数（丢弃小数部分，不做舍入）。
+    //
+    // -1.5 -> -1，1.5 -> 1。与 floor 的区别：floor 向 -∞ 取整，
+    // -1.5 的 floor 是 -2。位运算与进制转换的整数部分都用这个语义。
+    BigDecimal truncateToInteger() const;
+
+    // 整数的**绝对值**的 base-10^9 小端块（digits_[0] 是最低位块）。
+    //
+    // 非整数时抛 std::domain_error —— 位运算这类「精确整数运算」的入口。
+    // 符号不在这里：符号由 sign() 单独给出。
+    const std::vector<std::uint32_t>& integerBlocks() const;
+
     // --- 超越函数 ---
     //
     // 这些函数本质上不精确，必须显式给出精度：结果按 context.precision

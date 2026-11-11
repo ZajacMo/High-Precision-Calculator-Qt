@@ -18,6 +18,12 @@ constexpr int kBlockDigits = 9;
 // 通常说明调用方用了一个写死的巨大精度，而不是按量的级计算。
 constexpr int kMaxPrecision = 100000;
 
+// 科学计数法的指数上限。
+//
+// 指数为正时结果是 10^exponent 量级的整数，为负时是极小的分数。
+// 两种方向都要有上限，否则 "1e999999999" 会把内存吃光。
+constexpr long long kMaxExponentMagnitude = 1000000;
+
 // 去除高位的零块，但至少保留一个块表示 0。
 Blk trimBlk(Blk value) {
     while (value.size() > 1 && value.back() == 0) value.pop_back();
@@ -275,6 +281,46 @@ BigDecimal BigDecimal::fromString(std::string_view text) {
         ++index;
     }
 
+    // 科学计数法：把指数部分分离出来。
+    //
+    // 指数之前的尾数用与原来完全相同的规则解析（可选小数点、前导零），
+    // 因此**已有输入的行为不变**：不含 'e'/'E' 的串走的是同一条路径。
+    //
+    // 指数本身必须是一个十进制整数（可带正负号），否则抛 invalid_argument。
+    int exponent = 0;
+    bool hasExponent = false;
+    for (std::size_t i = index; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c != 'e' && c != 'E') continue;
+
+        std::size_t cursor = i + 1;
+        bool exponentNegative = false;
+        if (cursor < text.size() && (text[cursor] == '+' || text[cursor] == '-')) {
+            exponentNegative = (text[cursor] == '-');
+            ++cursor;
+        }
+        if (cursor >= text.size() || !std::isdigit(static_cast<unsigned char>(text[cursor]))) {
+            throw std::invalid_argument("BigDecimal: 指数部分非法");
+        }
+        long long magnitude = 0;
+        while (cursor < text.size() && std::isdigit(static_cast<unsigned char>(text[cursor]))) {
+            // 上限保护：避免 "1e99999999999" 之类的输入把内存吃光。
+            if (magnitude > kMaxExponentMagnitude) {
+                throw std::invalid_argument("BigDecimal: 指数过大");
+            }
+            magnitude = magnitude * 10 + (text[cursor] - '0');
+            ++cursor;
+        }
+        // 指数后面不允许再有别的字符（"1e5e6" 必须报错而不是丢掉 "e6"）。
+        if (cursor != text.size()) {
+            throw std::invalid_argument("BigDecimal: 指数后面有多余的字符");
+        }
+        exponent = static_cast<int>(exponentNegative ? -magnitude : magnitude);
+        hasExponent = true;
+        text = text.substr(0, i);
+        break;
+    }
+
     std::string integral;
     std::string fractional;
     bool seenDot = false;
@@ -299,6 +345,19 @@ BigDecimal BigDecimal::fromString(std::string_view text) {
     if (combined.empty()) combined = "0";
     result.digits_ = blocksFromDecimal(combined);
     result.normalize();
+
+    // 应用指数：value * 10^exponent。
+    //
+    // 移位是**精确**操作（十进制下 10 的整数次幂就是移小数点），
+    // 因此 1e20、2.5e-3 都能被精确表示，不引入任何舍入。
+    if (hasExponent) {
+        if (exponent > 0) {
+            result.digits_ = shiftLeftDecimal(result.digits_, exponent);
+        } else if (exponent < 0) {
+            result.scale_ += -exponent;
+        }
+        result.normalize();
+    }
     return result;
 }
 
@@ -430,6 +489,56 @@ std::string BigDecimal::toString() const {
 }
 
 bool BigDecimal::isZero() const { return sign_ == 0; }
+
+const std::vector<std::uint32_t>& BigDecimal::integerBlocks() const {
+    if (scale_ != 0) throw std::domain_error("BigDecimal: 该运算只支持整数");
+    return digits_;
+}
+
+BigDecimal BigDecimal::truncateToInteger() const {
+    if (scale_ == 0) return *this;
+
+    // 向零截断 = 取绝对值后丢掉最低的 scale 个十进制位。
+    //
+    // 性能：逐位 divideBy10 是 O(scale × 块数) 的二次方开销 ——
+    // 高精度除法的结果 scale 可达上万位（块数千个），逐位除会退化。
+    // 因此分两步：
+    //   1) 丢掉最低 scale/9 个**整块**（一次 erase，O(块数)）；
+    //   2) 剩下的 scale%9 位用 divideBy10 逐位去掉（最多 8 次，O(块数)）。
+    // 合计 O(块数)，与 scale 的大小基本无关。
+    BigDecimal magnitude = abs(*this);
+
+    const int wholeBlocks = scale_ / kBlockDigits;
+    const int rest = scale_ % kBlockDigits;
+
+    // 第一步：丢掉最低的整块。
+    //
+    // 正确性：值 = 低位部分 + 高位部分 × 10^(9w)，而低位部分 < 10^(9w)，
+    // 因此 floor(值 / 10^(9w)) 恰好等于高位部分。
+    const std::size_t drop = std::min(static_cast<std::size_t>(wholeBlocks),
+                                      magnitude.digits_.size());
+    Blk kept(magnitude.digits_.begin() + static_cast<std::ptrdiff_t>(drop),
+             magnitude.digits_.end());
+    if (kept.empty()) kept.push_back(0);
+
+    // 第二步：再丢掉 rest 个十进制位（rest < 9）。
+    //
+    // 注意**不能**只把最低块除以 10^rest：块边界与十进制位边界不对齐时
+    // （例如 9999999999 = 9×10^9 + 999999999），除以 10^5 会让**所有**块
+    // 一起右移 5 位，而不只是最低块。因此这里用整块级的长除法逐位除。
+    for (int i = 0; i < rest; ++i) {
+        divideBy10(kept);
+    }
+
+    BigDecimal result;
+    result.digits_ = std::move(kept);
+    result.scale_ = 0;
+    result.sign_ = sign_;
+    result.normalize();
+
+    // 符号跟随原值：向零截断，-1.5 -> -1（不是 floor 的 -2）。
+    return result;
+}
 
 // --- 除法、舍入与取整 ---
 

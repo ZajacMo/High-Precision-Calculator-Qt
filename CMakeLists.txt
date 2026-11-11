@@ -78,4 +78,9 @@ if(BUILD_TESTS)
     add_executable(func_probe tests/func_probe.cpp)
     target_link_libraries(func_probe PRIVATE hpc_core)
     hpc_set_warnings(func_probe)
+
+    # 进制/位运算探针：供 scripts/verify_format.py 做差分验证。
+    add_executable(format_probe tests/format_probe.cpp)
+    target_link_libraries(format_probe PRIVATE hpc_core)
+    hpc_set_warnings(format_probe)
 endif()
