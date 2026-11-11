@@ -215,6 +215,21 @@ def main():
     result = run(['--oj'], stdin='')
     check('OJ 空输入正常退出', result.returncode == 0 and out(result) == [],
           'exit=%d out=%r' % (result.returncode, out(result)))
+    # 组数上限：声明的组数超过上限时必须**拒绝**（stderr 给诊断、退出码 1），
+    # 而不是照着输出一行一组的 ERROR —— legacy 在这一档会读成 INT_MAX、
+    # 输出 21 亿行（资源耗尽）。
+    result = run(['--oj'], stdin='1000001\n')
+    check('OJ 声明的组数超过上限 -> 报错并停止',
+          result.returncode == 1 and out(result) == [] and '错误' in err(result),
+          'exit=%d out=%r err=%r' % (result.returncode, out(result), err(result)))
+    result = run(['--oj'], stdin='2000000000\n')
+    check('OJ 声明 2e9 组 -> 报错并停止（不做 21 亿行输出）',
+          result.returncode == 1 and out(result) == [],
+          'exit=%d out=%r' % (result.returncode, out(result)))
+    result = run(['--oj'], stdin='99999999999999999999\n')
+    check('OJ 声明的组数超出整数范围 -> 报错并停止（不是静悄悄的空输出）',
+          result.returncode == 1 and out(result) == [] and '错误' in err(result),
+          'exit=%d out=%r err=%r' % (result.returncode, out(result), err(result)))
 
     print('\n=== 7) 输出与错误分流 ===')
     result = run(['-e', '1/0'])

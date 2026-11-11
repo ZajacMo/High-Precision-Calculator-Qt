@@ -310,6 +310,9 @@ def main():
          ['ERROR', '7', '2']),
         ('科学计数法操作数', '1\n/ 1e2 4\n', 0, ['25']),
         ('操作数含逗号', '1\n+ 1,234 1\n', 0, ['1,235']),
+        # 组数声明得过大：必须**拒绝**而不是照着输出一行一组的 ERROR。
+        # legacy 在这一档会读成 INT_MAX、输出 21 亿行（资源耗尽）。
+        ('组数超过上限', '1000001\n', 1, []),
     ]
     for name, payload_m, expected_code, expected_lines in malformed:
         try:
