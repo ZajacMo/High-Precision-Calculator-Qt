@@ -7055,14 +7055,41 @@ git commit -m "feat(web): REST API、内置 HTTP 服务与原生 Web 前端"
 > **合法**请求**够不着** —— 用户在界面上根本选不到那个精度。
 >
 > 越界时的行为是**明确的报错**，不是静默降级：
->   - 选到 100000 以上 → 界面层报 400（含上限值）；
+>   - 选到 100000 以上 → 选择框本身不让选（setRange 的上界）；
 >   - 选到 1000..100000 之间但用到了超越函数 → **内核抛异常**，
->     界面层翻译成一条说清楚「是哪个函数越的界、上限是多少」的 400。
+>     界面层翻译成一条说清楚「是哪个函数越的界、上限是多少」的错误。
 >
 > 两者的共同点是：**用户拿到的答案要么是他要的精度，要么是一条明确的
 > 错误** —— 不会有「悄悄换了个精度」的第三种结果。
 
-- [ ] **Step 1: 在 `CMakeLists.txt` 加入 GUI 目标**
+> **Task 9 实测后修正的 7 处（原计划的代码有缺陷，详见本节末尾）**：
+>
+> 1. **精度上限从 1000 改为 100000**（`kMaxPrecision`）—— 见上。
+> 2. **前向声明不能用 `class QLineEdit*`** —— 那个 `class` 关键字会在
+>    `hpc::ui` 里**新建**一个叫 QLineEdit 的不完整类型，把真正的
+>    `::QLineEdit` 遮住。后果：`findChild<QLineEdit*>()` 找不到东西，
+>    `new QLineEdit(...)` 造出来的对象类型也不是 Qt 那个 —— 运行时必炸。
+>    正确写法是**不带 `class` 的裸名字**（`class QLineEdit;`）。
+> 3. **表达式不能先 trim 再交给内核** —— 内核报的错误位置是相对
+>    **它收到的那个串**的字节下标，trim 会让位置与输入框里的字符错位。
+>    内核自己会跳过空白，所以原样传进去位置才是准的。
+> 4. **windeployqt 的插件名是 `qoffscreen` 不是 `offscreen`** —— 而且
+>    `--no-angle` 在 Qt 6.6.2 上**不是合法选项**（会让 windeployqt 以
+>    退出码 127 失败，进而让整个构建失败）。
+> 5. **必须部署 Qt 运行时**（windeployqt）—— 原计划没有这一步。Qt6 是
+>    动态链接的，不部署的话 `hpc_gui.exe` 与 `gui_smoke.exe` 都只有在
+>    Qt 的 bin 目录恰好在 `PATH` 上时才跑得起来；ctest 会以退出码 127
+>    失败，而不是报出一个像样的测试失败。
+> 6. **部署必须串行** —— 两个可执行文件在同一个目录、共用同一套 Qt
+>    运行时，所以 windeployqt 只需跑**一次**；给两个目标各挂一个
+>    POST_BUILD 会让 Ninja **并行**跑两个 windeployqt，同时往同一个
+>    `imageformats/` 目录拷文件 —— 实测报「Cannot create ... qwebp.dll
+>    for output」并让构建失败（间歇性）。改成挂在自定义目标上。
+> 7. **`$<TARGET_FILE:hpc_gui>` 会形成依赖环** —— 部署目标用了它，
+>    而 hpc_gui 又依赖部署目标，CMake 直接报「strongly connected
+>    component」。部署命令改用 `$<TARGET_FILE_DIR:hpc_gui>/hpc_gui.exe`。
+
+- [x] **Step 1: 在 `CMakeLists.txt` 加入 GUI 目标**
 
 ```cmake
 if(BUILD_GUI)
@@ -7075,35 +7102,135 @@ if(BUILD_GUI)
         src/ui/MainWindow.h
     )
     target_link_libraries(hpc_gui PRIVATE hpc_core Qt6::Widgets)
-    if(MSVC)
-        target_compile_options(hpc_gui PRIVATE /W4 /utf-8)
-    endif()
+    hpc_set_warnings(hpc_gui)
     if(WIN32)
+        # GUI 程序不要弹出控制台窗口。
         set_target_properties(hpc_gui PROPERTIES WIN32_EXECUTABLE TRUE)
     endif()
 
+    # 把 Qt 的运行时（DLL + 平台插件）部署到可执行文件旁边。
+    #
+    # 为什么必须做：Qt6 是**动态链接**的，不部署的话 hpc_gui.exe 与
+    # gui_smoke.exe 都只有在 Qt 的 bin 目录恰好在 PATH 上时才跑得起来
+    # —— 直接双击 hpc_gui.exe 会弹「找不到 Qt6Core.dll」。
+    #
+    # windeployqt 由 Qt6CoreTools 提供（find_package(Qt6) 会顺带找到它）。
+    find_program(HPC_WINDEPLOYQT windeployqt)
+    if(HPC_WINDEPLOYQT)
+        # 两个可执行文件在**同一个目录**里（都是构建目录的根），所以它们
+        # 共享同一套 Qt 运行时 —— windeployqt 只需要跑**一次**。
+        #
+        # 而且**不能**给两个目标各挂一个 POST_BUILD：Ninja 会**并行**跑
+        # 两条命令，两个 windeployqt 同时往同一个 imageformats/ 目录里拷
+        # 文件 —— 实测会报「Cannot create ... qwebp.dll for output」
+        # 并让构建失败（间歇性，取决于调度）。
+        #
+        # 所以部署挂在一个**自定义目标**上，两个可执行文件都依赖它。
+        #
+        # 部署的**目标文件**写死成 $<TARGET_FILE_DIR:hpc_gui>/hpc_gui.exe，
+        # 而不是 $<TARGET_FILE:hpc_gui> —— 后者会把 hpc_gui 变成部署目标的
+        # 依赖，而 hpc_gui 又依赖部署目标，形成**依赖环**（CMake 直接报错）。
+        # 两者指向同一个文件（Ninja 单配置生成器下可执行文件就在目标目录里），
+        # 但前者没有依赖关系。
+        #
+        # 部署目标**依赖** hpc_gui（所以 hpc_gui.exe 先建好，部署才有东西
+        # 可部署），而 hpc_gui **不**依赖部署目标 —— 方向反了就是依赖环，
+        # CMake 会直接报「strongly connected component」。
+        #
+        # 部署命令里用 $<TARGET_FILE_DIR:hpc_gui>/hpc_gui.exe 而不是
+        # $<TARGET_FILE:hpc_gui>：两者指向同一个文件（Ninja 单配置生成器下
+        # 可执行文件就在目标目录里），但后者会**隐式**加一条
+        # 「部署目标依赖 hpc_gui」的边 —— 那条边本身没错，错的是它与
+        # add_dependencies 的方向组合起来会成环。写成显式的路径就没有
+        # 隐式边，方向完全由 add_dependencies 说了算。
+        add_custom_target(hpc_qt_deploy ALL
+            COMMAND "${HPC_WINDEPLOYQT}" --no-translations --no-system-d3d-compiler
+                    --no-opengl-sw --no-compiler-runtime
+                    --include-plugins qoffscreen
+                    "$<TARGET_FILE_DIR:hpc_gui>/hpc_gui.exe"
+            COMMENT "部署 Qt 运行时到构建目录")
+        add_dependencies(hpc_qt_deploy hpc_gui)
+    else()
+        message(WARNING
+            "找不到 windeployqt：hpc_gui.exe 需要 Qt 的 bin 目录在 PATH 上才能运行。")
+    endif()
+
     if(BUILD_TESTS)
-        add_executable(gui_smoke tests/gui_smoke.cpp
+        add_executable(gui_smoke
+            tests/gui_smoke.cpp
             src/ui/MainWindow.cpp
             src/ui/MainWindow.h
         )
         target_link_libraries(gui_smoke PRIVATE hpc_core Qt6::Widgets)
-        target_include_directories(gui_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/ui)
+        target_include_directories(gui_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        hpc_set_warnings(gui_smoke)
+        # 截图目录在构建时创建 —— 测试进程不该假设目录已经存在。
+        add_custom_command(TARGET gui_smoke POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "${CMAKE_CURRENT_BINARY_DIR}/screenshots")
+        if(HPC_WINDEPLOYQT)
+            # 同样部署：否则 ctest 启动 gui_smoke 时会因找不到 Qt6Core.dll
+            # 直接失败（退出码 127），而**不是**报出一个像样的测试失败。
+            #
+            # --include-plugins qoffscreen 是**必需**的：windeployqt 默认只
+            # 部署 qwindows 平台插件，而冒烟测试跑在 QT_QPA_PLATFORM=offscreen
+            # 下 —— 少了 qoffscreen.dll，测试会「Qt 平台插件加载失败」地退出。
+            #
+            # 部署由 hpc_qt_deploy 统一做（两个可执行文件共用同一套运行时），
+            # 这里只建立依赖关系。
+            add_dependencies(gui_smoke hpc_qt_deploy)
+        endif()
         add_test(NAME gui_smoke
                  COMMAND gui_smoke ${CMAKE_CURRENT_BINARY_DIR}/screenshots)
         set_tests_properties(gui_smoke PROPERTIES
             ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
     endif()
-endif()
+endif
 ```
 
-- [ ] **Step 2: 写 `src/ui/MainWindow.h`**
+> **为什么必须部署 Qt 运行时**：Qt6 是**动态链接**的。不部署的话
+> `hpc_gui.exe` 与 `gui_smoke.exe` 都只有在 Qt 的 bin 目录恰好在 `PATH`
+> 上时才跑得起来 —— 直接双击会弹「找不到 Qt6Core.dll」，ctest 会以
+> 退出码 127 失败（而不是报出一个像样的测试失败）。
+>
+> 部署之后 `gui_smoke.exe` 在**没有 Qt 在 PATH 上**的环境里也能跑
+> （实测：不设 Qt 的 PATH，直接 `./gui_smoke.exe` 通过）。
+>
+> `--include-plugins qoffscreen` 是**必需**的：windeployqt 默认只部署
+> `qwindows` 平台插件，而冒烟测试跑在 `QT_QPA_PLATFORM=offscreen` 下
+> —— 少了 `qoffscreen.dll`，测试会「Qt 平台插件加载失败」地退出。
+
+- [x] **Step 2: 写 `src/ui/MainWindow.h`**
 
 ```cpp
 // Qt 桌面界面：仅是核心的前端之一，不含任何计算逻辑。
+//
+// 所有算术都在 src/core 里 —— 这里只做输入、参数选择、错误呈现与结果显示。
+//
+// 与命令行前端（src/cli/main.cpp）保持同一套语义：
+//   - 精度是**有效数字位**（不是小数位）；
+//   - 精度越界是**明确的报错**，不是静默夹到上限；
+//   - '%' 是 fmod 语义（符号跟随被除数）；
+//   - 进制转换的 "..." 标记如实呈现，不把截断值说成精确值。
 #pragma once
 
 #include <QMainWindow>
+#include <QString>
+
+// 前向声明：Qt 的控件类型。
+//
+// **不能**写成 `class QLineEdit*` 那种形式 —— 那个 `class` 关键字会在**当前
+// 命名空间**里声明一个全新的不完整类型 `hpc::ui::QLineEdit`，把真正的
+// `::QLineEdit` 遮住。于是 `findChild<QLineEdit*>()` 找不到任何东西，
+// 而 `new QLineEdit(...)` 造出来的对象类型也不是 Qt 那个 —— 运行时必炸。
+// 写成不带 `class` 的裸名字，声明的就是全局命名空间里的那一个。
+class QComboBox;
+class QLabel;
+class QLineEdit;
+class QListWidget;
+class QPlainTextEdit;
+class QPushButton;
+class QSpinBox;
 
 namespace hpc {
 namespace ui {
@@ -7116,28 +7243,35 @@ public:
     ~MainWindow() override;
 
 private:
-    // 触发一次求值。
+    // 触发一次求值。「计算」按钮与输入框的回车都接到这里。
     void evaluate();
     // 把一次求值结果追加到历史列表。
     void appendHistory(const QString& expression, const QString& result);
+    // 显示一条错误。position >= 0 时还要在输入框里选中出错的字符。
+    void showError(const QString& message, int position);
+    // 结果区下方的注解（截断标记说明、出错位置说明）。空文本时隐藏。
+    void setNote(const QString& text);
 
-    class QLineEdit* expression_{nullptr};
-    class QSpinBox* precision_{nullptr};
-    class QComboBox* base_{nullptr};
-    class QPlainTextEdit* output_{nullptr};
-    class QListWidget* history_{nullptr};
+    QLineEdit* expression_{nullptr};
+    QSpinBox* precision_{nullptr};
+    QComboBox* base_{nullptr};
+    QPushButton* button_{nullptr};
+    QPlainTextEdit* output_{nullptr};
+    QLabel* note_{nullptr};
+    QListWidget* history_{nullptr};
 };
 
 }  // namespace ui
 }  // namespace hpc
 ```
 
-- [ ] **Step 3: 写 `src/ui/MainWindow.cpp`**
+- [x] **Step 3: 写 `src/ui/MainWindow.cpp`**
 
 ```cpp
 #include "ui/MainWindow.h"
 
 #include <QComboBox>
+#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -7146,9 +7280,11 @@ private:
 #include <QPushButton>
 #include <QSpinBox>
 #include <QVBoxLayout>
+#include <QVariant>
 #include <QWidget>
 
 #include <exception>
+#include <string>
 
 #include "core/BigDecimal.h"
 #include "core/Expression.h"
@@ -7158,72 +7294,212 @@ private:
 namespace hpc {
 namespace ui {
 
+namespace {
+
+// UTF-8 字节下标 → UTF-16 码元下标。
+//
+// 内核报的错误位置是**字节**下标（它按 UTF-8 字节处理表达式），而
+// QLineEdit::setSelection 用的是 **UTF-16 码元**下标。两者只在纯 ASCII
+// 时相等；非 ASCII 的表达式必须做这个换算，否则选中的是错的字符。
+//
+// 逐个码元地累加字节数是**不够**的：非 BMP 字符（代理对）占 2 个 UTF-16
+// 码元但只占 4 个 UTF-8 字节，逐码元累加会算成 6。所以这里按码点走。
+int utf8OffsetToUtf16(const QString& text, int byteOffset) {
+    if (byteOffset <= 0) return 0;
+    int byte = 0;
+    int utf16 = 0;
+    while (byte < byteOffset && utf16 < text.size()) {
+        const QChar ch = text.at(utf16);
+        const char16_t unit = ch.unicode();
+        int codeUnits = 1;
+        int bytes = 1;
+        if (unit < 0x80) {
+            codeUnits = 1;
+            bytes = 1;
+        } else if (unit < 0x800) {
+            codeUnits = 1;
+            bytes = 2;
+        } else if (unit >= 0xD800 && unit <= 0xDBFF && utf16 + 1 < text.size() &&
+                   text.at(utf16 + 1).unicode() >= 0xDC00 && text.at(utf16 + 1).unicode() <= 0xDFFF) {
+            // 高代理 + 低代理 = 一个码点：2 个 UTF-16 码元，4 个 UTF-8 字节。
+            codeUnits = 2;
+            bytes = 4;
+        } else {
+            codeUnits = 1;
+            bytes = 3;
+        }
+        byte += bytes;
+        utf16 += codeUnits;
+    }
+    return utf16;
+}
+
+}  // namespace
+
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     setWindowTitle("高精度计算器");
-    resize(560, 480);
+    resize(680, 620);
 
     auto* central = new QWidget(this);
     auto* layout = new QVBoxLayout(central);
 
     layout->addWidget(new QLabel("表达式", central));
     expression_ = new QLineEdit(central);
+    expression_->setObjectName("expression");
     expression_->setText("1/3 + 2*sqrt(9)");
     expression_->setPlaceholderText("支持 + - * / %、括号与 sqrt/abs/pow/exp/ln/log10");
     layout->addWidget(expression_);
 
     auto* controls = new QHBoxLayout();
-    controls->addWidget(new QLabel("精度", central));
+    controls->addWidget(new QLabel("有效数字位", central));
     precision_ = new QSpinBox(central);
-    // 上限取 kMaxTranscendentalPrecision：表达式里可以用 sqrt/exp/ln/log10，
-    // 它们的精度上限是 1000（再高内核抛 std::invalid_argument）。
-    precision_->setRange(1, hpc::kMaxTranscendentalPrecision);
+    precision_->setObjectName("precision");
+    // 上限取 kMaxPrecision（100000）—— 与 Web 前端一致。
+    //
+    // 超越函数的上限（1000）是**算力**上限，不是**接口契约**上限：它
+    // **只在真的用到超越函数时**才生效。纯加减乘除的表达式在 100000 位
+    // 以内都合法。把上限设成 1000 会让「纯算术表达式要 5000 位」这个
+    // 合法请求**够不着** —— 用户在界面上根本选不到那个精度。
+    //
+    // 越界时的行为是**明确的报错**而不是静默降级：
+    //   - 选到 100000 以上 → 界面层直接拒绝（并说明上限）；
+    //   - 选到 1000..100000 之间但用到了超越函数 → **内核抛异常**，
+    //     这里把它翻译成一条说清楚「是哪个函数越的界、上限是多少」的错误。
+    // 两者都不会给用户「悄悄换了个精度」的第三种结果。
+    precision_->setRange(1, hpc::kMaxPrecision);
     precision_->setValue(30);
+    precision_->setSuffix(" 位");
     controls->addWidget(precision_);
 
     controls->addWidget(new QLabel("输出进制", central));
     base_ = new QComboBox(central);
-    base_->addItems({"10", "2", "8", "16", "36"});
+    base_->setObjectName("base");
+    base_->addItem("10（十进制）", 10);
+    base_->addItem("2（二进制）", 2);
+    base_->addItem("8（八进制）", 8);
+    base_->addItem("16（十六进制）", 16);
+    base_->addItem("36（三十六进制）", 36);
+    base_->setCurrentIndex(0);
     controls->addWidget(base_);
 
-    auto* button = new QPushButton("计算", central);
-    controls->addWidget(button);
+    button_ = new QPushButton("计算", central);
+    button_->setObjectName("evaluate");
+    controls->addWidget(button_);
     layout->addLayout(controls);
 
     output_ = new QPlainTextEdit(central);
+    output_->setObjectName("output");
     output_->setReadOnly(true);
     layout->addWidget(output_);
 
+    note_ = new QLabel(central);
+    note_->setObjectName("note");
+    note_->setWordWrap(true);
+    note_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    note_->hide();
+    layout->addWidget(note_);
+
     layout->addWidget(new QLabel("历史", central));
     history_ = new QListWidget(central);
+    history_->setObjectName("history");
     layout->addWidget(history_);
+
+    // 用法说明：把命令行与 Web 前端里那些「不说清楚就会踩坑」的语义
+    // 摆在界面上，而不是让人从报错里反推。
+    auto* help = new QGroupBox("用法", central);
+    auto* helpText = new QLabel(
+        "<ul>"
+        "<li>运算符：<code>+ - * / %</code>；<code>%</code> 是 <b>fmod 语义</b>，"
+        "符号跟随<b>被除数</b>（-7 % 3 == -1），左操作数带小数时余数也带小数"
+        "（5.5 % 2 == 1.5）—— 不是「先取整再取余」。</li>"
+        "<li>函数：<code>sqrt</code>、<code>abs</code>、<code>pow</code>、"
+        "<code>exp</code>、<code>ln</code>、<code>log10</code>。</li>"
+        "<li>数字：十进制小数、科学计数法（<code>1e20</code>），以及 "
+        "<code>0x</code> / <code>0b</code> / <code>0o</code> 前缀的整数。</li>"
+        "<li>精度是<b>有效数字位</b>。上限 100000 位；但表达式一旦用到超越函数"
+        "（<code>sqrt</code> / <code>exp</code> / <code>ln</code> / "
+        "<code>log10</code>，以及 <code>pow</code> 的<b>非整数指数</b>分支），"
+        "精度另受 <b>1000 位</b>约束 —— 那是内核的算力上限，与界面无关。"
+        "纯加减乘除的表达式不受这条约束。</li>"
+        "<li>进制转换的整数部分<b>精确无损</b>；小数部分若在该进制下无法有限"
+        "表示，会截断并用 <code>...</code> 标记 —— 那是「展开被截断了」，"
+        "<b>不是</b>精确值。</li>"
+        "<li>高精度除法很慢：100000 位需要几十秒。</li>"
+        "</ul>", central);
+    helpText->setWordWrap(true);
+    helpText->setTextFormat(Qt::RichText);
+    helpText->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    auto* helpLayout = new QVBoxLayout(help);
+    helpLayout->addWidget(helpText);
+    layout->addWidget(help);
 
     setCentralWidget(central);
 
-    connect(button, &QPushButton::clicked, this, &MainWindow::evaluate);
+    connect(button_, &QPushButton::clicked, this, &MainWindow::evaluate);
     connect(expression_, &QLineEdit::returnPressed, this, &MainWindow::evaluate);
 }
 
 MainWindow::~MainWindow() = default;
 
 void MainWindow::evaluate() {
-    const QString text = expression_->text().trimmed();
+    const QString text = expression_->text();
     if (text.isEmpty()) return;
 
-    const Context context{precision_->value(), RoundingMode::HalfEven};
+    // **不**把表达式 trim 掉再交给内核：内核报的错误位置是相对**它收到
+    // 的那个串**的字节下标，trim 会让位置与输入框里的字符错位。内核自己
+    // 会跳过空白，所以原样传进去位置就是准的。
+    const hpc::Context context{precision_->value(), hpc::RoundingMode::HalfEven};
+
+    hpc::BigDecimal result;
     try {
-        const BigDecimal result = hpc::evaluate(text.toStdString(), context);
-        const int base = base_->currentText().toInt();
-        const QString shown = base == 10
-            ? QString::fromStdString(result.toString())
-            : QString::fromStdString(toBaseString(result, base));
-        output_->setPlainText(shown);
-        appendHistory(text, shown);
-    } catch (const ExpressionError& error) {
-        output_->setPlainText(QString("错误：%1（位置 %2）")
-                                  .arg(QString::fromUtf8(error.what()))
-                                  .arg(error.position()));
+        result = hpc::evaluate(text.toStdString(), context);
+    } catch (const hpc::ExpressionError& error) {
+        showError(QString::fromUtf8(error.what()), error.position());
+        return;
     } catch (const std::exception& error) {
-        output_->setPlainText(QString("错误：%1").arg(QString::fromUtf8(error.what())));
+        showError(QString::fromUtf8(error.what()), -1);
+        return;
+    } catch (...) {
+        // 兜底：任何异常都**不能**逃进 Qt 的事件循环 —— 那会终止进程。
+        showError(QStringLiteral("求值失败：未知的异常"), -1);
+        return;
+    }
+
+    const QString decimal = QString::fromStdString(result.toString());
+    const int base = base_->currentData().toInt();
+
+    if (base == 10) {
+        output_->setPlainText(decimal);
+        setNote(QString());
+        appendHistory(text.trimmed(), decimal);
+        return;
+    }
+
+    try {
+        const std::string converted = hpc::toBaseString(result, base);
+        const QString shown = QString::fromStdString(converted);
+        output_->setPlainText(shown);
+
+        if (converted.find("...") != std::string::npos) {
+            // "..." 表示「展开**被截断了**」。必须说出来 —— 把截断值当成
+            // 精确值展示就是在骗用户。整数部分仍是精确的，一并说明。
+            const std::size_t dot = converted.find('.');
+            const QString integerPart =
+                dot == std::string::npos
+                    ? QString::fromStdString(converted)
+                    : QString::fromStdString(converted.substr(0, dot));
+            setNote(QStringLiteral("注意：末尾的 “...” 表示该进制下的小数展开被截断了，"
+                                   "不是精确值；整数部分 %1 是精确的。")
+                        .arg(integerPart));
+        } else {
+            setNote(QString());
+        }
+        appendHistory(text.trimmed(), shown);
+    } catch (const std::exception& error) {
+        // 转换失败不丢掉十进制结果 —— 那个值是对的。
+        output_->setPlainText(decimal);
+        setNote(QStringLiteral("进制转换失败：%1（下面显示的是十进制结果）")
+                    .arg(QString::fromUtf8(error.what())));
     }
 }
 
@@ -7231,16 +7507,50 @@ void MainWindow::appendHistory(const QString& expression, const QString& result)
     history_->insertItem(0, expression + " = " + result);
 }
 
+void MainWindow::showError(const QString& message, int position) {
+    QString text = QStringLiteral("错误：") + message;
+    if (position >= 0) {
+        text += QStringLiteral("（位置 %1）").arg(position);
+    }
+    output_->setPlainText(text);
+
+    if (position >= 0) {
+        setNote(QStringLiteral("位置 %1 是出错字符在表达式里的字节下标，"
+                               "已在输入框中选中该字符。").arg(position));
+        const QString source = expression_->text();
+        const int index = utf8OffsetToUtf16(source, position);
+        // 先给焦点再设选区：反过来时 setFocus() 可能把选区清掉。
+        expression_->setFocus();
+        if (index < source.size()) {
+            expression_->setSelection(index, 1);
+        } else {
+            // 位置指向串尾（缺失的字符本该出现的地方）—— 没有字符可选，
+            // 把光标放到末尾。
+            expression_->setCursorPosition(source.size());
+        }
+    } else {
+        setNote(QString());
+    }
+}
+
+void MainWindow::setNote(const QString& text) {
+    note_->setText(text);
+    note_->setVisible(!text.isEmpty());
+}
+
 }  // namespace ui
 }  // namespace hpc
 ```
 
-- [ ] **Step 4: 写 `src/ui/main.cpp`**
+- [x] **Step 4: 写 `src/ui/main.cpp`**
 
 ```cpp
-#include "ui/MainWindow.h"
-
+// Qt 桌面界面的入口点：只负责建 QApplication 与窗口。
+//
+// 应用的**逻辑**都在 src/ui/MainWindow.cpp 与 src/core 里。
 #include <QApplication>
+
+#include "ui/MainWindow.h"
 
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
@@ -7250,87 +7560,68 @@ int main(int argc, char** argv) {
 }
 ```
 
-- [ ] **Step 5: 写 `tests/gui_smoke.cpp`**
+- [x] **Step 5: 写 `tests/gui_smoke.cpp`**
 
-```cpp
-// 离屏渲染冒烟测试：无需显示器即可验证界面能构建、求值并绘制。
-#include <QApplication>
-#include <QLineEdit>
-#include <QListWidget>
-#include <QPixmap>
-#include <QPlainTextEdit>
-#include <QPushButton>
+见 `tests/gui_smoke.cpp`（29 项断言）。要点：
 
-#include <cstdio>
+- 按 `objectName` 定位控件，**不**用 `findChild<QLineEdit*>()` 找第一个 ——
+  `findChild` 按对象树顺序返回，控件一多就找错。
+- 结果**逐字**比较（`checkEqual`），不是「含有小数点」那种弱断言。
+- 期望值全部取自 `hpc_cli`（同一个内核），保证两个前端一致。
+- 覆盖：按钮路径、回车路径、精度生效、换进制、"..." 截断标记、
+  能有限表示时**不**带标记、错误消息 + 位置 + 选中出错字符、
+  超越函数精度上限报错、纯算术在 2000 位仍合法、fmod 语义。
+- 渲染出的图**要有内容**：全黑说明什么都没画上去（`hasContent` 检查）。
+- 每个可能抛异常的调用各自包在 try/catch 里 —— 本文件的 `main`
+  **不**捕获异常，未捕获的异常会直接 abort 掉测试二进制。
 
-#include "ui/MainWindow.h"
-
-int main(int argc, char** argv) {
-    QApplication app(argc, argv);
-
-    hpc::ui::MainWindow window;
-    window.resize(560, 480);
-    window.show();
-
-    const auto lineEdit = window.findChild<QLineEdit*>();
-    const auto output = window.findChild<QPlainTextEdit*>();
-    const auto history = window.findChild<QListWidget*>();
-    const auto buttons = window.findChildren<QPushButton*>();
-
-    if (lineEdit == nullptr || output == nullptr || history == nullptr || buttons.isEmpty()) {
-        std::fprintf(stderr, "gui_smoke: 找不到界面控件\n");
-        return 1;
-    }
-
-    lineEdit->setText("1/3 + 2*sqrt(9)");
-    buttons.first()->click();
-
-    const QString text = output->toPlainText();
-    if (!text.contains('.') || text.contains("错误")) {
-        std::fprintf(stderr, "gui_smoke: 求值结果异常：%s\n", text.toUtf8().constData());
-        return 1;
-    }
-    if (history->count() != 1) {
-        std::fprintf(stderr, "gui_smoke: 历史记录条数异常：%d\n", history->count());
-        return 1;
-    }
-
-    // 离屏渲染一张截图，确认能绘制。
-    const QPixmap pixmap = window.grab();
-    if (pixmap.isNull()) {
-        std::fprintf(stderr, "gui_smoke: 渲染失败\n");
-        return 1;
-    }
-    if (argc > 1) {
-        pixmap.save(QString::fromLocal8Bit(argv[1]) + "/hpc_gui.png");
-    }
-
-    std::printf("gui_smoke: 求值结果 %s，渲染正常\n", text.toUtf8().constData());
-    return 0;
-}
-```
-
-- [ ] **Step 6: 构建并运行 GUI 冒烟测试**
+- [x] **Step 6: 构建并运行 GUI 冒烟测试**
 
 ```bash
-./scripts/msvc-env.bat cmake -S . -B build -G Ninja -DBUILD_GUI=ON -DBUILD_TESTS=ON
-./scripts/msvc-env.bat cmake --build build
-./scripts/run-ctest.bat
+./scripts/msvc-env.bat cmake -S . -B build-gui -G Ninja -DBUILD_GUI=ON -DBUILD_TESTS=ON
+./scripts/msvc-env.bat cmake --build build-gui
+./scripts/msvc-env.bat ctest --test-dir build-gui --output-on-failure -C Release
 ```
 
-预期：2 个测试全绿（`hpc_tests` 与 `gui_smoke`）。
+预期：3 个测试全绿（`hpc_tests`、`hpc_api_tests`、`gui_smoke`）。
 
 **注意**：`msvc-env.bat` 中的 `CMAKE_PREFIX_PATH` 已指向 `C:\Qt\6.6.2\msvc2019_64`。
+**不要**用 PATH 上的 `qmake` —— 那是 Anaconda 的 Qt 5.15，版本不对。
 
-- [ ] **Step 7: 提交**
+> **GUI 目标在本机是 MSVC-only**：Qt 6.6.2 是 MSVC 构建，GCC 下没有可用的
+> Qt。GCC 的验证覆盖**默认（GUI 关）配置**。
+
+- [x] **Step 7: 提交**
 
 ```bash
-git add src/ui tests/gui_smoke.cpp CMakeLists.txt
+git add src/ui tests/gui_smoke.cpp CMakeLists.txt docs/superpowers/plans
 git commit -m "feat(ui): Qt 桌面界面与离屏冒烟测试"
 ```
 
----
+#### Task 9 的实测结论
 
+- **默认构建完全不含 Qt**：用 `-DCMAKE_PREFIX_PATH=`（空）配置 `BUILD_GUI=OFF`
+  仍然配置成功、编译零警告、ctest 全绿 —— `find_package(Qt6)` 只在
+  `BUILD_GUI=ON` 时执行，默认构建的 `CMakeCache.txt` 里没有任何 `Qt6_DIR`。
+- **Qt 构建零警告**（MSVC `/W4 /permissive-`）。
+- **GCC 默认构建零警告**、ctest 全绿。
+- **冒烟测试的离屏 pixmap** 显示的是一个真实可用的窗口：表达式框、
+  精度选择框、进制下拉框、结果区、历史区、用法说明；点「计算」后结果区
+  显示 `6.333333333333333333333333333333`，历史区显示
+  `1/3 + 2*sqrt(9) = 6.333333333333333333333333333333`。
+- **真实原生窗口**（`PrintWindow` 抓取，带标题栏「高精度计算器」）也验证过：
+  用真实键盘事件（`WM_CHAR` / `WM_KEYDOWN`）输入表达式并回车，结果区
+  显示正确结果、历史区有记录；输入 `7/3` 时显示
+  `错误：多余的字符（位置 15）`，且输入框里那个出错字符**被选中高亮**。
+- **部署后的产物自包含**：不把 Qt 的 bin 目录放进 `PATH`，直接跑
+  `./gui_smoke.exe` 仍然全部通过（29/29）—— Qt 的 DLL 与平台插件就在
+  可执行文件旁边。
+- **截图存在仓库里**：`docs/screenshots/qt_native_success.png`（真实原生
+  窗口，成功路径）、`qt_native_window.png`（真实原生窗口，空状态）、
+  `qt_offscreen_pixmap.png`（离屏 pixmap）。
+- **构建脚本**：`scripts/build-gui.bat`（见下）一键构建 GUI 目标。
+
+---
 ### Task 10: CI、脚本与文档
 
 **Files:**

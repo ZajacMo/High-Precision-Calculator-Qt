@@ -135,3 +135,105 @@ if(BUILD_TESTS)
     target_link_libraries(expression_probe PRIVATE hpc_core)
     hpc_set_warnings(expression_probe)
 endif()
+
+# Qt 图形界面：**可选**目标。
+#
+# 整个架构的前提是「核心内核零第三方依赖」，所以 Qt 只能出现在这里 ——
+# 默认构建（BUILD_GUI=OFF）**不能**有任何 Qt 依赖，find_package(Qt6) 也
+# 不能出现在默认配置里（否则没装 Qt 的机器连配置都过不去）。
+#
+# 这里用 find_package(Qt6 ...)，但它只在 BUILD_GUI=ON 时才被执行。
+if(BUILD_GUI)
+    set(CMAKE_AUTOMOC ON)
+    find_package(Qt6 REQUIRED COMPONENTS Widgets)
+
+    add_executable(hpc_gui
+        src/ui/main.cpp
+        src/ui/MainWindow.cpp
+        src/ui/MainWindow.h
+    )
+    target_link_libraries(hpc_gui PRIVATE hpc_core Qt6::Widgets)
+    hpc_set_warnings(hpc_gui)
+    if(WIN32)
+        # GUI 程序不要弹出控制台窗口。
+        set_target_properties(hpc_gui PROPERTIES WIN32_EXECUTABLE TRUE)
+    endif()
+
+    # 把 Qt 的运行时（DLL + 平台插件）部署到可执行文件旁边。
+    #
+    # 为什么必须做：Qt6 是**动态链接**的，不部署的话 hpc_gui.exe 与
+    # gui_smoke.exe 都只有在 Qt 的 bin 目录恰好在 PATH 上时才跑得起来
+    # —— 直接双击 hpc_gui.exe 会弹「找不到 Qt6Core.dll」。
+    #
+    # windeployqt 由 Qt6CoreTools 提供（find_package(Qt6) 会顺带找到它）。
+    find_program(HPC_WINDEPLOYQT windeployqt)
+    if(HPC_WINDEPLOYQT)
+        # 两个可执行文件在**同一个目录**里（都是构建目录的根），所以它们
+        # 共享同一套 Qt 运行时 —— windeployqt 只需要跑**一次**。
+        #
+        # 而且**不能**给两个目标各挂一个 POST_BUILD：Ninja 会**并行**跑
+        # 两条命令，两个 windeployqt 同时往同一个 imageformats/ 目录里拷
+        # 文件 —— 实测会报「Cannot create ... qwebp.dll for output」
+        # 并让构建失败（间歇性，取决于调度）。
+        #
+        # 所以部署挂在一个**自定义目标**上，两个可执行文件都依赖它。
+        #
+        # 部署的**目标文件**写死成 $<TARGET_FILE_DIR:hpc_gui>/hpc_gui.exe，
+        # 而不是 $<TARGET_FILE:hpc_gui> —— 后者会把 hpc_gui 变成部署目标的
+        # 依赖，而 hpc_gui 又依赖部署目标，形成**依赖环**（CMake 直接报错）。
+        # 两者指向同一个文件（Ninja 单配置生成器下可执行文件就在目标目录里），
+        # 但前者没有依赖关系。
+        #
+        # 部署目标**依赖** hpc_gui（所以 hpc_gui.exe 先建好，部署才有东西
+        # 可部署），而 hpc_gui **不**依赖部署目标 —— 方向反了就是依赖环，
+        # CMake 会直接报「strongly connected component」。
+        #
+        # 部署命令里用 $<TARGET_FILE_DIR:hpc_gui>/hpc_gui.exe 而不是
+        # $<TARGET_FILE:hpc_gui>：两者指向同一个文件（Ninja 单配置生成器下
+        # 可执行文件就在目标目录里），但后者会**隐式**加一条
+        # 「部署目标依赖 hpc_gui」的边 —— 那条边本身没错，错的是它与
+        # add_dependencies 的方向组合起来会成环。写成显式的路径就没有
+        # 隐式边，方向完全由 add_dependencies 说了算。
+        add_custom_target(hpc_qt_deploy ALL
+            COMMAND "${HPC_WINDEPLOYQT}" --no-translations --no-system-d3d-compiler
+                    --no-opengl-sw --no-compiler-runtime
+                    --include-plugins qoffscreen
+                    "$<TARGET_FILE_DIR:hpc_gui>/hpc_gui.exe"
+            COMMENT "部署 Qt 运行时到构建目录")
+        add_dependencies(hpc_qt_deploy hpc_gui)
+    else()
+        message(WARNING
+            "找不到 windeployqt：hpc_gui.exe 需要 Qt 的 bin 目录在 PATH 上才能运行。")
+    endif()
+
+    if(BUILD_TESTS)
+        add_executable(gui_smoke
+            tests/gui_smoke.cpp
+            src/ui/MainWindow.cpp
+            src/ui/MainWindow.h
+        )
+        target_link_libraries(gui_smoke PRIVATE hpc_core Qt6::Widgets)
+        target_include_directories(gui_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        hpc_set_warnings(gui_smoke)
+        # 截图目录在构建时创建 —— 测试进程不该假设目录已经存在。
+        add_custom_command(TARGET gui_smoke POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "${CMAKE_CURRENT_BINARY_DIR}/screenshots")
+        if(HPC_WINDEPLOYQT)
+            # 同样部署：否则 ctest 启动 gui_smoke 时会因找不到 Qt6Core.dll
+            # 直接失败（退出码 127），而**不是**报出一个像样的测试失败。
+            #
+            # --include-plugins qoffscreen 是**必需**的：windeployqt 默认只
+            # 部署 qwindows 平台插件，而冒烟测试跑在 QT_QPA_PLATFORM=offscreen
+            # 下 —— 少了 qoffscreen.dll，测试会「Qt 平台插件加载失败」地退出。
+            #
+            # 部署由 hpc_qt_deploy 统一做（两个可执行文件共用同一套运行时），
+            # 这里只建立依赖关系。
+            add_dependencies(gui_smoke hpc_qt_deploy)
+        endif()
+        add_test(NAME gui_smoke
+                 COMMAND gui_smoke ${CMAKE_CURRENT_BINARY_DIR}/screenshots)
+        set_tests_properties(gui_smoke PROPERTIES
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    endif()
+endif()
