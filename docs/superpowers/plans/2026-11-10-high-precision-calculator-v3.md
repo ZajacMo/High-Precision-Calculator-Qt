@@ -5219,7 +5219,7 @@ brief 的代码是**从未运行过的初稿**。下表的每一行都由
 >    要自己实现「按小数位舍入」—— 精确放大 10^10 倍后用**精确的余数**
 >    判定舍入方向，避免双重舍入。
 
-- [ ] **Step 1: 写 `src/cli/main.cpp`**
+- [x] **Step 1: 写 `src/cli/main.cpp`**
 
 ```cpp
 // 命令行前端：与 Web 前端、Qt 界面共用 src/core 的同一套内核。
@@ -5707,7 +5707,7 @@ int main(int argc, char** argv) {
 }
 ```
 
-- [ ] **Step 2: 构建并手工验证**
+- [x] **Step 2: 构建并手工验证**
 
 ```bash
 ./scripts/build-core.bat
@@ -5759,7 +5759,7 @@ diff /tmp/new.txt /tmp/old.txt && echo "OJ 协议一致"
 >
 > legacy 在 `"* 0 0.0001"` 这类输入上会**崩溃**（SIGSEGV，legacy 缺陷 #5）。
 
-- [ ] **Step 3: 端到端测试脚本**
+- [x] **Step 3: 端到端测试脚本**
 
 ```bash
 python scripts/verify_cli.py ./build/hpc_cli.exe
@@ -5769,7 +5769,7 @@ python scripts/verify_cli_oj.py ./build/hpc_cli.exe /tmp/hpc_baseline/oj.exe
 `verify_cli.py` 覆盖三种模式与参数解析的边界（59 项断言）。
 `verify_cli_oj.py` 逐例与 legacy 对比、并与**正确算术**对比。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add src/cli/main.cpp scripts/verify_cli.py scripts/verify_cli_oj.py
