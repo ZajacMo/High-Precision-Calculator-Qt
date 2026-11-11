@@ -549,14 +549,20 @@ Blk blocksFromDecimal(std::string_view text) {
     return trimBlk(std::move(blocks));
 }
 
-// 把小端 base-10^9 块转成十进制字符串，scale 为小数位数。
-std::string decimalFromBlocks(const Blk& blocks, int scale) {
+// 把小端 base-10^9 块转成十进制字符串（不含小数点）。
+std::string blockDigitsToString(const Blk& blocks) {
     std::string digits = std::to_string(blocks.back());
     char buffer[16];
     for (std::size_t i = blocks.size() - 1; i-- > 0;) {
-        std::snprintf(buffer, sizeof buffer, "%09u", blocks[i]);
+        std::snprintf(buffer, sizeof buffer, "%09u", static_cast<unsigned>(blocks[i]));
         digits += buffer;
     }
+    return digits;
+}
+
+// 把小端 base-10^9 块转成十进制字符串，scale 为小数位数。
+std::string decimalFromBlocks(const Blk& blocks, int scale) {
+    std::string digits = blockDigitsToString(blocks);
     if (scale <= 0) return digits;
     if (static_cast<int>(digits.size()) <= scale) {
         digits.insert(0, static_cast<std::size_t>(scale) + 1 - digits.size(), '0');
