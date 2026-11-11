@@ -54,6 +54,7 @@ if(BUILD_TESTS)
     enable_testing()
     add_executable(hpc_tests
         tests/tst_main.cpp
+        tests/tst_framework.cpp
         tests/tst_bigdecimal.cpp
         tests/tst_transcendental.cpp
         tests/tst_format.cpp
