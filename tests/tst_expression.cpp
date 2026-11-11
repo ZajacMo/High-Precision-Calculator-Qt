@@ -1,5 +1,6 @@
 #include "test_framework.h"
 
+#include <exception>
 #include <string>
 
 #include "core/Expression.h"
@@ -10,6 +11,10 @@ using hpc::ExpressionError;
 using hpc::RoundingMode;
 
 namespace {
+
+// volatile 读取不会被常量折叠，从而保证断言在运行时求值，
+// 否则 MSVC /W4 会因常量条件表达式报 C4127。
+volatile int kOne = 1;
 
 // 求值并返回结果。
 //
@@ -278,11 +283,26 @@ TEST(expression, divisionByZero) {
     CHECK(evalOrError("1/0").rfind("!", 0) == 0);
     CHECK(evalOrError("1/(2-2)").rfind("!", 0) == 0);
     CHECK(evalOrError("1%0").rfind("!", 0) == 0);
-    // 抛的是 ExpressionError（不是内核的 domain_error）。
+    // 抛的必须是 **ExpressionError**，而不是内核的 domain_error。
+    //
+    // 这里不能只用 tryEval —— 它只捕获 ExpressionError，内核的
+    // domain_error 若漏出来会**一路传播出去**，而测试框架的 main
+    // **不捕获**异常：整个测试二进制直接终止，后面几十个用例一个都
+    // 跑不到，失败原因也被淹没。所以要显式地 catch 住 std::exception，
+    // 断言「漏出来的不是别的东西」。
     int position = -1;
     std::string message;
     CHECK(!tryEval("1/0", position, message));
-    CHECK(!tryEval("1/0", position, message));
+
+    bool threwExpressionError = false;
+    try {
+        hpc::evaluate("1/0", Context{20, RoundingMode::HalfEven});
+    } catch (const ExpressionError&) {
+        threwExpressionError = true;
+    } catch (const std::exception&) {
+        threwExpressionError = false;
+    }
+    CHECK(threwExpressionError);
 }
 
 TEST(expression, domainErrorsAreExpressionErrors) {
@@ -307,6 +327,32 @@ TEST(expression, domainErrorsAreExpressionErrors) {
         caughtAsExpressionError = false;
     }
     CHECK(caughtAsExpressionError);
+}
+
+// 零底数的次幂：三种情形必须分清。
+//
+// 内核的契约（BigDecimal.h 的「定义域之外抛 std::domain_error」）：
+//   - 零的**负**数次幂 → 定义域错误
+//   - 零的**零**次幂   → 定义域错误（decimal 规范里也是非法运算）
+//   - 零的**正**数次幂 → 0（**不是**错误！与 Python 的 decimal 一致）
+//
+// 最后一条最容易搞错：非整数指数走的是 exp(b·ln a) 那条超越函数的路，
+// 而 ln(0) 是未定义的 —— 但 0^正数仍然有定义 0，内核为此专门在
+// 「负底数未定义」之前先判零底数。
+TEST(expression, zeroBasePower) {
+    // 整数指数。
+    CHECK_EQ(eval("pow(0,2)").toString(), std::string("0"));
+    CHECK_EQ(eval("pow(0,10)").toString(), std::string("0"));
+    // 非整数指数：**有定义**，结果是 0。
+    CHECK_EQ(eval("pow(0,0.5)").toString(), std::string("0"));
+    CHECK_EQ(eval("pow(0,1.5)").toString(), std::string("0"));
+    CHECK_EQ(eval("pow(0,2.5)").toString(), std::string("0"));
+    // 零次幂与负数次幂：定义域错误。
+    CHECK(evalOrError("pow(0,0)").rfind("!", 0) == 0);
+    CHECK(evalOrError("pow(0,-1)").rfind("!", 0) == 0);
+    CHECK(evalOrError("pow(0,-0.5)").rfind("!", 0) == 0);
+    // 负底数的非整数次幂仍然是错误（这条不能被零底数的规则带跑）。
+    CHECK(evalOrError("pow(-2,0.5)").rfind("!", 0) == 0);
 }
 
 TEST(expression, unknownFunction) {
@@ -548,4 +594,23 @@ TEST(expression, structuralSafety) {
     // 除数为零的两个变体。
     CHECK(evalOrError("1/0.0").rfind("!", 0) == 0);
     CHECK(evalOrError("1/(0*5)").rfind("!", 0) == 0);
+}
+
+// --- 负向自测 ---
+//
+// 验证断言失败**确实会被计数**。
+//
+// 若 reportFailure 退化成空操作，上面的用例照样全绿，而这套测试的
+// 全部意义就在于「失败能被检出」。failureCount() 返回引用，可存可
+// 复原；复原后 main 的 before/after 差值为 0，全局计数仍是 0，
+// 本用例本身判为 ok（main 会打印一行 FAIL，但那是**故意**的）。
+//
+// 这个自测放在**每个**测试文件里，而不是集中一处：每个文件的断言
+// 都必须自己证明「失败能被检出」，否则某个文件里的断言全部失效
+// （比如 CHECK 宏被误改）时，那个文件会**静默地**全绿。
+TEST(expression, frameworkDetectsFailures) {
+    const int before = ::testing::failureCount();
+    CHECK(kOne == 2);                                     // 故意失败
+    CHECK(::testing::failureCount() == before + 1);
+    ::testing::failureCount() = before;                   // 复原，避免污染全局计数
 }
