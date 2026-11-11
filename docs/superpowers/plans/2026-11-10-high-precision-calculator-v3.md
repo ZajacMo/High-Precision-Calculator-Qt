@@ -5903,14 +5903,28 @@ git commit -m "feat(cli): 交互/单次/OJ 三模式命令行前端"
   - `POST /api/convert` body `{"value": "...", "from": 16, "to": 10}`
   - `POST /api/bitwise` body `{"op": "&", "lhs": "...", "rhs": "..."}`
 
-> **精度上限**：`precision` 字段夹到 `kMaxTranscendentalPrecision`（1000）。
-> `/api/evaluate` 的表达式里可以用超越函数（sqrt/exp/ln/log10/pow），
-> 那些函数的内核上限就是 1000 —— 放行更高的值只会让用户拿到一个
-> 「precision 超出超越函数的上限」的 400，而不是一个算得出来的结果。
-> Web UI 的 `<input type="number">` 的 `max` 同样取 1000，
-> 两个界面上限必须与内核一致，否则 UI 会提供用不了的取值。
+> **精度上限（Task 8 实测后确定）**：**不夹到 1000**。两个端点的
+> `precision` 上限都是 `kMaxPrecision`（100000），越界时**明确报 400**，
+> 而不是静默改写用户要的精度。
+>
+> 理由：超越函数的上限（`kMaxTranscendentalPrecision` = 1000）是**算力**
+> 上限，不是**接口契约**上限 —— 它**只在真的用到超越函数时**才生效。
+> 内核的 `evaluate` 只在调用 sqrt/exp/ln/log10（或 pow 的非整数指数分支）
+> 时才检查 1000；纯加减乘除的表达式在 100000 位以内都合法。
+>
+> 所以把 `precision` 一律夹到 1000 会让「纯算术表达式要 5000 位」这个
+> **合法**请求被悄悄降成 1000 位 —— 静默降精度等于给出一个用户没要求的
+> 答案，而响应里没有任何地方能看出这个差别。
+>
+> 越界的处理：超出 100000 → 本层报 400（含上限值）；在 1000..100000 之间
+> 但用到了超越函数 → **内核抛异常**，本层翻译成 400（消息里带上是哪个
+> 函数越的界与上限值）。两条路径都是明确的拒绝，不是静默降级。
+>
+> Web UI 的 `<input type="number">` 的 `max` 取 100000 —— 与接口契约一致。
+> 界面上限若比内核严格，UI 会提供用不了的取值；比内核宽松，用户会拿到
+> 一条 400（但那条 400 会说清楚为什么）。
 
-- [ ] **Step 1: 复制 Json 与 HttpServer 到 `src/core/`**
+- [x] **Step 1: 复制 Json 与 HttpServer 到 `src/core/`**
 
 ```bash
 S="/f/Projects/01_courses/cpp/VS_C++Project/Comprehensive-Calculation-Tool/src/core"
@@ -5923,11 +5937,37 @@ cp "$S/Json.h" "$S/Json.cpp" "$S/HttpServer.h" "$S/HttpServer.cpp" src/core/
 > `https://github.com/ZajacMo/Comprehensive-Calculation-Tool` 的 main 分支为准。
 > 本任务开始前应重新核对下文列出的 API 签名是否仍然成立。
 >
-> **服务端生命周期**（据兄弟项目 2026-11-10 反馈）：`stop()` 会把监听套接字置为
-> 已关闭状态，`m_socketClosed` 在 `listen()` 中重置，因此**同一个 `Server` 对象
-> 可以 start → stop → start**；但每次 `start()` 之间不能复用已关闭的句柄。
-> `stop()` 内部会 join 线程，正常路径下无残留。本项目的端到端测试若要反复启停，
-> 每次 `start()` 前确认没有残留线程即可。
+> **服务端生命周期（Task 8 实测后修正）**：兄弟项目的 `stop()` 用
+> `shutdown(listener, SD_BOTH)` 唤醒阻塞在 `accept()` 上的 `serve()` 线程 ——
+> 但 **`shutdown()` 对「监听」套接字上的 `accept()` 无效**，那是挂死而不是
+> 唤醒。实测（探针程序）：
+>
+> ```
+> testing shutdown...      <- 永久挂死（timeout 30 s 被杀）
+> testing closesocket...  -> accept 用了 317 ms <- 被唤醒了
+> ```
+>
+> 具体表现：起服务 → 等 2 秒（让 `serve()` 真的阻塞到 `accept()` 里）
+> → `stop()` → **进程永远不退出**，`join()` 永不返回。
+>
+> 兄弟项目的写法之所以「看起来能用」，是因为它在「`serve()` 线程还没跑到
+> `accept()`」时就调 `stop()` —— 那时 `m_running` 已经是 false，
+> `serve()` 的 while 条件直接不成立，线程自然返回。**这是个时序巧合**，
+> 不是正确的实现。
+>
+> 本项目的修法：`serve()` 改成用**带超时（100 ms）的 poll / WSAPoll**
+> 等连接，而不是直接阻塞在 `accept()` 里。这样 `stop()` 只需要把
+> `m_running` 置 false，`serve()` 最多等一个 poll 周期就会自己退出，
+> 句柄的关闭仍只由 `serve()` 退出时做一次 —— 没有「另一个线程关掉一个
+> 正在被 `accept()` 使用的句柄」的**句柄复用**竞态。
+>
+> 实测：修复后 `stop()` 约 46 ms 返回，Ctrl+C 路径打印「服务已停止。」
+> 并以退出码 0 结束。回归用例见 `tests/tst_api.cpp` 的
+> `stopReturnsWhenServeThreadIsWaitingForConnections`。
+>
+> **同一个 `Server` 对象可以 start → stop → start**（`m_socketClosed`
+> 在 `listen()` 中重置）；但每次 `start()` 之间不能复用已关闭的句柄。
+> `stop()` 内部会 join 线程，正常路径下无残留。
 
 改命名空间：`namespace calc` → `namespace hpc`，`namespace calc::json` → `namespace hpc::json`，
 `namespace calc::http` → `namespace hpc::http`。同时把 `Json.h` 里的
@@ -5967,7 +6007,7 @@ static Response html(const std::string& body, int status = 200);
 static Response text(const std::string& body, int status = 200);
 ```
 
-- [ ] **Step 2: 在 `CMakeLists.txt` 加入 server 与 api 目标**
+- [x] **Step 2: 在 `CMakeLists.txt` 加入 server 与 api 目标**
 
 把 `hpc_core` 的源文件列表改为：
 
@@ -5991,19 +6031,22 @@ if(BUILD_SERVER)
         src/api/ApiRoutes.h
     )
     target_link_libraries(hpc_server PRIVATE hpc_core)
+    hpc_set_warnings(hpc_server)
+
+    # Winsock：Windows 上 socket 相关符号在 ws2_32.lib 里。
     if(WIN32)
         target_link_libraries(hpc_server PRIVATE ws2_32)
     endif()
 
+    # 把 Web 前端资源复制到可执行文件同级目录，让 server 启动后能找到它们。
     add_custom_target(web_assets ALL
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_CURRENT_SOURCE_DIR}/web" "$<TARGET_FILE_DIR:hpc_server>/web"
         COMMENT "同步 Web 前端资源到构建目录")
     add_dependencies(hpc_server web_assets)
-endif()
-```
+endif()```
 
-- [ ] **Step 3: 写 `src/api/ApiRoutes.h`**
+- [x] **Step 3: 写 `src/api/ApiRoutes.h`**
 
 ```cpp
 // REST API 层：把核心的运算能力映射为 JSON 接口。
@@ -6024,7 +6067,7 @@ void registerApiRoutes(Server& server, const std::string& webRoot);
 }  // namespace hpc
 ```
 
-- [ ] **Step 4: 写 `src/api/ApiRoutes.cpp`**
+- [x] **Step 4: 写 `src/api/ApiRoutes.cpp`**
 
 **已核实的兄弟项目 API（不要自行猜测签名）：** 见 Step 1 末尾的「已核实的 API」清单
 （`Json::parse` 是返回 `bool` 的自由函数；`Value::find` 返回指针；`HttpServer::route`
@@ -6039,12 +6082,16 @@ POST 请求体已由 `HttpServer` 按 `Content-Length` 读入 `request.body`。
 ```cpp
 #include "api/ApiRoutes.h"
 
+#include <algorithm>
+#include <cmath>
 #include <exception>
 #include <string>
+#include <vector>
 
 #include "core/BigDecimal.h"
 #include "core/Expression.h"
 #include "core/Format.h"
+#include "core/HttpServer.h"
 #include "core/Json.h"
 #include "core/Rounding.h"
 
@@ -6062,6 +6109,10 @@ Response ok(Object payload) {
 }
 
 // 构造 {"ok": false, "error": "..."} 形式的失败响应。
+//
+// 错误消息是**中文**（内核的异常消息是中文，翻译成英文反而多一层失真）。
+// 因此响应体不是纯 ASCII —— 必须靠 Content-Type 里的 charset=utf-8
+// 说明编码，浏览器与测试脚本都要按 UTF-8 解码。
 Response fail(const std::string& message, int status = 400) {
     Object payload;
     payload["ok"] = Value(false);
@@ -6071,6 +6122,12 @@ Response fail(const std::string& message, int status = 400) {
 
 // 解析请求体为 JSON 对象。失败时返回 false 并填写 error。
 bool parseBody(const Request& request, Object& out, std::string& error) {
+    // 空请求体单独给一条消息：json::parse 的报错是「JSON 内容意外结束」，
+    // 对「忘了写 body」这件事不够直白。
+    if (request.body.find_first_not_of(" \t\r\n") == std::string::npos) {
+        error = "请求体为空";
+        return false;
+    }
     Value parsed;
     if (!json::parse(request.body, parsed, error)) return false;
     if (!parsed.isObject()) {
@@ -6081,29 +6138,131 @@ bool parseBody(const Request& request, Object& out, std::string& error) {
     return true;
 }
 
-// 从 JSON 对象取出字符串字段，缺失或类型不符时返回 fallback。
-std::string stringField(const Object& body, const std::string& key,
-                        const std::string& fallback = std::string()) {
-    const auto it = body.find(key);
-    if (it == body.end() || !it->second.isString()) return fallback;
-    return it->second.asString(fallback);
+// 拒绝未知的字段。
+//
+// 打错字（"presicion"）与多传参数是最容易犯、也最难查的两类错误 ——
+// 静默忽略它们会让请求「看起来成功」但结果不是用户想要的。
+// 所以本层采用**严格**契约：只接受下面列出的字段，多一个就报 400。
+bool rejectUnknownFields(const Object& body, const std::vector<std::string>& allowed,
+                          std::string& error) {
+    for (const auto& member : body) {
+        if (std::find(allowed.begin(), allowed.end(), member.first) == allowed.end()) {
+            error = "未知字段 '" + member.first + "'";
+            return false;
+        }
+    }
+    return true;
 }
 
-// 取有效数字位数，缺省 30，越界回落到 30。
+// 取必填的字符串字段。缺失或类型不符时返回 false 并填写 error。
 //
-// 上限取 kMaxTranscendentalPrecision（1000）而不是 kMaxPrecision（100000）：
-// /api/evaluate 的表达式里可以出现 sqrt / exp / ln / log10 / pow，
-// 那些函数的工作精度是平方级的 —— p=1600 时 pow(2, 0.5) 要跑 151 s，
-// p=99990 更是永远算不完。内核对它们统一抛 std::invalid_argument。
+// 「缺失」与「类型不符」给出**不同**的消息：把 `"expression": 123`
+// 报成「缺少 expression 字段」会把用户引向错误的排查方向。
+bool requireString(const Object& body, const std::string& key, std::string& out,
+                   std::string& error) {
+    const auto it = body.find(key);
+    if (it == body.end()) {
+        error = "缺少字段 '" + key + "'";
+        return false;
+    }
+    if (!it->second.isString()) {
+        error = "字段 '" + key + "' 必须是字符串";
+        return false;
+    }
+    out = it->second.asString();
+    return true;
+}
+
+// 把一个 JSON 数字读成 long long。失败时返回 false 并填写 error。
 //
-// 这里提前夹到 1000，是为了让**请求本身**带着一个可用的精度，
-// 而不是让用户拿到一个「precision 超出超越函数的上限」的 400。
-// 只做加减乘除的表达式其实能到 100000 位，那条路走 /api/arithmetic。
-int precisionField(const Object& body) {
+// **范围检查必须在转换之前**：把 1e300 这样的值直接
+// static_cast<long long> 是**未定义行为**（超出 int64 的可表示范围）——
+// MSVC 与 GCC 在这里的实际结果并不一致（有的实现返回 INT64_MIN，
+// 有的返回饱和值），同一个请求在不同编译器上会得到不同的答案。
+//
+// 所以先用 double 判范围与整数性，确认落在 int64 的安全区间内，
+// 再做转换。
+bool readLongLong(const Value& value, const std::string& key, long long& out,
+                  std::string& error) {
+    if (!value.isNumber()) {
+        error = "字段 '" + key + "' 必须是整数";
+        return false;
+    }
+    const double raw = value.asNumber();
+    // 9.2e18 < INT64_MAX（约 9.223e18），所以这个区间内的 double 转
+    // long long 是安全的。
+    if (!std::isfinite(raw) || raw < -9.2e18 || raw > 9.2e18 ||
+        raw != std::trunc(raw)) {
+        error = "字段 '" + key + "' 必须是整数";
+        return false;
+    }
+    out = static_cast<long long>(raw);
+    return true;
+}
+
+// 取必填的整数字段。缺失、类型不符、不是整数时返回 false 并填写 error。
+bool requireInteger(const Object& body, const std::string& key, int& out,
+                    std::string& error) {
+    const auto it = body.find(key);
+    if (it == body.end()) {
+        error = "缺少字段 '" + key + "'";
+        return false;
+    }
+    long long value = 0;
+    if (!readLongLong(it->second, key, value, error)) return false;
+    if (value < -2147483648LL || value > 2147483647LL) {
+        error = "字段 '" + key + "' 超出范围";
+        return false;
+    }
+    out = static_cast<int>(value);
+    return true;
+}
+
+// 取有效数字位数（significant digits）。
+//
+// **字段缺失**时用缺省值 30；**字段存在但非法**时**报错**，绝不静默改写
+// 用户要的精度 —— 把 5000 悄悄换成 30 等于给出一个他没要求的答案，
+// 而响应里没有任何地方能看出这个差别。
+//
+// 上限取 kMaxPrecision（100000），两个端点都一样。原因是这个上限约束的
+// 是**上下文精度**本身（合法的取值范围），而不是某一类运算的代价：
+//
+//   - /api/arithmetic 只做加减乘除，除法是唯一用到精度的运算，
+//     p=100000 时能算完（要几十秒，但能算完）。
+//   - /api/evaluate 可以含超越函数，而超越函数另有一个上限
+//     （kMaxTranscendentalPrecision = 1000）。那个上限**只在真的用到
+//     超越函数时**才生效 —— 内核在调用函数时才检查它，纯加减乘除的
+//     表达式在 100000 位以内都合法。
+//
+// 所以这里不能夹到 1000：那会把「纯算术表达式要 5000 位」这个合法请求
+// 悄悄降成 1000 位。超越函数越界的情况交给内核抛异常，由上层翻译成
+// 一条清楚的 400（消息里会带上是哪个函数越的界）。
+int precisionField(const Object& body, std::string& error) {
     const auto it = body.find("precision");
-    if (it == body.end() || !it->second.isNumber()) return 30;
-    const int precision = static_cast<int>(it->second.asNumber(30));
-    return precision > 0 && precision <= hpc::kMaxTranscendentalPrecision ? precision : 30;
+    if (it == body.end()) return 30;
+    long long precision = 0;
+    if (!readLongLong(it->second, "precision", precision, error)) return 30;
+    if (precision <= 0) {
+        error = "字段 'precision' 必须是正整数";
+        return 30;
+    }
+    if (precision > kMaxPrecision) {
+        error = "字段 'precision' 超出上限 " + std::to_string(kMaxPrecision);
+        return 30;
+    }
+    return static_cast<int>(precision);
+}
+
+// 把内核异常翻译成一句对用户有意义的话。
+//
+// 内核的异常消息是中文，直接透出即可 —— 但要**标明是哪一类问题**，
+// 因为「Bitwise: 只支持整数」这句话本身不告诉用户该怎么改。
+std::string describe(const std::domain_error& error) {
+    return "参数超出定义域：" + std::string(error.what());
+}
+
+std::string describe(const std::invalid_argument& error) {
+    return "参数非法：" + std::string(error.what());
 }
 
 Response handleHealth(const Request&) {
@@ -6118,15 +6277,21 @@ Response handleEvaluate(const Request& request) {
     Object body;
     std::string error;
     if (!parseBody(request, body, error)) return fail(error);
+    if (!rejectUnknownFields(body, {"expression", "precision"}, error)) return fail(error);
 
-    const std::string expression = stringField(body, "expression");
-    if (expression.empty()) return fail("缺少 expression 字段");
+    std::string expression;
+    if (!requireString(body, "expression", expression, error)) return fail(error);
+    if (expression.empty()) return fail("字段 'expression' 不能为空");
 
-    const Context context{precisionField(body), RoundingMode::HalfEven};
+    const int precision = precisionField(body, error);
+    if (!error.empty()) return fail(error);
+
+    const Context context{precision, RoundingMode::HalfEven};
     try {
         const BigDecimal result = evaluate(expression, context);
         Object payload;
         payload["result"] = Value(result.toString());
+        payload["precision"] = Value(precision);
         return ok(payload);
     } catch (const ExpressionError& error) {
         return fail(std::string(error.what()) + "（位置 " + std::to_string(error.position()) + "）");
@@ -6139,31 +6304,44 @@ Response handleArithmetic(const Request& request) {
     Object body;
     std::string error;
     if (!parseBody(request, body, error)) return fail(error);
+    if (!rejectUnknownFields(body, {"op", "lhs", "rhs", "precision"}, error)) return fail(error);
 
-    const std::string op = stringField(body, "op");
-    const std::string leftText = stringField(body, "lhs");
-    const std::string rightText = stringField(body, "rhs");
-    if (op.empty() || leftText.empty() || rightText.empty()) {
-        return fail("缺少 op / lhs / rhs 字段");
+    std::string op;
+    std::string leftText;
+    std::string rightText;
+    if (!requireString(body, "op", op, error)) return fail(error);
+    if (!requireString(body, "lhs", leftText, error)) return fail(error);
+    if (!requireString(body, "rhs", rightText, error)) return fail(error);
+    if (op != "+" && op != "-" && op != "*" && op != "/") {
+        return fail("不支持的运算符 '" + op + "'，只支持 + - * /");
     }
 
-    const Context context{precisionField(body), RoundingMode::HalfEven};
+    const int precision = precisionField(body, error);
+    if (!error.empty()) return fail(error);
+
+    const Context context{precision, RoundingMode::HalfEven};
     try {
         const BigDecimal left = BigDecimal::fromString(leftText);
         const BigDecimal right = BigDecimal::fromString(rightText);
         BigDecimal result;
-        if (op == "+") result = left + right;
-        else if (op == "-") result = left - right;
-        else if (op == "*") result = left * right;
-        else if (op == "/") {
+        if (op == "+") {
+            result = left + right;
+        } else if (op == "-") {
+            result = left - right;
+        } else if (op == "*") {
+            result = left * right;
+        } else {
             if (right.isZero()) return fail("除数为零");
             result = BigDecimal::divide(left, right, context);
-        } else {
-            return fail("不支持的运算符");
         }
         Object payload;
         payload["result"] = Value(result.toString());
+        payload["precision"] = Value(precision);
         return ok(payload);
+    } catch (const std::invalid_argument& error) {
+        return fail(describe(error));
+    } catch (const std::domain_error& error) {
+        return fail(describe(error));
     } catch (const std::exception& error) {
         return fail(error.what());
     }
@@ -6173,23 +6351,61 @@ Response handleConvert(const Request& request) {
     Object body;
     std::string error;
     if (!parseBody(request, body, error)) return fail(error);
+    if (!rejectUnknownFields(body, {"value", "from", "to"}, error)) return fail(error);
 
-    const std::string value = stringField(body, "value");
-    const auto fromIt = body.find("from");
-    const auto toIt = body.find("to");
-    if (value.empty() || fromIt == body.end() || toIt == body.end()) {
-        return fail("缺少 value / from / to 字段");
+    std::string value;
+    if (!requireString(body, "value", value, error)) return fail(error);
+    int from = 0;
+    int to = 0;
+    if (!requireInteger(body, "from", from, error)) return fail(error);
+    if (!requireInteger(body, "to", to, error)) return fail(error);
+
+    if (from < 2 || from > 36) {
+        return fail("字段 'from' 超出范围 2..36");
     }
-    const int from = static_cast<int>(fromIt->second.asNumber(10));
-    const int to = static_cast<int>(toIt->second.asNumber(10));
+    if (to < 2 || to > 36) {
+        return fail("字段 'to' 超出范围 2..36");
+    }
 
     try {
-        const BigDecimal parsed = from == 10
-            ? BigDecimal::fromString(value)
-            : fromBaseString(value, from);
+        // 源进制为 10 时按十进制解析（允许小数、科学计数法）；
+        // 其余进制走 fromBaseString —— 它**只接受整数**，因为任意进制
+        // 的小数在十进制内核里未必能精确表示（1/3 在三进制下无法有限
+        // 表示），接受它等于引入无声的近似。
+        BigDecimal parsed;
+        if (from == 10) {
+            parsed = BigDecimal::fromString(value);
+        } else {
+            if (value.find('.') != std::string::npos) {
+                return fail("源进制 " + std::to_string(from) +
+                            " 只接受整数，不接受小数点（十进制的源值可以带小数）");
+            }
+            parsed = fromBaseString(value, from);
+        }
+
+        // toBaseString 把整数部分**精确**转换，小数部分按目标进制逐位
+        // 提取；该进制下无法有限表示时末尾带 "..." 标记截断。
+        //
+        // 那个标记必须**如实报告** —— 把它当成一个普通的数字字符串返回，
+        // 等于让用户以为那是精确值。所以响应里同时给出 truncated 标志
+        // 与精确的整数部分。
+        const std::string result = toBaseString(parsed, to);
+        const bool truncated = result.find("...") != std::string::npos;
+        const std::size_t dot = result.find('.');
+        const std::string integerPart = (dot == std::string::npos) ? result : result.substr(0, dot);
+
         Object payload;
-        payload["result"] = Value(toBaseString(parsed, to));
+        payload["result"] = Value(result);
+        payload["truncated"] = Value(truncated);
+        payload["exact"] = Value(!truncated);
+        payload["integerPart"] = Value(integerPart);
+        payload["from"] = Value(from);
+        payload["to"] = Value(to);
         return ok(payload);
+    } catch (const std::invalid_argument& error) {
+        return fail(describe(error));
+    } catch (const std::domain_error& error) {
+        return fail(describe(error));
     } catch (const std::exception& error) {
         return fail(error.what());
     }
@@ -6199,25 +6415,41 @@ Response handleBitwise(const Request& request) {
     Object body;
     std::string error;
     if (!parseBody(request, body, error)) return fail(error);
+    if (!rejectUnknownFields(body, {"op", "lhs", "rhs"}, error)) return fail(error);
 
-    const std::string op = stringField(body, "op");
-    const std::string leftText = stringField(body, "lhs");
-    const std::string rightText = stringField(body, "rhs");
-    if (op.empty() || leftText.empty() || rightText.empty()) {
-        return fail("缺少 op / lhs / rhs 字段");
+    std::string op;
+    std::string leftText;
+    std::string rightText;
+    if (!requireString(body, "op", op, error)) return fail(error);
+    if (!requireString(body, "lhs", leftText, error)) return fail(error);
+    if (!requireString(body, "rhs", rightText, error)) return fail(error);
+
+    BitOp operation;
+    if (op == "&") {
+        operation = BitOp::And;
+    } else if (op == "|") {
+        operation = BitOp::Or;
+    } else if (op == "^") {
+        operation = BitOp::Xor;
+    } else {
+        return fail("不支持的位运算符 '" + op + "'，只支持 & | ^");
     }
 
     try {
         const BigDecimal left = BigDecimal::fromString(leftText);
         const BigDecimal right = BigDecimal::fromString(rightText);
-        BitOp operation;
-        if (op == "&") operation = BitOp::And;
-        else if (op == "|") operation = BitOp::Or;
-        else if (op == "^") operation = BitOp::Xor;
-        else return fail("不支持的位运算符");
+        // 位运算只对整数有意义：内核抛 std::domain_error。
+        //
+        // 负操作数按**无限位**二进制补码处理（与 Python 的 int 运算一致），
+        // 不是 C++ 的定长补码。
+        const BigDecimal result = bitwise(left, right, operation);
         Object payload;
-        payload["result"] = Value(bitwise(left, right, operation).toString());
+        payload["result"] = Value(result.toString());
         return ok(payload);
+    } catch (const std::domain_error& error) {
+        return fail("位运算只支持整数操作数：" + std::string(error.what()));
+    } catch (const std::invalid_argument& error) {
+        return fail(describe(error));
     } catch (const std::exception& error) {
         return fail(error.what());
     }
@@ -6245,7 +6477,7 @@ void registerApiRoutes(Server& server, const std::string& webRoot) {
 与 `Handler = std::function<Response(const Request&)>` 匹配；
 `registerApiRoutes` 中的 `server.route(...)` 调用形式与上表一致。
 
-- [ ] **Step 5: 写 `src/server/main.cpp`**
+- [x] **Step 5: 写 `src/server/main.cpp`**
 
 **已核实的兄弟项目 API**：`Server` 有 `start(host, port)`（后台线程启动）、`running()`、
 `boundPort()`、`stop()`；**没有 `run()` 方法**。静态资源目录用 `serveStatic("/", webRoot)` 注册。
@@ -6253,24 +6485,115 @@ void registerApiRoutes(Server& server, const std::string& webRoot) {
 ```cpp
 // 内置 HTTP 服务：只监听回环地址，供本地使用。
 //
-// 用法：hpc_server [--host 127.0.0.1] [--port 8098] [--web-root <目录>] [--no-browser]
-#if defined(_MSC_VER)
+// 用法：hpc_server [--host 127.0.0.1] [--port 8098] [--web-root <目录>]
+//
+// 默认只监听回环地址，不会暴露到局域网。
+//
+// 该文件**不**自动打开浏览器：兄弟项目用 std::system 拉起浏览器，那条路径
+// 要把命令行拼成一条 shell 命令，而 host 来自用户输入。这里不做这件事 ——
+// 服务起来后把 URL 打印出来就够了。
+//
+// Ctrl+C 的处理：装一个控制台处理器，只翻转一个标志位，主循环看到它就退出，
+// 随后 Server 的析构函数调用 stop()，stop() 会 join 服务线程 —— 进程干净地
+// 结束，不留残留线程，也不依赖「被杀进程反正会死」这种运气。
+//
+// getenv 在 MSVC 下会触发弃用警告，这里显式关闭该检查。
+// 那个宏必须定义在包含任何头文件之前 —— 所以它在这里，而不是在
+// CMakeLists.txt 里（CMake 已经通过 hpc_set_warnings 定义过它，
+// 在这里重复定义会触发 C4005「宏被重定义」的警告）。
+#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <csignal>
+#include <unistd.h>
+#endif
+
 #include "api/ApiRoutes.h"
 #include "core/HttpServer.h"
+
+namespace {
+
+// Ctrl+C 被按下时置位。主循环每 200 ms 查一次。
+std::atomic<bool> g_stopRequested{false};
+
+#if defined(_WIN32)
+BOOL WINAPI consoleHandler(DWORD signalType) {
+    switch (signalType) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_LOGOFF_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            g_stopRequested.store(true);
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+#else
+void signalHandler(int) { g_stopRequested.store(true); }
+#endif
+
+// 安装 Ctrl+C 处理器。
+void installSignalHandler() {
+#if defined(_WIN32)
+    SetConsoleCtrlHandler(consoleHandler, TRUE);
+#else
+    std::signal(SIGINT, signalHandler);
+    std::signal(SIGTERM, signalHandler);
+#endif
+}
+
+// 取得当前可执行文件路径。失败时返回空字符串。
+std::string executablePath() {
+#if defined(_WIN32)
+    char buffer[MAX_PATH] = {0};
+    const DWORD length = GetModuleFileNameA(nullptr, buffer, MAX_PATH);
+    return std::string(buffer, length);
+#else
+    char buffer[4096] = {0};
+    const ssize_t length = readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    return std::string(buffer, static_cast<size_t>(length > 0 ? length : 0));
+#endif
+}
+
+// 定位前端资源目录。优先用命令行参数，其次用环境变量，最后用可执行文件所在目录。
+std::string resolveWebRoot(const std::string& explicitPath) {
+    if (!explicitPath.empty()) return explicitPath;
+
+    if (const char* fromEnv = std::getenv("HPC_WEB_ROOT")) {
+        if (*fromEnv != '\0') return fromEnv;
+    }
+
+    // 可执行文件同级的 web 目录。
+    const std::string exePath = executablePath();
+    const size_t slash = exePath.find_last_of("/\\");
+    if (slash != std::string::npos) {
+        const std::string candidate = exePath.substr(0, slash) + "/web";
+        std::ifstream probe(candidate + "/index.html");
+        if (probe) return candidate;
+    }
+    return "web";
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     std::string host = "127.0.0.1";
     int port = 8098;
-    std::string webRoot = "web";
+    std::string webRoot;
 
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
@@ -6284,14 +6607,33 @@ int main(int argc, char** argv) {
             std::cout << "用法: hpc_server [--host 127.0.0.1] [--port 8098] "
                          "[--web-root <目录>]\n";
             return 0;
+        } else {
+            std::cerr << "未知参数: " << argument << "\n";
+            std::cerr << "用法: hpc_server [--host 127.0.0.1] [--port 8098] "
+                         "[--web-root <目录>]\n";
+            return 2;
         }
     }
+
+    if (port <= 0 || port > 65535) {
+        std::cerr << "端口超出范围 1..65535\n";
+        return 2;
+    }
+
+    webRoot = resolveWebRoot(webRoot);
+
+    // 先装 Ctrl+C 处理器，再启动服务 ——
+    // 反过来的话，从 start() 到 installSignalHandler() 之间有一个窗口，
+    // 那个窗口里来的 Ctrl+C 会走系统默认处理（直接杀进程），
+    // 服务线程来不及收尾。
+    installSignalHandler();
 
     hpc::http::Server server;
     hpc::http::registerApiRoutes(server, webRoot);
 
     std::cout << "高精度计算器 · Web 服务\n";
     std::cout << "前端目录: " << webRoot << "\n";
+    std::cout << "正在启动服务..." << std::endl;
 
     if (!server.start(host, port)) {
         std::cerr << "启动失败：无法绑定 " << host << ":" << port << "\n"
@@ -6299,19 +6641,26 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const std::string url =
-        "http://" + host + ":" + std::to_string(server.boundPort()) + "/";
+    const std::string url = "http://" + host + ":" + std::to_string(server.boundPort()) + "/";
     std::cout << "服务已就绪: " << url << "\n";
     std::cout << "按 Ctrl+C 停止。" << std::endl;
 
-    while (server.running()) {
+    // 等待服务线程结束或收到停止信号。
+    //
+    // Server 的析构函数会调用 stop()，而 stop() 会 join 线程 ——
+    // 因此循环退出后不会有残留线程，进程可以干净地结束。
+    while (server.running() && !g_stopRequested.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
+
+    // 显式停一次：把监听套接字关掉、唤醒并 join 服务线程。
+    server.stop();
+    std::cout << "服务已停止。" << std::endl;
     return 0;
 }
 ```
 
-- [ ] **Step 6: 写 `web/index.html`**
+- [x] **Step 6: 写 `web/index.html`**
 
 ```html
 <!DOCTYPE html>
@@ -6331,25 +6680,46 @@ int main(int argc, char** argv) {
     <main class="content">
         <section class="panel">
             <label for="expr">表达式</label>
-            <input id="expr" type="text" value="1/3 + 2*sqrt(9)" autocomplete="off">
+            <input id="expr" type="text" value="1/3 + 2*sqrt(9)" autocomplete="off"
+                   spellcheck="false">
             <div class="controls">
-                <label>精度 <input id="precision" type="number" value="30" min="1" max="1000"></label>
+                <label>有效数字位数
+                    <input id="precision" type="number" value="30" min="1" max="100000">
+                </label>
                 <label>输出进制
                     <select id="base">
-                        <option value="10">10</option>
-                        <option value="2">2</option>
-                        <option value="8">8</option>
-                        <option value="16">16</option>
-                        <option value="36">36</option>
+                        <option value="10">10（十进制）</option>
+                        <option value="2">2（二进制）</option>
+                        <option value="8">8（八进制）</option>
+                        <option value="16">16（十六进制）</option>
+                        <option value="36">36（三十六进制）</option>
                     </select>
                 </label>
                 <button id="evaluate">计算</button>
             </div>
             <pre id="result" class="result"></pre>
+            <p id="note" class="note"></p>
         </section>
         <section class="panel">
             <h2>历史</h2>
             <ul id="history" class="history"></ul>
+        </section>
+        <section class="panel help">
+            <h2>用法</h2>
+            <ul>
+                <li>运算符：<code>+ - * / %</code>（<code>%</code> 是 fmod 语义，符号跟随被除数）。</li>
+                <li>函数：<code>sqrt</code>、<code>abs</code>、<code>pow</code>、<code>exp</code>、<code>ln</code>、<code>log10</code>。</li>
+                <li>数字：十进制小数、科学计数法（<code>1e20</code>）、以及
+                    <code>0x</code> / <code>0b</code> / <code>0o</code> 前缀的整数。</li>
+                <li>精度的上限是 100000 位；但表达式一旦用到超越函数
+                    （<code>sqrt</code> / <code>exp</code> / <code>ln</code> /
+                    <code>log10</code>，以及 <code>pow</code> 的非整数指数分支），
+                    精度另受 1000 位约束 —— 这是内核的算力上限，与界面无关。
+                    纯加减乘除的表达式不受这条约束。</li>
+                <li>进制转换的整数部分<strong>精确无损</strong>；小数部分若在该进制下无法
+                    有限表示，会截断并用 <code>...</code> 标记 —— 那是「展开被
+                    截断了」，不是精确值。</li>
+            </ul>
         </section>
     </main>
 </div>
@@ -6358,58 +6728,102 @@ int main(int argc, char** argv) {
 </html>
 ```
 
-- [ ] **Step 7: 写 `web/app.js`**
+- [x] **Step 7: 写 `web/app.js`**
 
 ```javascript
 // Web 前端：调用 /api/* 接口展示结果。
+//
+// 前端只做 I/O 与呈现 —— 所有算术都在内核里，前端不重写任何语义。
+//
+// 与命令行的区别：命令行交互模式把 "> " 提示与结果打在同一条流上，
+// 前端拿到的则是**干净的 JSON**（成功时 {"ok":true,...}，失败时
+// {"ok":false,"error":"..."}），所以这里不需要（也不能）去解析提示符。
+
 const expressionInput = document.getElementById('expr');
 const precisionInput = document.getElementById('precision');
 const baseSelect = document.getElementById('base');
 const resultBox = document.getElementById('result');
+const noteBox = document.getElementById('note');
 const historyList = document.getElementById('history');
+
+// 调用一个 API 端点。返回 { status, payload }。
+//
+// 服务端在出错时也会返回 JSON（{"ok":false,"error":"..."}），但状态码是
+// 4xx —— urllib / fetch 那边会抛异常或给出 ok=false，两边都要处理。
+async function postJson(path, body) {
+    const response = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    // 响应体是 UTF-8 的中文。fetch 的 json() 会按 UTF-8 解码，无需额外处理。
+    const payload = await response.json();
+    return { status: response.status, payload: payload };
+}
+
+function showError(message) {
+    resultBox.textContent = '错误：' + message;
+    resultBox.classList.add('error');
+    noteBox.textContent = '';
+}
 
 async function evaluateExpression() {
     const expression = expressionInput.value.trim();
     if (!expression) return;
+
     const precision = Number(precisionInput.value) || 30;
     resultBox.classList.add('loading');
+    resultBox.classList.remove('error');
+    noteBox.textContent = '';
+
     try {
-        const response = await fetch('/api/evaluate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ expression, precision })
-        });
-        const payload = await response.json();
-        if (!response.ok) {
-            resultBox.textContent = '错误：' + (payload.error || '未知错误');
-            resultBox.classList.add('error');
+        const evaluated = await postJson('/api/evaluate', { expression, precision });
+        if (!evaluated.payload.ok) {
+            showError(evaluated.payload.error || '未知错误');
             return;
         }
-        resultBox.classList.remove('error');
-        let text = payload.result;
+
+        const decimalText = evaluated.payload.result;
+        let text = decimalText;
+        let note = '';
+
         const base = Number(baseSelect.value);
         if (base !== 10) {
-            const converted = await fetch('/api/convert', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ value: text, from: 10, to: base })
-            });
-            const convertedPayload = await converted.json();
-            if (converted.ok) text = convertedPayload.result;
+            const converted = await postJson('/api/convert', { value: decimalText, from: 10, to: base });
+            if (converted.payload.ok) {
+                text = converted.payload.result;
+                // 「...」标记的含义是「展开被截断了」，不是精确值。
+                // 把它如实说出来，免得用户把截断值当成精确值。
+                if (converted.payload.truncated) {
+                    note = '注意：末尾的 “...” 表示该进制下的展开被截断了，' +
+                           '不是精确值；整数部分 ' + converted.payload.integerPart + ' 是精确的。';
+                }
+            } else {
+                // 转换失败不丢掉十进制结果 —— 那个值是对的。
+                note = '进制转换失败：' + (converted.payload.error || '未知错误') +
+                       '（下面显示的是十进制结果）';
+            }
         }
+
         resultBox.textContent = text;
-        addHistory(expression, text);
+        noteBox.textContent = note;
+        addHistory(expression, text, note);
     } catch (error) {
-        resultBox.textContent = '网络错误：' + error.message;
-        resultBox.classList.add('error');
+        showError('网络错误：' + error.message);
     } finally {
         resultBox.classList.remove('loading');
     }
 }
 
-function addHistory(expression, result) {
+function addHistory(expression, result, note) {
     const item = document.createElement('li');
     item.textContent = expression + ' = ' + result;
+    if (note) {
+        const marker = document.createElement('span');
+        marker.className = 'history-note';
+        marker.textContent = note;
+        item.appendChild(marker);
+    }
     historyList.prepend(item);
 }
 
@@ -6417,9 +6831,14 @@ document.getElementById('evaluate').addEventListener('click', evaluateExpression
 expressionInput.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') evaluateExpression();
 });
+
+// 页面加载时自动算一次默认表达式 ——
+// 空着的结果区既看不出这个页面能干什么，也让「前端是否真的连上了
+// 后端」变得无从判断。先算一次，页面一打开就有一个可验证的答案。
+evaluateExpression();
 ```
 
-- [ ] **Step 8: 写 `web/styles.css`**
+- [x] **Step 8: 写 `web/styles.css`**
 
 ```css
 /* 高精度计算器 Web 前端样式。 */
@@ -6431,6 +6850,7 @@ expressionInput.addEventListener('keydown', (event) => {
     --muted: #9aa3b2;
     --accent: #4f8cff;
     --error: #ff6b6b;
+    --warn: #ffb454;
 }
 
 * { box-sizing: border-box; }
@@ -6455,6 +6875,7 @@ body {
 }
 
 .panel label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+.panel h2 { margin: 0 0 12px; font-size: 16px; }
 
 input[type="text"], input[type="number"], select {
     width: 100%;
@@ -6495,40 +6916,100 @@ button:hover { background: #3f7bea; }
 .result.error { color: var(--error); }
 .result.loading { opacity: 0.6; }
 
+.note {
+    margin: 10px 0 0;
+    min-height: 18px;
+    color: var(--warn);
+    font-size: 13px;
+    line-height: 1.5;
+}
+
 .history { list-style: none; margin: 0; padding: 0; font-family: Consolas, monospace; font-size: 13px; }
 .history li { padding: 6px 0; border-bottom: 1px solid #22262f; color: var(--muted); word-break: break-all; }
+.history-note { display: block; color: var(--warn); }
+
+.help ul { margin: 0; padding-left: 20px; }
+.help li { margin-bottom: 6px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+.help code {
+    background: #0d0f14;
+    border: 1px solid #262b36;
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-family: Consolas, monospace;
+    color: var(--text);
+}
 ```
 
-- [ ] **Step 9: 构建并端到端验证**
+- [x] **Step 9: 构建并端到端验证**
 
 ```bash
-./scripts/msvc-env.bat cmake -S . -B build -G Ninja -DBUILD_GUI=OFF -DBUILD_SERVER=ON -DBUILD_TESTS=ON
-./scripts/msvc-env.bat cmake --build build
+./scripts/build-core.bat          # MSVC：核心 + CLI + 测试 + server
+./scripts/run-ctest.bat            # 1/1 通过
 ```
 
 ```bash
-./build/hpc_server --port 8098 &
-sleep 2
-curl -s http://127.0.0.1:8098/api/health
-curl -s -X POST http://127.0.0.1:8098/api/evaluate -d '{"expression":"1/3"}'
-curl -s -X POST http://127.0.0.1:8098/api/arithmetic -d '{"op":"*","lhs":"2.5","rhs":"4"}'
-curl -s -X POST http://127.0.0.1:8098/api/convert -d '{"value":"ff","from":16,"to":10}'
+# 端到端：测试脚本**自己**拉起服务、跑完所有端点、再把服务停掉。
+python scripts/api_test.py
 ```
 
-预期：依次返回 `{"status":"ok"}`、`{"result":"0.333333333333333333333333333333"}`、
-`{"result":"10"}`、`{"result":"255"}`。
+> **为什么由脚本拉起服务**：CTest 里的测试若依赖「外面已经跑着的服务」，
+> 就会有一个「服务得先起来」的顺序依赖 —— 单独跑 `ctest` 会失败。
+> 让脚本自己 spawn 服务就没有这个环。
 
-- [ ] **Step 10: 截图核对界面**
+`scripts/api_test.py` 覆盖 125 项检查：五个端点的正常路径，以及
+非法 JSON、空请求体、非对象请求体、缺字段、字段类型错、precision
+越界/非整数、未知字段、表达式语法错误、除数为零、不支持的运算符、
+进制越界、非十进制源带小数点、源进制数字越界、位运算的非整数操作数、
+未知路由、路径穿越、以及 1e300 这类超出 int64 的数值字段。
+
+**实测输出**（GCC 构建）：
+
+```
+[健康检查]
+  ok   health 状态码 = 200
+  ok   status = 'ok'
+...
+全部 125 项检查通过。
+```
+
+手工核对（brief 里给的那几条 curl）：
+
+```bash
+$ curl -s http://127.0.0.1:8098/api/health
+{"ok":true,"service":"高精度计算器 API","status":"ok","version":"3.0.0"}
+$ curl -s -X POST http://127.0.0.1:8098/api/evaluate -d '{"expression":"1/3"}'
+{"ok":true,"precision":30,"result":"0.333333333333333333333333333333"}
+$ curl -s -X POST http://127.0.0.1:8098/api/arithmetic -d '{"op":"*","lhs":"2.5","rhs":"4"}'
+{"ok":true,"precision":30,"result":"10"}
+$ curl -s -X POST http://127.0.0.1:8098/api/convert -d '{"value":"ff","from":16,"to":10}'
+{"ok":true,"exact":true,"from":16,"integerPart":"255","result":"255","to":10,"truncated":false}
+```
+
+- [x] **Step 10: 截图核对界面**
 
 ```bash
 python scripts/screenshot.py http://127.0.0.1:8098/ /tmp/hpc_web.png
 ```
 **必须实际查看生成的截图**，确认排版正常、结果区非空。
 
-- [ ] **Step 11: 提交**
+**实测结果**：页面渲染正常，深色主题，标题「高精度计算器」、
+副标题「任意精度十进制 · base-10⁹ 分块内核」；表达式框里是默认的
+`1/3 + 2*sqrt(9)`，结果区显示 `6.333333333333333333333333333333`，
+历史区有对应的一行。
+
+> 前端在**页面加载时自动算一次**默认表达式：空着的结果区既看不出
+> 这个页面能干什么，也让「前端是否真的连上了后端」变得无从判断。
+
+另外截了一张**二进制输出**的图（`1/3` 转二进制）来核对「...」截断
+标记的处理：结果显示 `0.0101010101...0100...`，下方橙色的提示写着
+「注意：末尾的 "..." 表示该进制下的展开被截断了，不是精确值；
+整数部分 0 是精确的。」
+
+- [x] **Step 11: 提交**
 
 ```bash
-git add src/core/Json.* src/core/HttpServer.* src/api src/server web CMakeLists.txt
+git add src/core/Json.* src/core/HttpServer.* src/api src/server web CMakeLists.txt \
+        scripts/api_test.py scripts/screenshot.py
 git commit -m "feat(web): REST API、内置 HTTP 服务与原生 Web 前端"
 ```
 
@@ -6547,10 +7028,24 @@ git commit -m "feat(web): REST API、内置 HTTP 服务与原生 Web 前端"
 - Consumes: Task 2-6 的核心接口
 - Produces: `hpc_gui` 可执行文件（仅 `-DBUILD_GUI=ON` 时构建）；`gui_smoke` 离屏渲染测试
 
-> **精度上限**：精度选择框的范围是 `1 .. kMaxTranscendentalPrecision`（1000）。
-> 表达式框里可以用 sqrt/exp/ln/log10/pow，那些函数的内核上限就是 1000 ——
-> 让用户能选到 10000 却拿回一个「precision 超出超越函数的上限」的错误，
-> 是界面上限与内核上限不一致造成的，不是内核的问题。
+> **精度上限（Task 8 实测后与 Task 9 对齐）**：精度选择框的范围是
+> `1 .. kMaxPrecision`（100000），**不是** `1 .. kMaxTranscendentalPrecision`（1000）。
+>
+> 理由与 Task 8 的 Web 前端一致：超越函数的上限（1000）是**算力**上限，
+> 不是**接口契约**上限 —— 它**只在真的用到超越函数时**才生效。纯加减乘除的
+> 表达式在 100000 位以内都合法（内核只在调用 sqrt/exp/ln/log10 或 pow 的
+> 非整数指数分支时才检查 1000）。
+>
+> 所以把选择框的上限设成 1000 会让「纯算术表达式要 5000 位」这个
+> **合法**请求**够不着** —— 用户在界面上根本选不到那个精度。
+>
+> 越界时的行为是**明确的报错**，不是静默降级：
+>   - 选到 100000 以上 → 界面层报 400（含上限值）；
+>   - 选到 1000..100000 之间但用到了超越函数 → **内核抛异常**，
+>     界面层翻译成一条说清楚「是哪个函数越的界、上限是多少」的 400。
+>
+> 两者的共同点是：**用户拿到的答案要么是他要的精度，要么是一条明确的
+> 错误** —— 不会有「悄悄换了个精度」的第三种结果。
 
 - [ ] **Step 1: 在 `CMakeLists.txt` 加入 GUI 目标**
 

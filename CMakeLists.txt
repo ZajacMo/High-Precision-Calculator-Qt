@@ -21,10 +21,15 @@ option(BUILD_TESTS  "构建单元测试"                ON)
 option(BUILD_SERVER "构建 Web 服务端"              ON)
 
 # 核心数值库：纯 C++17，零第三方依赖。
+#
+# Json.* 与 HttpServer.* 也是核心的一部分 —— 它们是本项目自己的代码
+# （从兄弟项目复制而来，已改命名空间），不是第三方依赖。
 add_library(hpc_core STATIC
     src/core/BigDecimal.cpp
     src/core/Format.cpp
     src/core/Expression.cpp
+    src/core/Json.cpp
+    src/core/HttpServer.cpp
 )
 target_include_directories(hpc_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -50,6 +55,28 @@ if(BUILD_CLI)
     hpc_set_warnings(hpc_cli)
 endif()
 
+if(BUILD_SERVER)
+    add_executable(hpc_server
+        src/server/main.cpp
+        src/api/ApiRoutes.cpp
+        src/api/ApiRoutes.h
+    )
+    target_link_libraries(hpc_server PRIVATE hpc_core)
+    hpc_set_warnings(hpc_server)
+
+    # Winsock：Windows 上 socket 相关符号在 ws2_32.lib 里。
+    if(WIN32)
+        target_link_libraries(hpc_server PRIVATE ws2_32)
+    endif()
+
+    # 把 Web 前端资源复制到可执行文件同级目录，让 server 启动后能找到它们。
+    add_custom_target(web_assets ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_CURRENT_SOURCE_DIR}/web" "$<TARGET_FILE_DIR:hpc_server>/web"
+        COMMENT "同步 Web 前端资源到构建目录")
+    add_dependencies(hpc_server web_assets)
+endif()
+
 if(BUILD_TESTS)
     enable_testing()
     add_executable(hpc_tests
@@ -64,6 +91,24 @@ if(BUILD_TESTS)
     target_include_directories(hpc_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     hpc_set_warnings(hpc_tests)
     add_test(NAME hpc_tests COMMAND hpc_tests)
+
+    # API 层的单元测试：直接调 Server::handle()，不经过网络。
+    #
+    # 单独一个目标而不是塞进 hpc_tests：API 层要链 ApiRoutes.cpp 与
+    # ws2_32，核心测试不需要那些 —— 混在一起会让「核心零依赖」这条
+    # 约束在链接层面失守。
+    add_executable(hpc_api_tests
+        tests/tst_api.cpp
+        tests/tst_framework.cpp
+        src/api/ApiRoutes.cpp
+    )
+    target_link_libraries(hpc_api_tests PRIVATE hpc_core)
+    target_include_directories(hpc_api_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    hpc_set_warnings(hpc_api_tests)
+    if(WIN32)
+        target_link_libraries(hpc_api_tests PRIVATE ws2_32)
+    endif()
+    add_test(NAME hpc_api_tests COMMAND hpc_api_tests)
 
     # 除法探针：供 scripts/verify_div.py 做 Python decimal 差分验证。
     add_executable(div_probe tests/div_probe.cpp)

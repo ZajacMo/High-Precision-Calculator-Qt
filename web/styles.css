@@ -1,0 +1,97 @@
+/* 高精度计算器 Web 前端样式。 */
+:root {
+    color-scheme: dark;
+    --bg: #0f1115;
+    --panel: #171a21;
+    --text: #e6e8ec;
+    --muted: #9aa3b2;
+    --accent: #4f8cff;
+    --error: #ff6b6b;
+    --warn: #ffb454;
+}
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+.app { max-width: 880px; margin: 0 auto; padding: 32px 20px; }
+
+.header h1 { margin: 0 0 4px; font-size: 26px; }
+.header p { margin: 0 0 24px; color: var(--muted); font-size: 14px; }
+
+.panel {
+    background: var(--panel);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+}
+
+.panel label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+.panel h2 { margin: 0 0 12px; font-size: 16px; }
+
+input[type="text"], input[type="number"], select {
+    width: 100%;
+    padding: 10px 12px;
+    background: #0d0f14;
+    color: var(--text);
+    border: 1px solid #262b36;
+    border-radius: 8px;
+    font-size: 15px;
+    font-family: "Cascadia Code", Consolas, monospace;
+}
+
+.controls { display: flex; gap: 16px; align-items: flex-end; margin: 16px 0; flex-wrap: wrap; }
+.controls label { flex: 1 1 140px; }
+
+button {
+    padding: 10px 22px;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 15px;
+    cursor: pointer;
+}
+button:hover { background: #3f7bea; }
+
+.result {
+    margin: 0;
+    padding: 14px;
+    background: #0d0f14;
+    border-radius: 8px;
+    font-family: "Cascadia Code", Consolas, monospace;
+    font-size: 15px;
+    min-height: 24px;
+    word-break: break-all;
+    white-space: pre-wrap;
+}
+.result.error { color: var(--error); }
+.result.loading { opacity: 0.6; }
+
+.note {
+    margin: 10px 0 0;
+    min-height: 18px;
+    color: var(--warn);
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.history { list-style: none; margin: 0; padding: 0; font-family: Consolas, monospace; font-size: 13px; }
+.history li { padding: 6px 0; border-bottom: 1px solid #22262f; color: var(--muted); word-break: break-all; }
+.history-note { display: block; color: var(--warn); }
+
+.help ul { margin: 0; padding-left: 20px; }
+.help li { margin-bottom: 6px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+.help code {
+    background: #0d0f14;
+    border: 1px solid #262b36;
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-family: Consolas, monospace;
+    color: var(--text);
+}
