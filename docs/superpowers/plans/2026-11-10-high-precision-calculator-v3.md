@@ -5219,6 +5219,44 @@ brief 的代码是**从未运行过的初稿**。下表的每一行都由
 >    要自己实现「按小数位舍入」—— 精确放大 10^10 倍后用**精确的余数**
 >    判定舍入方向，避免双重舍入。
 
+> **OJ 除法路径的**上界**（Task 7 评审后补记）**：OJ 的除法结果要按小数位
+> 舍入到 10 位，商的位数因此可能是**十万位量级**，而内核的
+> `kMaxPrecision`（100000）就是那道闸门。于是当「被除数 / 除数」的量级
+> 超过约 10^99987 时，`ojDivide` 抛 `std::overflow_error`，OJ 模式把它
+> 转成 `ERROR`。
+>
+> **实测阈值**：`/ 1e99987 1` 正常给出精确值，`/ 1e99988 1` 给 `ERROR`。
+> legacy 在这一档**不报错**（它用自己的一套任意精度实现）—— 这是与
+> legacy 的**第三处**刻意差异（另两处见下面的「与原实现**不同**的两处」）。
+>
+> 风险评估：触发上界需要操作数的十进制指数达到 ~1e5，任何现实的 OJ 测试
+> 数据都远在这个量级之下。**因此不改代码，只把上界写进文档** —— 让读代码
+> 的人知道「OJ 的除法路径是有界的，超上界报 ERROR 而不是继续算」。
+
+> **OJ 组数的**上界**（Task 7 评审后定案）**：协议首行的组数是**声明**的。
+>
+> **根因**：C++11 规定 `std::cin >> int` 在数值超出 int 范围时把目标置为
+> `INT_MAX` —— 所以 legacy 声明 `2e9` 组时实际输出 **21 亿行** ERROR
+> （实测 >25 s 超时；1e8 组 → 22 s / 700 MB）。这是**资源耗尽**，不是行为
+> 兼容。
+>
+> **修法**：组数**逐位**读 —— 跳过前导空白，读掉一个可选的正负号，然后收下
+> 连续的数字位，非数字的那一位**留在输入流里**（与 legacy 的
+> `std::cin >> int` 的提取语义一致：`"12abc"` 在 legacy 那里也是把 12
+> 取走、把 `"abc"` 留给后面的组）。**一旦超过上限就立刻停**，于是组数
+> 永远不会溢出。
+>
+> **上限 `kOjMaxGroups = 1000000`**：最大的公开 OJ 单文件用例在**几十万条**
+> 量级，1e6 有 10 倍以上的余量；而 1e6 组的最坏输出（全 ERROR 行）也就
+> 6 MB、**实测 0.10 s**。超过上限就**报错并停止**（stderr 给诊断、退出码 1、
+> 不输出任何数据行）。
+>
+> **实测**：组数为 `1` / `0` / `-1` / `+3` / `12abc` / `1 x 1 2` / `  2  ` /
+> `abc` / 空输入时，新实现与 legacy **取到的组数完全相同**。
+>
+> **这是**产品决定**，不是 bug 修复**：它让新实现在这一档比 legacy 更严格，
+> 换来的是「不可信输入不会耗尽资源」。
+
 - [x] **Step 1: 写 `src/cli/main.cpp`**
 
 ```cpp
@@ -5266,8 +5304,22 @@ using hpc::RoundingMode;
 //
 //   kOjMinimumDivisor = 1e-6
 //       原实现的 checkBit()：「检查绝对值是否小于 0.000001」。
+//
+//   kOjMaxGroups = 1000000
+//       一次运行允许声明的最大组数。协议的首行是一个**声明**的组数，
+//       legacy 照着它一行一组地输出 —— 一个坏的输入可以声明 2e9 组。
+//
+//       legacy 在这一档是**资源耗尽**，不是行为兼容：C++11 规定
+//       `std::cin >> int` 在数值超出 int 范围时把目标置为 INT_MAX，于是
+//       legacy 声明 2e9 组时实际输出 **21 亿行** ERROR（实测 >25 s 超时）。
+//       实测 1e8 组 → 22 s / 700 MB。
+//
+//       取 1e6：最大的公开 OJ 单文件用例在**几十万条**量级，1e6 有 10 倍
+//       以上的余量；而 1e6 组的最坏输出（全是 ERROR 行）也就 6 MB、实测
+//       0.10 s。超过上限就报错并停止，而不是继续消耗资源。
 constexpr int kOjFractionDigits = 10;
 const char* const kOjMinimumDivisor = "0.000001";
+constexpr long long kOjMaxGroups = 1000000;
 
 // Windows 控制台默认是 GBK（代码页 936），而本项目的提示信息是 UTF-8。
 // 不切换代码页的话，中文提示在控制台上是乱码。
@@ -5378,6 +5430,15 @@ int decimalExponentOf(const BigDecimal& value) {
 //
 // 这里的做法：把被除数精确地放大 10^10 倍，再用**精确的长除法余数**
 // 判定舍入方向。余数是精确的，不存在双重舍入。
+//
+// **上界**：结果的位数被内核的 kMaxPrecision（100000 位有效数字）限制。
+// 于是「被除数 / 除数」的量级超过约 10^99987 时，ojDivide 抛
+// std::overflow_error，OJ 模式把它转成 ERROR。
+// legacy 在这一档**不会**报错（它用自己的一套任意精度的实现，能给出
+// 精确的值），所以这是一个**刻意保留的差异**：OJ 的除法路径有上界，
+// 超上界时报告 ERROR 而不是继续算下去。
+// 触发上界需要操作数的十进制指数达到 ~1e5 —— 任何现实的 OJ 测试数据
+// 都远在这个量级之下。
 BigDecimal ojDivide(const BigDecimal& lhs, const BigDecimal& rhs) {
     const BigDecimal scale = BigDecimal::fromString("1e10");
     const BigDecimal scaled = BigDecimal::abs(lhs) * scale;   // 精确乘法
@@ -5506,6 +5567,10 @@ OJ 批量协议（与 legacy/oj_console_edition 对齐）:
 
   输入被截断时（组数比实际数据多），剩下的每一组都输出 ERROR。
 
+  首行的组数是**声明**的，一次运行最多接受 1000000 组 —— 超过上限就报错
+  并停止（正常的 OJ 数据只有几万组）。不设上限的话，一个声明 2e9 组的
+  输入会让本实现输出 21 亿行 ERROR（legacy 也是这样）。
+
   --oj-legacy-sync
     逐字节复现原实现的**输入流错位**行为：运算符非法时不读走该组的两个
     操作数，于是后面每一组都读到错的位置、给出 ERROR。默认**不**启用 ——
@@ -5523,20 +5588,59 @@ OJ 批量协议（与 legacy/oj_console_edition 对齐）:
 // 输入流因此错位、后面每一组都读到错的位置）。默认 false —— 保持输入流
 // 对齐，见 printUsage() 里的说明。
 int runOjMode(bool legacySync) {
-    int totalCases = 0;
-    if (!(std::cin >> totalCases)) return 0;
+    // 首行是**声明**的组数。
+    //
+    // 不用 `std::cin >> int`：C++11 规定它在数值超出 int 范围时把目标置为
+    // INT_MAX —— 于是 legacy 声明 2e9 组时实际输出 **21 亿行** ERROR
+    // （实测 >25 s 超时），而「解析失败」与「组数就是 0」在输出上完全
+    // 一样：都是静悄悄的空输出，用户看不到任何诊断。
+    //
+    // 改法：跳过前导空白，读掉一个可选的正负号，然后**逐位**收下连续的
+    // 数字位，**一旦超过 kOjMaxGroups 就立刻停**（于是组数永远不会溢出）。
+    // 非数字的那一位**留在输入流里** —— 与 legacy 的 `std::cin >> int` 的
+    // 提取语义一致（"12abc" 在 legacy 那里也是把 12 取走、把 "abc" 留给
+    // 后面的组）。
+    std::cin >> std::ws;
+    std::string countText;
+    bool negative = false;
+    const int first = std::cin.peek();
+    if (first == '+' || first == '-') {
+        negative = (first == '-');
+        std::cin.get();
+    }
+    while (std::cin.good()) {
+        const int c = std::cin.peek();
+        if (c < '0' || c > '9') break;
+        countText.push_back(static_cast<char>(std::cin.get()));
+    }
+    if (negative) return 0;                    // 负数：没有组（与 legacy 一致）
+
+    long long totalCases = 0;
+    bool tooLarge = false;
+    for (const char c : countText) {
+        totalCases = totalCases * 10 + (c - '0');
+        if (totalCases > kOjMaxGroups) {
+            tooLarge = true;
+            break;
+        }
+    }
+    if (tooLarge) {
+        std::cerr << "错误：声明的测试组数 " << countText
+                  << " 超过上限 " << kOjMaxGroups << "，已停止处理\n";
+        return 1;
+    }
     if (totalCases <= 0) return 0;
 
     const BigDecimal minimumDivisor = BigDecimal::fromString(kOjMinimumDivisor);
 
-    for (int i = 0; i < totalCases; ++i) {
+    for (long long i = 0; i < totalCases; ++i) {
         char mode = '+';
         std::string leftText;
         std::string rightText;
 
         if (!(std::cin >> mode)) {
             // 输入被截断：这一组和剩下的每一组都只能给 ERROR。
-            for (int j = i; j < totalCases; ++j) std::cout << "ERROR\n";
+            for (long long j = i; j < totalCases; ++j) std::cout << "ERROR\n";
             break;
         }
 
@@ -5554,7 +5658,7 @@ int runOjMode(bool legacySync) {
         const bool rightRead = static_cast<bool>(std::cin >> rightText);
         if (!leftRead || !rightRead) {
             // 输入被截断：这一组和剩下的每一组都只能给 ERROR。
-            for (int j = i; j < totalCases; ++j) std::cout << "ERROR\n";
+            for (long long j = i; j < totalCases; ++j) std::cout << "ERROR\n";
             break;
         }
 
