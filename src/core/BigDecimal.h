@@ -46,6 +46,20 @@ inline constexpr int kMaxPrecision = 100000;
 //
 // 这是**产品决策**而非数学限制 —— 真正需要更高精度的调用方
 // 应该分批求值（例如先用 1000 位求出前导部分再细化）。
+//
+// **注**：上表的实测数据是**优化前**的。超越函数曾经是三次方复杂度
+// （级数每项一次全精度除法，而通用除法用二分试商是 O(块数²)），
+// 优化后「除以小整数」与「舍入」都走线性路径，整体降到接近平方级：
+//
+//   p=50  →  exp(1)    1 ms    ln(2)   0.4 ms
+//   p=100 →  exp(1)  1.3 ms    ln(2)   0.5 ms
+//   p=200 →  exp(1)  3.1 ms    ln(2)   1.2 ms
+//   p=400 →  exp(1) 9.6 ms    ln(2)   3.9 ms
+//   p=800 →  exp(1)   38 ms    ln(2)    18 ms
+//   p=1000 → exp(1)   65 ms    ln(2)    35 ms
+//
+// 上限**保持 1000 不变** —— 它是公开契约，改动要与调用方协调；
+// 但现在这个上限是「保守」而非「不得不然」，可以另行讨论是否提高。
 inline constexpr int kMaxTranscendentalPrecision = 1000;
 
 // 整数幂的指数上限。
@@ -256,6 +270,17 @@ private:
 
     // exp(g) 的泰勒级数（0 <= g < ln(10) 时收敛很快）。
     static BigDecimal expSeries(const BigDecimal& g, const Context& work);
+
+    // 除以一个小整数（级数里的 2k+1 与 n! 的因子都是这种形状）。
+    //
+    // 语义与 divide(value, BigDecimal(divisor), context) **完全一致**
+    // （同样的舍入模式、同样的精度处理），但走的是线性时间的路径：
+    // 除数是「单块整数 × 10 的幂」，可以一步长除法算出来，
+    // 不必用通用路径的「二分试商」逐位试商（那是 O(块数²)）。
+    //
+    // divisor >= 10^9 时回退到通用路径（那时除数已经不止一块了）。
+    static BigDecimal divideBySmallInt(const BigDecimal& value, std::uint64_t divisor,
+                                       const Context& context);
 
     // 把 value 分解成 mantissa * 10^exponent * 2^halvings，
     // 其中 mantissa ∈ [1, 2)，exponent 与 halvings 由输出参数给出。

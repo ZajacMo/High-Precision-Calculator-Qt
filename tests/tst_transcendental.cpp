@@ -4,6 +4,7 @@
 // 覆盖精确值、量级极端值、定义域边界与舍入模式。
 #include "test_framework.h"
 
+#include <chrono>
 #include <stdexcept>
 #include <string>
 
@@ -505,4 +506,34 @@ TEST(transcendental, identities) {
                                                  BigDecimal::ln(BigDecimal::fromString("10"), ctx20()),
                                                  ctx20());
     CHECK_EQ(viaLog10.toString(), viaLn.toString());
+}
+
+// --- 性能回归 ---
+//
+// 超越函数曾经是三次方复杂度：级数的每一项都要做一次「全精度除法」，
+// 而通用除法用二分试商，是 O(块数²)；级数又有 Θ(精度) 项。
+// 于是 exp(1) 在精度 400 时要 1.4 s，在精度 800 时要 12 s。
+//
+// 现在「除以小整数」与「舍入」都走线性路径，整体降到接近平方级：
+// 精度 800 的 exp(1) 约 40 ms、ln(2) 约 20 ms、log10(2) 约 55 ms。
+//
+// 上面的时间上限留得很宽（5 s），目的不是测性能，而是**挡住退回慢路径**：
+// 退回原来的实现时 exp(1) 要约 12 s（log10(2) 约 8 s），
+// 所以精度必须取 800 —— 精度 400 的旧实现只要 1.4 s，仍落在 5 s 以内，
+// 抓不住回归。
+// 上限本身足够宽松，在负载很重的机器上也不会误报。
+
+TEST(transcendental, high_precision_stays_fast) {
+    const auto start = std::chrono::steady_clock::now();
+
+    const Context ctx{800, RoundingMode::HalfEven};
+    BigDecimal::exp(BigDecimal::fromString("1"), ctx);
+    BigDecimal::ln(BigDecimal::fromString("2"), ctx);
+    BigDecimal::log10(BigDecimal::fromString("2"), ctx);
+
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+
+    // 上限 5 s：旧实现（exp 约 12 s）会被抓住，新实现（约 120 ms）远在界内。
+    CHECK(elapsed < 5000);
 }

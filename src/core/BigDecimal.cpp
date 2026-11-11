@@ -244,6 +244,170 @@ int quotientExponent(const Blk& numerator, const Blk& denominator) {
     return e;
 }
 
+// --- 超越函数级数用的线性时间工具 ---
+//
+// 通用路径（divideBlk + 二分试商）每次除法是 O(块数²)：每来一个块就要
+// 二分试商约 30 次，每次试商又是一次 O(块数) 的乘法。超越函数的级数每一项
+// 都要做一次除法，级数又有 Θ(precision) 项，于是总体变成三次方。
+//
+// 但级数里的除数有两个特殊形状：**单块的小整数**与 **10 的整数次幂**。
+// 这两种都能用 O(块数) 的线性扫描算出来。
+
+// 单块长除法：把块序列除以一个单块整数（0 < divisor < 10^9）。
+//
+// 每块只要一次 64 位除法：current = 余数 * 10^9 + 块 < 10^18，装得下。
+// 返回 {商, 余数}，余数 < divisor。
+std::pair<Blk, std::uint32_t> divideBlkBySingle(const Blk& dividend, std::uint32_t divisor) {
+    Blk quotient(dividend.size(), 0);
+    std::uint64_t remainder = 0;
+    for (std::size_t i = dividend.size(); i-- > 0;) {
+        const std::uint64_t current = remainder * kBase + dividend[i];
+        quotient[i] = static_cast<std::uint32_t>(current / divisor);
+        remainder = current % divisor;
+    }
+    quotient = trimBlk(std::move(quotient));
+    return {std::move(quotient), static_cast<std::uint32_t>(remainder)};
+}
+
+// 把块序列右移 rest 个十进制位（1 <= rest <= 8），即丢掉最低的 rest 位。
+//
+// 小端表示下，最低位块是 digits_[0]，所以「第 i 块右移 rest 位」的结果要
+// 从**更高**的一块借位：新的第 i 块 = 上一块（更高位）的低 rest 位拼上
+// 自己的高 9-rest 位。
+Blk shiftRightDecimalDigits(const Blk& blocks, int rest) {
+    if (rest <= 0) return blocks;
+    const std::size_t size = blocks.size();
+    Blk shifted(size, 0);
+    for (std::size_t i = 0; i < size; ++i) {
+        const std::uint32_t low = blocks[i] / kPow10[rest];
+        const std::uint32_t high =
+            (i + 1 < size) ? static_cast<std::uint32_t>(blocks[i + 1] % kPow10[rest]) : 0u;
+        shifted[i] = high * kPow10[kBlockDigits - rest] + low;
+    }
+    return trimBlk(std::move(shifted));
+}
+
+// 把块序列除以 10^places（十进制位），返回 {商, 余数}。
+//
+// 商 = floor(N / 10^places)，余数 = N mod 10^places（都以块序列表示）。
+//
+// places 不必是 9 的倍数：先把低 whole 个整块丢掉，再整体右移 rest 位。
+// 公式是 floor(N / 10^(9w+r)) = floor(floor(N / 10^(9w)) / 10^r)。
+std::pair<Blk, Blk> divideBlkByPowerOfTen(const Blk& blocks, int places) {
+    if (places <= 0) return {trimBlk(blocks), Blk{0}};
+    const int whole = places / kBlockDigits;
+    const int rest = places % kBlockDigits;
+    const int size = static_cast<int>(blocks.size());
+
+    if (whole >= size) {
+        // 整个数都不到 10^places：商为 0，余数就是它自己。
+        return {Blk{0}, trimBlk(blocks)};
+    }
+
+    // 余数 = 低 whole 个整块 + (第 whole 块的低 rest 位) * 10^(9*whole)。
+    Blk remainder;
+    remainder.reserve(static_cast<std::size_t>(whole) + 1);
+    for (int i = 0; i < whole; ++i) remainder.push_back(blocks[i]);
+    if (rest > 0) {
+        remainder.push_back(static_cast<std::uint32_t>(blocks[whole] % kPow10[rest]));
+    }
+    remainder = trimBlk(std::move(remainder));
+
+    // 商 = floor(N / 10^(9*whole)) 再右移 rest 位。
+    Blk quotient(blocks.begin() + whole, blocks.end());
+    if (rest > 0) quotient = shiftRightDecimalDigits(std::move(quotient), rest);
+    quotient = trimBlk(std::move(quotient));
+
+    return {std::move(quotient), std::move(remainder)};
+}
+
+// 比较 2*value 与 10^places。返回 <0 / 0 / >0。
+//
+// value 只需是「不足 10^places 的非负整数」，调用方保证这一点。
+int compareDoubleToPowerOfTen(const Blk& value, int places) {
+    const Blk doubled = doubleBlk(value);
+    const Blk threshold = powOfTenBlocks(places);
+    return compareBlk(doubled, threshold);
+}
+
+// 把精确分数 N / (d * 10^s) 舍入到 precision 位有效数字。
+//
+// 与 roundQuotient(N, d * 10^s, ...) **完全等价**（同样的舍入模式、同样的
+// 尾数判定、同样的结果位数），但除法走线性路径：除数是「单块整数 d × 10
+// 的幂」，可以分两段做长除法 —— 先除 10^m，再除 d —— 每段都是 O(块数)。
+//
+// 两段除法与一步除法等价，靠的是恒等式
+//     floor(floor(X / a) / b) = floor(X / (a·b))
+// 余数也随之分解：X = q·(d·10^m) + r，而 r = r2·10^m + r1，
+// 其中 r1 = X mod 10^m、r2 = (X div 10^m) mod d。
+//
+// d 必须 < 10^9（单块）。
+std::pair<Blk, int> roundQuotientSmall(const Blk& numerator, std::uint32_t d, int s,
+                                       int precision, RoundingMode mode, bool negative) {
+    const Blk denominator = shiftLeftDecimal(Blk{d}, s);
+    const int exponent = quotientExponent(numerator, denominator);
+
+    const int shift = precision - 1 - exponent;
+    Blk scaledNumerator;
+    int m;                       // 约化后的除数是 d * 10^m
+    if (shift >= 0) {
+        scaledNumerator = shiftLeftDecimal(numerator, shift);
+        m = s;
+    } else {
+        scaledNumerator = numerator;
+        m = s - shift;
+    }
+
+    // 两段长除法。
+    const auto first = divideBlkByPowerOfTen(scaledNumerator, m);
+    const auto second = divideBlkBySingle(first.first, d);
+    Blk quotient = second.first;
+    const std::uint32_t r2 = second.second;    // (scaledNumerator div 10^m) mod d
+    const Blk& r1 = first.second;              // scaledNumerator mod 10^m
+
+    // 尾数判定：余数 R = r2·10^m + r1，比较 2R 与 d·10^m。
+    //
+    // 因为 0 <= 2·r1 < 2·10^m，比较 2R = 2·r2·10^m + 2·r1 与 d·10^m
+    // 可以按 2·r2 与 d 的大小分档：
+    //   2·r2 > d   → 一定更大
+    //   2·r2 == d  → 由 r1 是否为零决定「正好一半」还是「更大」
+    //   2·r2 == d-1 → 归结为比较 2·r1 与 10^m
+    //   2·r2 < d-1 → 一定更小
+    DiscardTail tail;
+    if (r2 == 0 && isZeroBlk(r1)) {
+        tail = DiscardTail::Zero;
+    } else {
+        const std::uint64_t twiceR2 = 2 * static_cast<std::uint64_t>(r2);
+        if (twiceR2 > d) {
+            tail = DiscardTail::GreaterThanHalf;
+        } else if (twiceR2 == d) {
+            tail = isZeroBlk(r1) ? DiscardTail::ExactlyHalf : DiscardTail::GreaterThanHalf;
+        } else if (twiceR2 + 1 == d) {
+            const int cmp = compareDoubleToPowerOfTen(r1, m);
+            tail = cmp > 0 ? DiscardTail::GreaterThanHalf
+                 : cmp == 0 ? DiscardTail::ExactlyHalf
+                            : DiscardTail::LessThanHalf;
+        } else {
+            tail = DiscardTail::LessThanHalf;
+        }
+    }
+
+    // 末位数字：商的个位。blockDigitsToString 的末位就是 blocks[0] % 10，
+    // 不必为它拼一次字符串。
+    const int lastKeptDigit = static_cast<int>(quotient[0] % 10);
+    if (roundsUpInMagnitude(mode, tail, lastKeptDigit, negative)) {
+        incrementBlk(quotient);
+    }
+
+    // 值 = 商 * 10^(exponent+1-precision)，改写成 整数 * 10^(-小数位数)。
+    int scale = precision - 1 - exponent;
+    if (scale < 0) {
+        quotient = shiftLeftDecimal(std::move(quotient), -scale);
+        scale = 0;
+    }
+    return {std::move(quotient), scale};
+}
+
 }  // namespace
 
 BigDecimal::BigDecimal() : digits_{0} {}
@@ -422,15 +586,23 @@ void BigDecimal::normalize() {
 }
 
 // 对齐小数位：把 scale 较小的数末尾补零，使两者 scale 相同。
+//
+// 补零就是「乘以 10^delta」，而 10 的整数次幂在十进制下就是移小数点 ——
+// 用 shiftLeftDecimal 直接移块，**O(块数)**。
+//
+// 原来的写法是 mulBlk(digits, 10^delta)：那是一次通用的大数乘法，O(块数²)，
+// 而且每次都要先把 "1" + delta 个 '0' 拼成字符串再解析成块。
+// 超越函数的级数每一项都要做加法与比较，两次 alignScale 一次，
+// 于是这个二次方开销把整个级数拖回三次方。
 int BigDecimal::alignScale(BigDecimal& lhs, BigDecimal& rhs) {
     if (lhs.scale_ == rhs.scale_) return lhs.scale_;
     if (lhs.scale_ < rhs.scale_) {
         const int delta = rhs.scale_ - lhs.scale_;
-        lhs.digits_ = mulBlk(lhs.digits_, blocksFromDecimal("1" + std::string(static_cast<std::size_t>(delta), '0')));
+        lhs.digits_ = shiftLeftDecimal(std::move(lhs.digits_), delta);
         lhs.scale_ += delta;
     } else {
         const int delta = lhs.scale_ - rhs.scale_;
-        rhs.digits_ = mulBlk(rhs.digits_, blocksFromDecimal("1" + std::string(static_cast<std::size_t>(delta), '0')));
+        rhs.digits_ = shiftLeftDecimal(std::move(rhs.digits_), delta);
         rhs.scale_ += delta;
     }
     return lhs.scale_;
@@ -691,11 +863,11 @@ BigDecimal BigDecimal::divide(const BigDecimal& lhs, const BigDecimal& rhs,
 
 // 舍入到 context.precision 位有效数字。
 //
-// 走"把精确分数交给 roundQuotient"的路径：舍入判定基于长除法得到的
+// 走"把精确分数交给 roundQuotientSmall"的路径：舍入判定基于长除法得到的
 // **精确余数**，而不是"多算几位再猜"。因此「正好一半」与「超过一半」
 // 永远能被正确区分 —— 银行家舍入的偶数分支才可靠。
 //
-// 结构安全：全程只用块数组与数字串，不做任何"向前回退一格"的链式操作，
+// 结构安全：全程只用块数组，不做任何"向前回退一格"的链式操作，
 // 因此单块/单元素结构天然安全（legacy 缺陷 #5 与 #10 的共同根因）。
 BigDecimal BigDecimal::roundToPrecision(const BigDecimal& value, const Context& context) {
     if (value.sign_ == 0) return value;
@@ -709,11 +881,16 @@ BigDecimal BigDecimal::roundToPrecision(const BigDecimal& value, const Context& 
 
     // 把精确值表示成分数：numerator/denominator = value。
     // value = digits * 10^-scale，所以分母是 10^scale，分子是 digits。
-    const Blk numerator = value.digits_;
-    const Blk denominator = powOfTenBlocks(value.scale_);
-
-    const auto rounded = roundQuotient(numerator, denominator, context.precision,
-                                       context.mode, value.sign_ < 0);
+    //
+    // 除数是 **10 的整数次幂**（d = 1, s = scale），走线性路径：
+    // roundQuotientSmall 与 roundQuotient 在这个形状上的结果**完全一致**
+    // （同一个 exponent、同一套尾数判定、同一个结果位数），
+    // 但除法从 O(块数²) 降到 O(块数)。
+    //
+    // 这一步是超越函数提速的关键：级数每一项都要 roundToPrecision，
+    // 而通用路径的「二分试商」让整体变成三次方。
+    const auto rounded = roundQuotientSmall(value.digits_, 1, value.scale_,
+                                            context.precision, context.mode, value.sign_ < 0);
 
     BigDecimal result;
     result.digits_ = rounded.first;
@@ -725,6 +902,49 @@ BigDecimal BigDecimal::roundToPrecision(const BigDecimal& value, const Context& 
 
 BigDecimal BigDecimal::floor(const BigDecimal& value, const Context& context) {
     return roundToPrecision(value, Context{context.precision, RoundingMode::Floor});
+}
+
+// 除以一个小整数。
+//
+// 语义与 divide(value, BigDecimal(divisor), context) **完全一致** ——
+// 同样的舍入模式、同样的精度处理、同样的结果位数。区别只在**速度**：
+// 除数是「单块整数 d × 10 的幂」时可以分两段做长除法（先除 10^m 再除 d），
+// 每段都是 O(块数)；通用路径的「二分试商」是 O(块数²)。
+//
+// divisor >= 10^9 时除数不止一块，回退到通用路径。
+BigDecimal BigDecimal::divideBySmallInt(const BigDecimal& value, std::uint64_t divisor,
+                                         const Context& context) {
+    if (divisor == 0) throw std::domain_error("BigDecimal: 除数为零");
+    if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    if (context.precision > kMaxPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出上限");
+    }
+    if (value.sign_ == 0) return BigDecimal();
+
+    // 除数超过一块：通用路径。
+    //
+    // 整数除数的 scale 恒为 0，所以对齐后的 commonScale 就是 value.scale_。
+    if (divisor >= kBase) {
+        BigDecimal integer(static_cast<std::int64_t>(divisor));
+        return divide(value, integer, context);
+    }
+
+    // 除数是单块整数 d（d = divisor），没有 10 的幂因子。
+    //
+    // 与 divide 一样：整数除数的 scale 为 0，对齐后的共同 scale 是
+    // value.scale_，于是被除数不变、除数变成 d × 10^value.scale_。
+    const std::uint32_t d = static_cast<std::uint32_t>(divisor);
+    const Blk numerator = value.digits_;
+
+    const auto rounded = roundQuotientSmall(numerator, d, value.scale_,
+                                            context.precision, context.mode, value.sign_ < 0);
+
+    BigDecimal result;
+    result.digits_ = rounded.first;
+    result.scale_ = rounded.second;
+    result.sign_ = value.sign_;
+    result.normalize();
+    return result;
 }
 
 BigDecimal BigDecimal::ceil(const BigDecimal& value, const Context& context) {
@@ -943,8 +1163,12 @@ BigDecimal BigDecimal::atanhSeries(const BigDecimal& z, const Context& work) {
     // 项数上界：|z| <= 1/3 时 z^(2k+1) <= 3^-(2k+1)，需要约 1.05 * precision 项。
     for (int k = 1; k <= work.precision * 2 + 8; ++k) {
         power = roundToPrecision(power * zSquared, work);
-        const BigDecimal addend = divide(power, BigDecimal(2 * k + 1),
-                                         Context{work.precision, RoundingMode::HalfEven});
+        // 除以 2k+1：走「除以小整数」的线性路径。
+        //
+        // 语义与 divide(power, BigDecimal(2*k+1), ...) 完全一致，
+        // 但除法从 O(块数²) 降到 O(块数) —— 这一项是级数里的主项。
+        const BigDecimal addend = divideBySmallInt(power, static_cast<std::uint64_t>(2 * k + 1),
+                                                   Context{work.precision, RoundingMode::HalfEven});
         if (addend.isZero()) break;
         sum = sum + addend;
         if (abs(addend).compare(epsilon) < 0) break;
@@ -967,7 +1191,9 @@ BigDecimal BigDecimal::expSeries(const BigDecimal& g, const Context& work) {
     BigDecimal sum(1);
     for (int n = 1; n <= work.precision * 3 + 16; ++n) {
         term = roundToPrecision(term * gRounded, work);
-        term = divide(term, BigDecimal(n), Context{work.precision, RoundingMode::HalfEven});
+        // 除以 n：走「除以小整数」的线性路径（语义与通用路径一致）。
+        term = divideBySmallInt(term, static_cast<std::uint64_t>(n),
+                                Context{work.precision, RoundingMode::HalfEven});
         if (term.isZero()) break;
         sum = sum + term;
         if (abs(term).compare(epsilon) < 0) break;

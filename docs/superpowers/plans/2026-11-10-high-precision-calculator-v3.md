@@ -645,15 +645,23 @@ void BigDecimal::normalize() {
 }
 
 // 对齐小数位：把 scale 较小的数末尾补零，使两者 scale 相同。
+//
+// 补零就是「乘以 10^delta」，而 10 的整数次幂在十进制下就是移小数点 ——
+// 用 shiftLeftDecimal 直接移块，**O(块数)**。
+//
+// 原来的写法是 mulBlk(digits, 10^delta)：那是一次通用的大数乘法，O(块数²)，
+// 而且每次都要先把 "1" + delta 个 '0' 拼成字符串再解析成块。
+// 超越函数的级数每一项都要做加法与比较，两次 alignScale 一次，
+// 于是这个二次方开销把整个级数拖回三次方。
 int BigDecimal::alignScale(BigDecimal& lhs, BigDecimal& rhs) {
     if (lhs.scale_ == rhs.scale_) return lhs.scale_;
     if (lhs.scale_ < rhs.scale_) {
         const int delta = rhs.scale_ - lhs.scale_;
-        lhs.digits_ = mulBlk(lhs.digits_, blocksFromDecimal("1" + std::string(static_cast<std::size_t>(delta), '0')));
+        lhs.digits_ = shiftLeftDecimal(std::move(lhs.digits_), delta);
         lhs.scale_ += delta;
     } else {
         const int delta = lhs.scale_ - rhs.scale_;
-        rhs.digits_ = mulBlk(rhs.digits_, blocksFromDecimal("1" + std::string(static_cast<std::size_t>(delta), '0')));
+        rhs.digits_ = shiftLeftDecimal(std::move(rhs.digits_), delta);
         rhs.scale_ += delta;
     }
     return lhs.scale_;
@@ -989,7 +997,7 @@ BigDecimal BigDecimal::modulo(const BigDecimal& lhs, const BigDecimal& rhs) {
 }
 ```
 
-`roundToPrecision` —— **用字符串级实现**，避免块边界与舍入位的交互错误：
+`roundToPrecision` —— **走块级路径**（不是字符串级），避免块边界与舍入位的交互错误：
 
 > **设计要点（来自 legacy 缺陷 #5 与 #10 的共同根因）**：这两条缺陷同源 ——
 > 都是「用 `->prior` 向前走时，假定链表不止一个节点」：
@@ -998,100 +1006,91 @@ BigDecimal BigDecimal::modulo(const BigDecimal& lhs, const BigDecimal& rhs) {
 > #5 的修复使结果退化为**单节点链表**，#10 随后对单节点链表做了同样的错误假设。
 >
 > 因此 v3.0 的舍入步骤必须**结构上安全**，而不仅仅是校验 `precision`：
-> 本实现走字符串级路径，**完全不做 `->prior` 回退**，单节点/空链表都安全。
+> 本实现全程只用块数组，**完全不做 `->prior` 回退**，单节点/空链表都安全。
 > `precision <= 0` 的校验是第二道防线（实测 `precision >= 1` 即安全）。
+>
+> **块级路径同时也是性能路径**：舍入判定基于长除法得到的**精确余数**，
+> 因此「正好一半」（银行家舍入要走偶数分支）与「超过一半」永远能被正确区分。
+> 除数是 **10 的整数次幂**（d = 1, s = scale），可以分两段做长除法
+> （先除 10^m 再除 d），每段都是 O(块数) —— 而通用的「二分试商」是 O(块数²)。
+> 这一步是超越函数提速的关键：级数每一项都要 roundToPrecision。
 
 ```cpp
 // 舍入到 context.precision 位有效数字。
+//
+// 走"把精确分数交给 roundQuotientSmall"的路径：舍入判定基于长除法得到的
+// **精确余数**，而不是"多算几位再猜"。因此「正好一半」与「超过一半」
+// 永远能被正确区分 —— 银行家舍入的偶数分支才可靠。
+//
+// 结构安全：全程只用块数组，不做任何"向前回退一格"的链式操作，
+// 因此单块/单元素结构天然安全（legacy 缺陷 #5 与 #10 的共同根因）。
 BigDecimal BigDecimal::roundToPrecision(const BigDecimal& value, const Context& context) {
     if (value.sign_ == 0) return value;
-
-    std::string text = value.toString();
-    const bool negative = !text.empty() && text[0] == '-';
-    if (negative) text.erase(0, 1);
-    std::size_t dot = text.find('.');
-    std::string integerPart = dot == std::string::npos ? text : text.substr(0, dot);
-    std::string fractionPart = dot == std::string::npos ? std::string() : text.substr(dot + 1);
-
-    // 去掉整数部分前导零
-    const std::size_t firstNonZero = integerPart.find_first_not_of('0');
-    integerPart = firstNonZero == std::string::npos ? std::string("0")
-                                                     : integerPart.substr(firstNonZero);
-    // 去掉小数部分尾随零
-    while (!fractionPart.empty() && fractionPart.back() == '0') fractionPart.pop_back();
-
-    // 判断是否需要进位：依据被丢弃的首位与舍入模式。
-    auto shouldRoundUp = [&](const std::string& discarded, const std::string& kept) {
-        if (discarded.empty()) return false;
-        if (context.mode == RoundingMode::Down || context.mode == RoundingMode::Floor) {
-            return false;
-        }
-        const char first = discarded[0];
-        switch (context.mode) {
-            case RoundingMode::Ceil:
-                return !negative;
-            case RoundingMode::Up:
-                return true;
-            case RoundingMode::HalfUp:
-                return first >= '5';
-            case RoundingMode::HalfEven: {
-                const bool greater = first > '5';
-                const bool equal = first == '5';
-                const bool restNonZero =
-                    discarded.find_first_not_of('0', 1) != std::string::npos;
-                const int lastDigit = kept.empty() ? 0 : (kept.back() - '0');
-                return greater || (equal && (restNonZero || lastDigit % 2 == 1));
-            }
-            default:
-                return first >= '5';
-        }
-    };
-
-    // 十进制字符串加一。
-    auto increment = [](std::string& digits) {
-        std::size_t i = digits.size();
-        while (i-- > 0) {
-            if (digits[i] == '9') { digits[i] = '0'; }
-            else { ++digits[i]; return; }
-        }
-        digits.insert(0, "1");
-    };
-
-    if (integerPart.size() >= static_cast<std::size_t>(context.precision)) {
-        // 整数部分已占满精度：截断小数部分。
-        const std::string kept = integerPart.substr(0, static_cast<std::size_t>(context.precision));
-        const std::string discarded = integerPart.substr(static_cast<std::size_t>(context.precision))
-                                     + fractionPart;
-        std::string result = kept;
-        if (shouldRoundUp(discarded, kept)) increment(result);
-        text = result;
-        fractionPart.clear();
-    } else {
-        // 小数部分需要截断。
-        const std::size_t keep = static_cast<std::size_t>(context.precision) - integerPart.size();
-        std::string kept = fractionPart.substr(0, std::min(keep, fractionPart.size()));
-        const std::string discarded = fractionPart.substr(kept.size());
-        if (shouldRoundUp(discarded, kept)) {
-            // 给 kept 加一；若溢出到整数位则进位到 integerPart。
-            std::string probe = kept;
-            increment(probe);
-            bool overflow = probe.size() > kept.size();
-            if (overflow) probe = probe.substr(1);
-            kept = probe;
-            if (overflow) increment(integerPart);
-        }
-        text = integerPart;
-        fractionPart = kept;
+    if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    if (context.precision > kMaxPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出上限");
     }
 
-    // 拼装
-    std::string assembled = text;
-    if (!fractionPart.empty()) assembled += "." + fractionPart;
-    if (negative && assembled.find_first_not_of("0.") != std::string::npos) {
-        assembled = "-" + assembled;
-    }
-    return BigDecimal::fromString(assembled);
+    // 把精确值表示成分数：numerator/denominator = value。
+    // value = digits * 10^-scale，所以分母是 10^scale，分子是 digits。
+    //
+    // 除数是 **10 的整数次幂**（d = 1, s = scale），走线性路径：
+    // roundQuotientSmall 与 roundQuotient 在这个形状上的结果**完全一致**
+    // （同一个 exponent、同一套尾数判定、同一个结果位数），
+    // 但除法从 O(块数²) 降到 O(块数)。
+    const auto rounded = roundQuotientSmall(value.digits_, 1, value.scale_,
+                                            context.precision, context.mode, value.sign_ < 0);
+
+    BigDecimal result;
+    result.digits_ = rounded.first;
+    result.scale_ = rounded.second;
+    result.sign_ = value.sign_;
+    result.normalize();
+    return result;
 }
+```
+
+配套的线性时间工具（匿名 namespace 内）：
+
+```cpp
+// 单块长除法：把块序列除以一个单块整数（0 < divisor < 10^9）。
+// 每块只要一次 64 位除法：current = 余数 * 10^9 + 块 < 10^18，装得下。
+std::pair<Blk, std::uint32_t> divideBlkBySingle(const Blk& dividend, std::uint32_t divisor) {
+    Blk quotient(dividend.size(), 0);
+    std::uint64_t remainder = 0;
+    for (std::size_t i = dividend.size(); i-- > 0;) {
+        const std::uint64_t current = remainder * kBase + dividend[i];
+        quotient[i] = static_cast<std::uint32_t>(current / divisor);
+        remainder = current % divisor;
+    }
+    quotient = trimBlk(std::move(quotient));
+    return {std::move(quotient), static_cast<std::uint32_t>(remainder)};
+}
+
+// 把块序列右移 rest 个十进制位（1 <= rest <= 8），即丢掉最低的 rest 位。
+Blk shiftRightDecimalDigits(const Blk& blocks, int rest);
+
+// 把块序列除以 10^places（十进制位），返回 {商, 余数}。
+std::pair<Blk, Blk> divideBlkByPowerOfTen(const Blk& blocks, int places);
+
+// 把精确分数 N / (d * 10^s) 舍入到 precision 位有效数字。
+// 与 roundQuotient(N, d * 10^s, ...) **完全等价**，但除法走线性路径。
+std::pair<Blk, int> roundQuotientSmall(const Blk& numerator, std::uint32_t d, int s,
+                                       int precision, RoundingMode mode, bool negative);
+```
+
+以及公开的「除以小整数」入口（级数专用，语义与 `divide` 完全一致）：
+
+```cpp
+// 除以一个小整数。
+//
+// 语义与 divide(value, BigDecimal(divisor), context) **完全一致** ——
+// 同样的舍入模式、同样的精度处理、同样的结果位数。区别只在**速度**：
+// 除数是单块整数时可以一步长除法算出来，不必用通用路径的「二分试商」。
+//
+// divisor >= 10^9 时除数不止一块，回退到通用路径。
+BigDecimal BigDecimal::divideBySmallInt(const BigDecimal& value, std::uint64_t divisor,
+                                         const Context& context);
 ```
 
 - [ ] **Step 3: 实现 floor / ceil / round**
@@ -1395,6 +1394,17 @@ int floorHalf(int e) { return e >= 0 ? e / 2 : (e - 1) / 2; }
     // exp(g) 的泰勒级数（0 <= g < ln(10) 时收敛很快）。
     static BigDecimal expSeries(const BigDecimal& g, const Context& work);
 
+    // 除以一个小整数（级数里的 2k+1 与 n 都是这种形状）。
+    //
+    // 语义与 divide(value, BigDecimal(divisor), context) **完全一致**
+    // （同样的舍入模式、同样的精度处理），但走的是线性时间的路径：
+    // 除数是单块整数时，一步长除法就能算出来，不必用通用路径的
+    // 「二分试商」逐位试商（那是 O(块数²)）。
+    //
+    // divisor >= 10^9 时回退到通用路径（那时除数已经不止一块了）。
+    static BigDecimal divideBySmallInt(const BigDecimal& value, std::uint64_t divisor,
+                                       const Context& context);
+
     // 把 value 分解成 mantissa * 10^exponent * 2^halvings，
     // 其中 mantissa ∈ [1, 2)，exponent 与 halvings 由输出参数给出。
     //
@@ -1631,8 +1641,12 @@ BigDecimal BigDecimal::atanhSeries(const BigDecimal& z, const Context& work) {
     // 项数上界：|z| <= 1/3 时 z^(2k+1) <= 3^-(2k+1)，需要约 1.05 * precision 项。
     for (int k = 1; k <= work.precision * 2 + 8; ++k) {
         power = roundToPrecision(power * zSquared, work);
-        const BigDecimal addend = divide(power, BigDecimal(2 * k + 1),
-                                         Context{work.precision, RoundingMode::HalfEven});
+        // 除以 2k+1：走「除以小整数」的线性路径。
+        //
+        // 语义与 divide(power, BigDecimal(2*k+1), ...) 完全一致，
+        // 但除法从 O(块数²) 降到 O(块数) —— 这一项是级数里的主项。
+        const BigDecimal addend = divideBySmallInt(power, static_cast<std::uint64_t>(2 * k + 1),
+                                                   Context{work.precision, RoundingMode::HalfEven});
         if (addend.isZero()) break;
         sum = sum + addend;
         if (abs(addend).compare(epsilon) < 0) break;
@@ -1657,7 +1671,9 @@ BigDecimal BigDecimal::expSeries(const BigDecimal& g, const Context& work) {
     BigDecimal sum(1);
     for (int n = 1; n <= work.precision * 3 + 16; ++n) {
         term = roundToPrecision(term * gRounded, work);
-        term = divide(term, BigDecimal(n), Context{work.precision, RoundingMode::HalfEven});
+        // 除以 n：走「除以小整数」的线性路径（语义与通用路径一致）。
+        term = divideBySmallInt(term, static_cast<std::uint64_t>(n),
+                                Context{work.precision, RoundingMode::HalfEven});
         if (term.isZero()) break;
         sum = sum + term;
         if (abs(term).compare(epsilon) < 0) break;
