@@ -31,6 +31,12 @@ from fractions import Fraction
 
 getcontext().prec = 400
 
+# Python 3.11+ 默认禁止把超过 4300 位的整数转成十进制串（防 DoS）。
+# 本脚本有上百万位的用例（科学计数法的指数上限边界），参考值要**精确**
+# 比较，所以把上限调高 —— 没有安全顾虑：输入是脚本自己造的。
+if hasattr(sys, 'set_int_max_str_digits'):
+    sys.set_int_max_str_digits(10000000)
+
 MODES = ('HalfEven', 'HalfUp', 'Down', 'Up', 'Ceil', 'Floor')
 
 
@@ -538,8 +544,23 @@ def build_cases():
     for text in ('1/0', '1%0', 'sqrt(-1)', 'ln(0)', 'log10(0)', 'pow(0,0)',
                  'pow(-2,0.5)', 'pow(0,-1)', '', '   ', '1+', '(1+2', '1+*2',
                  'unknown(1)', 'sqrt()', 'pow(2)', '1.2.3', '0b2', '0x', '1e',
-                 'x', 'sqrt', '()', '1)2', '1 2', ')', '*'):
+                 'x', 'sqrt', '()', '1)2', '1 2', ')', '*',
+                 # 科学计数法的指数过大（|exponent| 的上限是 10^6）。
+                 # 表达式层在解析指数时就检查这个上限，不去构造那个
+                 # 上百万位的移位。
+                 '1e1000001', '1e-1000001', '1e999999999', '1e-999999999',
+                 '1.5e999999999', '0e999999999', '1e1000009', '1e1000010'):
         cases.append((text, ('error',), 20, 'HalfEven'))
+
+    # 14) 科学计数法的指数**恰好**在上限之内：必须能正常算出。
+    #
+    # 这守着上限的**边界**：上限之内要能算（不是一律报错）。
+    #
+    # 只测**正**指数：负指数的参考值是 1/10^1000000，参考实现的
+    # render_fraction 要把分母的因子 2 与 5 逐个剥掉 —— 对上百万位的
+    # 分母那是 O(n^2)，慢到不可用。负指数的那一侧由单元测试
+    # （tst_expression.cpp 的 scientificNotationExponentLimit）覆盖。
+    cases.append(('1e1000000', literal(Fraction(10) ** 1000000), 20, 'HalfEven'))
 
     return cases
 
