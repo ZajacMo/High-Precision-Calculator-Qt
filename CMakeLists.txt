@@ -83,4 +83,9 @@ if(BUILD_TESTS)
     add_executable(format_probe tests/format_probe.cpp)
     target_link_libraries(format_probe PRIVATE hpc_core)
     hpc_set_warnings(format_probe)
+
+    # 表达式探针：供 scripts/verify_expression.py 做差分验证。
+    add_executable(expression_probe tests/expression_probe.cpp)
+    target_link_libraries(expression_probe PRIVATE hpc_core)
+    hpc_set_warnings(expression_probe)
 endif()

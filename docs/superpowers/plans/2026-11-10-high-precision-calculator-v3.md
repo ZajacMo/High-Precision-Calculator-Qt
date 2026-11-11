@@ -3609,6 +3609,7 @@ git commit -m "feat(core): 进制转换与整数位运算"
 **Files:**
 - Create: `src/core/Expression.h`
 - Create: `src/core/Expression.cpp`
+- Create: `tests/expression_probe.cpp`
 - Modify: `tests/tst_expression.cpp`
 
 **Interfaces:**
@@ -3616,9 +3617,10 @@ git commit -m "feat(core): 进制转换与整数位运算"
 - Produces:
   - `class ExpressionError : public std::runtime_error`（携带 `int position()`）
   - `BigDecimal evaluate(std::string_view expression, const Context& context)`
-  - 支持：数字、`0x`/`0b`/`0o` 前缀整数、`+ - * / %`、一元正负、括号、函数 `sqrt abs pow exp ln log10`
+  - 支持：数字（含**科学计数法**）、`0x`/`0b`/`0o` 前缀整数、`+ - * / %`、
+    一元正负、括号、函数 `sqrt abs pow exp ln log10`
 
-- [ ] **Step 1: 写 `src/core/Expression.h`**
+- [x] **Step 1: 写 `src/core/Expression.h`**
 
 ```cpp
 // 表达式解析与求值：递归下降。
@@ -3634,6 +3636,13 @@ git commit -m "feat(core): 进制转换与整数位运算"
 namespace hpc {
 
 // 表达式错误：携带出错字符在原串中的位置（从 0 开始）。
+//
+// **位置约定**：position 指向**出错的字符本身**，而不是它后面的位置。
+// 「表达式意外结束」这类错误没有 offending 字符，position 指向**串尾**
+// —— 即缺失的字符本该出现的地方。
+//
+// 位置是**字节**下标（不是字符下标）：表达式按字节处理，非 ASCII 输入
+// 也能用这个下标做「高亮第 n 个字节」。
 class ExpressionError : public std::runtime_error {
 public:
     ExpressionError(const std::string& message, int position)
@@ -3644,18 +3653,55 @@ private:
     int position_;
 };
 
+// 表达式的最大嵌套层数（括号与函数调用都算）。
+//
+// 递归下降解析器的每一层嵌套要占若干个栈帧，层数无上限时一个几百 KB
+// 的输入就能把栈跑穿 —— 而栈溢出是**崩溃**，不是可捕获的异常：
+// 前端连错误提示都来不及显示。
+//
+// 取 256：正常表达式远远用不到，它是「防呆」而不是「限制能力」。
+// 超过上限时抛 ExpressionError（带位置），而不是崩溃。
+inline constexpr int kMaxExpressionNestingDepth = 256;
+
 // 求值表达式。语法错误抛 ExpressionError。
+//
+// **语法**（优先级由低到高，左结合）：
+//
+//   expression := term (('+' | '-') term)*
+//   term       := unary (('*' | '/' | '%') unary)*
+//   unary      := ('+' | '-') unary | primary
+//   primary    := number | '(' expression ')' | name '(' args ')'
+//
+// 数字支持十进制小数、**科学计数法**（1e20、2.5E-3）与 0x/0b/0o 前缀
+// 的整数。函数：sqrt abs pow exp ln log10。
+//
+// **精度**：context.precision 是**有效数字位数**（同 Python decimal 的
+// prec），直接用于除法与超越函数；加、减、乘是精确运算，不受精度影响。
+//
+// **精度上限**：求值前会先检查精度本身，合法范围是 1..kMaxPrecision
+// （100000）；用到超越函数（sqrt/exp/ln/log10，以及 pow 的**非整数指数**
+// 分支）时还要额外满足 1..kMaxTranscendentalPrecision（1000）。
+//
+// 超出上限时抛 ExpressionError —— **不静默降精度**：静默地把 5000 位
+// 降成 1000 位，等于给用户一个他没要求的答案，而错误信息里看不出这一点。
+// 前端要「夹到上限」的行为，自己在调用前夹。
+//
+// **异常契约**：内核抛出的所有异常（定义域错误如 sqrt(-1)、ln(0)；
+// 溢出如 exp 过大；精度越界）都在这里转换成 ExpressionError，
+// 因此前端只需要捕获 **一种** 异常类型。
 BigDecimal evaluate(std::string_view expression, const Context& context);
 
 }  // namespace hpc
 ```
 
-- [ ] **Step 2: 写 `src/core/Expression.cpp`**
+- [x] **Step 2: 写 `src/core/Expression.cpp`**
 
 ```cpp
 #include "core/Expression.h"
 
 #include <cctype>
+#include <cstddef>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -3663,6 +3709,48 @@ BigDecimal evaluate(std::string_view expression, const Context& context);
 
 namespace hpc {
 namespace {
+
+bool isDigit(char c) { return c >= '0' && c <= '9'; }
+
+bool isAlpha(char c) {
+    return std::isalpha(static_cast<unsigned char>(c)) != 0;
+}
+
+bool isAlnum(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0;
+}
+
+bool isSpace(char c) {
+    return std::isspace(static_cast<unsigned char>(c)) != 0;
+}
+
+char toLower(char c) {
+    return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+}
+
+// 该字符在 base 进制下是否是一个合法数位。
+bool isBaseDigit(char c, int base) {
+    int digit;
+    if (isDigit(c)) {
+        digit = c - '0';
+    } else if (c >= 'a' && c <= 'z') {
+        digit = c - 'a' + 10;
+    } else if (c >= 'A' && c <= 'Z') {
+        digit = c - 'A' + 10;
+    } else {
+        return false;
+    }
+    return digit < base;
+}
+
+// 一个函数实参：值 + 它在原串中的起始位置。
+//
+// 位置用于报「参数超出定义域」这类错误：出错的确实是**这个实参**，
+// 所以位置指向实参的起点比指向函数名更有用。
+struct Argument {
+    BigDecimal value;
+    int position;
+};
 
 // 递归下降解析器。
 class Parser {
@@ -3672,6 +3760,9 @@ public:
 
     BigDecimal parse() {
         skipSpaces();
+        if (position_ >= text_.size()) {
+            fail("表达式为空");
+        }
         BigDecimal value = parseExpression();
         skipSpaces();
         if (position_ != text_.size()) {
@@ -3681,13 +3772,17 @@ public:
     }
 
 private:
+    // 报错的**位置**指向出错的字符本身。
     [[noreturn]] void fail(const std::string& message) const {
         throw ExpressionError(message, static_cast<int>(position_));
     }
 
+    [[noreturn]] void failAt(const std::string& message, std::size_t position) const {
+        throw ExpressionError(message, static_cast<int>(position));
+    }
+
     void skipSpaces() {
-        while (position_ < text_.size() &&
-               std::isspace(static_cast<unsigned char>(text_[position_]))) {
+        while (position_ < text_.size() && isSpace(text_[position_])) {
             ++position_;
         }
     }
@@ -3706,6 +3801,21 @@ private:
             fail(std::string("期望 '") + c + "'");
         }
     }
+
+    // 嵌套深度的守卫：构造时 +1，析构时 -1。
+    //
+    // 异常路径上也要 -1，否则中途抛错后深度计数会失真。用 RAII 而不是
+    // 「正常返回时手写 -1」正是为此 —— 异常展开时析构函数照样会跑。
+    class DepthGuard {
+    public:
+        explicit DepthGuard(Parser& parser) : parser_(parser) { ++parser_.depth_; }
+        ~DepthGuard() { --parser_.depth_; }
+        DepthGuard(const DepthGuard&) = delete;
+        DepthGuard& operator=(const DepthGuard&) = delete;
+
+    private:
+        Parser& parser_;
+    };
 
     // expression := term (('+' | '-') term)*
     BigDecimal parseExpression() {
@@ -3730,12 +3840,24 @@ private:
             if (consume('*')) {
                 value = value * parseUnary();
             } else if (consume('/')) {
+                skipSpaces();
+                const std::size_t divisorStart = position_;
                 const BigDecimal divisor = parseUnary();
-                if (divisor.isZero()) fail("除数为零");
+                if (divisor.isZero()) {
+                    failAt("除数为零", divisorStart);
+                }
                 value = BigDecimal::divide(value, divisor, context_);
             } else if (consume('%')) {
+                skipSpaces();
+                const std::size_t divisorStart = position_;
                 const BigDecimal divisor = parseUnary();
-                if (divisor.isZero()) fail("取余的除数为零");
+                if (divisor.isZero()) {
+                    failAt("取余的除数为零", divisorStart);
+                }
+                // 取余用的是内核的**整数余数**语义（符号跟随被除数）。
+                // 左操作数带小数时，内核把两个数对齐到共同的小数位再做
+                // 整数长除法 —— 等价于 C 的 fmod(5.5, 2) = 1.5，
+                // 而不是「先取整再取余」（那是 5.5 → 5，5 % 2 = 1）。
                 value = BigDecimal::modulo(value, divisor);
             } else {
                 return value;
@@ -3743,88 +3865,191 @@ private:
         }
     }
 
-    // unary := ('+' | '-') unary | primary
+    // unary := ('+' | '-')* primary
+    //
+    // 写成**迭代**而不是递归：一串一元符号（"----5"）用递归实现会
+    // 无限深地调用自己，一个几百 KB 的输入就能把栈跑穿 —— 而栈溢出是
+    // **崩溃**，前端连错误提示都来不及显示。
+    //
+    // 一元符号的链一定是**平的**：语法里 unary 的操作数要么是另一个
+    // unary（于是链继续延伸），要么是 primary（链到此为止）。所以
+    // 「若干个符号 + 一个 primary」这个形式覆盖了全部情况 ——
+    // "-(-5)" 里的内层 unary 是 primary '(' 的内部，由 parsePrimary
+    // 负责，不在这条链上。
     BigDecimal parseUnary() {
-        skipSpaces();
-        if (consume('+')) return parseUnary();
-        if (consume('-')) return BigDecimal() - parseUnary();
-        return parsePrimary();
+        bool negate = false;
+        while (true) {
+            skipSpaces();
+            if (position_ < text_.size() && text_[position_] == '+') {
+                ++position_;
+                continue;
+            }
+            if (position_ < text_.size() && text_[position_] == '-') {
+                ++position_;
+                negate = !negate;
+                continue;
+            }
+            break;
+        }
+        BigDecimal value = parsePrimary();
+        return negate ? BigDecimal(0) - value : value;
     }
 
-    // primary := number | '(' expression ')' | func '(' args ')'
+    // primary := number | '(' expression ')' | name '(' args ')'
     BigDecimal parsePrimary() {
         skipSpaces();
-        if (position_ >= text_.size()) fail("表达式意外结束");
+        if (position_ >= text_.size()) {
+            fail("表达式意外结束");
+        }
+
+        // 嵌套深度上限：超限时报错，而不是让递归把栈跑穿。
+        if (depth_ >= kMaxExpressionNestingDepth) {
+            fail("表达式的嵌套层数超过上限 " +
+                 std::to_string(kMaxExpressionNestingDepth));
+        }
 
         const char c = text_[position_];
         if (c == '(') {
             ++position_;
+            DepthGuard guard(*this);
             BigDecimal value = parseExpression();
             expect(')');
             return value;
         }
-        if (std::isdigit(static_cast<unsigned char>(c))) {
+        if (isDigit(c) || c == '.') {
             return parseNumber();
         }
-        if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
+        if (isAlpha(c) || c == '_') {
             return parseIdentifier();
         }
         fail("意外的字符");
     }
 
-    // 支持 0x / 0b / 0o 前缀的整数，以及十进制小数。
+    // 数字字面量。
+    //
+    // 两类：
+    //   - 0x / 0b / 0o 前缀的**整数**（该进制下的小数无法精确表示，
+    //     所以进制字面量只支持整数 —— 与 fromBaseString 的契约一致）；
+    //   - 十进制：[.][数字][.数字][(e|E)[+|-]数字]。
+    //
+    // 前缀路径与十进制路径**互斥**：先看前缀（0x/0b/0o），没有前缀才走
+    // 十进制。于是 "0x1e5" 是十六进制的 1e5（485），而 "1e5" 是科学
+    // 计数法的 100000 —— 两条路不会互相误认。
     BigDecimal parseNumber() {
         const std::size_t start = position_;
         if (text_[position_] == '0' && position_ + 1 < text_.size()) {
-            const char marker = static_cast<char>(std::tolower(
-                static_cast<unsigned char>(text_[position_ + 1])));
+            const char marker = toLower(text_[position_ + 1]);
             int base = 0;
             if (marker == 'x') base = 16;
             else if (marker == 'b') base = 2;
             else if (marker == 'o') base = 8;
             if (base != 0) {
-                position_ += 2;
-                const std::size_t digitsStart = position_;
-                while (position_ < text_.size() &&
-                       std::isalnum(static_cast<unsigned char>(text_[position_]))) {
-                    ++position_;
+                return parseBaseInteger(base);
+            }
+        }
+        return parseDecimalLiteral(start);
+    }
+
+    // 0x/0b/0o 前缀的整数。
+    BigDecimal parseBaseInteger(int base) {
+        position_ += 2;                       // 跳过 "0x" / "0b" / "0o"
+        const std::size_t digitsStart = position_;
+        while (position_ < text_.size() && isBaseDigit(text_[position_], base)) {
+            ++position_;
+        }
+        const std::size_t digitsEnd = position_;
+        if (digitsEnd == digitsStart) {
+            // 一个数位都没有：要么后面跟的是非法字符，要么根本没有了。
+            if (position_ < text_.size() && isAlnum(text_[position_])) {
+                fail("非法的进制数字");
+            }
+            fail("进制前缀后缺少数字");
+        }
+        // 数位之后紧跟字母数字 → 那个字符就是出错的字符。
+        if (position_ < text_.size() && isAlnum(text_[position_])) {
+            fail("非法的进制数字");
+        }
+        try {
+            return fromBaseString(
+                std::string(text_.substr(digitsStart, digitsEnd - digitsStart)), base);
+        } catch (const std::exception&) {
+            fail("非法的进制数字");
+        }
+    }
+
+    // 十进制字面量（含科学计数法）。
+    BigDecimal parseDecimalLiteral(std::size_t start) {
+        bool seenDot = false;
+        bool seenDigit = false;
+
+        if (text_[position_] == '.') {
+            seenDot = true;
+            ++position_;
+        }
+        while (position_ < text_.size() && isDigit(text_[position_])) {
+            seenDigit = true;
+            ++position_;
+        }
+        if (position_ < text_.size() && text_[position_] == '.') {
+            if (seenDot) {
+                fail("非法的数字：小数点重复");
+            }
+            seenDot = true;
+            ++position_;
+            while (position_ < text_.size() && isDigit(text_[position_])) {
+                seenDigit = true;
+                ++position_;
+            }
+        }
+        // 小数部分之后**又**出现小数点：那个点就是出错的字符。
+        //
+        // 不在这里报的话，字面量会停在第一个点（"1.2"），剩下的 ".3" 由
+        // parse() 当成「多余的字符」报出来 —— 位置对，但信息误导
+        // （用户看到的是「多余」，实际是「多点」）。
+        if (position_ < text_.size() && text_[position_] == '.') {
+            fail("非法的数字：小数点重复");
+        }
+        if (!seenDigit) {
+            failAt("非法的数字：没有数字", start);
+        }
+
+        // 科学计数法：'e'/'E' 后面必须跟（可选符号）加数字，否则它就是
+        // 一个非法字符 —— 把它算进字面量让 fromString 报错，位置指向
+        // 那个 'e'。
+        if (position_ < text_.size() &&
+            (text_[position_] == 'e' || text_[position_] == 'E')) {
+            const std::size_t mark = position_;
+            std::size_t cursor = mark + 1;
+            if (cursor < text_.size() && (text_[cursor] == '+' || text_[cursor] == '-')) {
+                ++cursor;
+            }
+            if (cursor < text_.size() && isDigit(text_[cursor])) {
+                while (cursor < text_.size() && isDigit(text_[cursor])) {
+                    ++cursor;
                 }
-                const std::string digits(text_.substr(digitsStart, position_ - digitsStart));
-                if (digits.empty()) fail("进制前缀后缺少数字");
+                position_ = cursor;
+            } else {
+                position_ = mark + 1;
                 try {
-                    return fromBaseString(digits, base);
+                    return BigDecimal::fromString(text_.substr(start, position_ - start));
                 } catch (const std::exception&) {
-                    fail("非法的进制数字");
+                    failAt("非法的数字：指数部分非法", mark);
                 }
             }
         }
 
-        bool seenDot = false;
-        while (position_ < text_.size()) {
-            const char d = text_[position_];
-            if (std::isdigit(static_cast<unsigned char>(d))) {
-                ++position_;
-            } else if (d == '.' && !seenDot) {
-                seenDot = true;
-                ++position_;
-            } else {
-                break;
-            }
-        }
-        const std::string literal(text_.substr(start, position_ - start));
         try {
-            return BigDecimal::fromString(literal);
+            return BigDecimal::fromString(text_.substr(start, position_ - start));
         } catch (const std::exception&) {
             fail("非法的数字");
         }
     }
 
-    // 标识符：函数名。
+    // 标识符：只能是函数名（后面必须紧跟 '('）。
     BigDecimal parseIdentifier() {
         const std::size_t start = position_;
         while (position_ < text_.size() &&
-               (std::isalnum(static_cast<unsigned char>(text_[position_])) ||
-                text_[position_] == '_')) {
+               (isAlnum(text_[position_]) || text_[position_] == '_')) {
             ++position_;
         }
         const std::string name(text_.substr(start, position_ - start));
@@ -3832,146 +4057,903 @@ private:
         skipSpaces();
         if (position_ < text_.size() && text_[position_] == '(') {
             ++position_;
-            std::vector<BigDecimal> args;
+            DepthGuard guard(*this);
+            std::vector<Argument> args;
             skipSpaces();
             if (!(position_ < text_.size() && text_[position_] == ')')) {
-                args.push_back(parseExpression());
-                while (consume(',')) args.push_back(parseExpression());
+                args.push_back(parseArgument());
+                while (consume(',')) {
+                    args.push_back(parseArgument());
+                }
             }
             expect(')');
-            return callFunction(name, args);
+            return callFunction(name, args, start);
         }
-        fail("未知的标识符 '" + name + "'");
+        failAt("未知的标识符 '" + name + "'", start);
     }
 
-    BigDecimal callFunction(const std::string& name, const std::vector<BigDecimal>& args) {
+    Argument parseArgument() {
+        skipSpaces();
+        const std::size_t start = position_;
+        BigDecimal value = parseExpression();
+        return Argument{value, static_cast<int>(start)};
+    }
+
+    // 把内核抛出的异常统一转换成 ExpressionError。
+    //
+    // 前端因此只需要捕获**一种**异常类型 —— 定义域错误（sqrt(-1)、
+    // ln(0)、pow(0,0)）、溢出（exp 参数过大）、精度越界在内核里是三种
+    // 不同的异常类型，让它们原样漏到前端会让每个前端都写三段 catch。
+    BigDecimal callFunction(const std::string& name, const std::vector<Argument>& args,
+                            std::size_t nameStart) {
         auto need = [&](std::size_t count) {
             if (args.size() != count) {
-                fail("函数 '" + name + "' 需要 " + std::to_string(count) + " 个参数");
+                failAt("函数 '" + name + "' 需要 " + std::to_string(count) + " 个参数",
+                       nameStart);
             }
         };
-        if (name == "sqrt") {
-            need(1);
-            return BigDecimal::sqrt(args[0], context_);
-        }
-        if (name == "abs") {
-            need(1);
-            return BigDecimal::abs(args[0]);
-        }
-        if (name == "exp") {
-            need(1);
-            return BigDecimal::exp(args[0], context_);
-        }
-        if (name == "ln") {
-            need(1);
-            return BigDecimal::ln(args[0], context_);
-        }
-        if (name == "log10") {
-            need(1);
-            return BigDecimal::log10(args[0], context_);
-        }
+
         if (name == "pow") {
             need(2);
-            return BigDecimal::pow(args[0], args[1], context_);
+            // pow 的**整数指数**分支是精确运算，不受超越函数的精度上限
+            // 约束；只有非整数指数才受。判定条件与内核一致（scale == 0）。
+            if (!args[1].value.isInteger() &&
+                context_.precision > kMaxTranscendentalPrecision) {
+                failAt("精度 " + std::to_string(context_.precision) +
+                           " 超出超越函数的上限 " +
+                           std::to_string(kMaxTranscendentalPrecision) +
+                           "（函数 'pow' 的非整数指数分支）",
+                       nameStart);
+            }
+            try {
+                return BigDecimal::pow(args[0].value, args[1].value, context_);
+            } catch (const std::domain_error& e) {
+                throw ExpressionError(
+                    std::string("函数 'pow' 的参数超出定义域：") + e.what(),
+                    static_cast<int>(nameStart));
+            } catch (const std::overflow_error& e) {
+                throw ExpressionError(
+                    std::string("函数 'pow' 的结果超出可计算范围：") + e.what(),
+                    static_cast<int>(nameStart));
+            } catch (const std::invalid_argument& e) {
+                throw ExpressionError(
+                    std::string("函数 'pow' 无法计算：") + e.what(),
+                    static_cast<int>(nameStart));
+            }
         }
-        fail("未知的函数 '" + name + "'");
+
+        if (name == "sqrt" || name == "exp" || name == "ln" || name == "log10") {
+            need(1);
+            if (context_.precision > kMaxTranscendentalPrecision) {
+                failAt("精度 " + std::to_string(context_.precision) +
+                           " 超出超越函数的上限 " +
+                           std::to_string(kMaxTranscendentalPrecision) + "（函数 '" +
+                           name + "'）",
+                       nameStart);
+            }
+            try {
+                if (name == "sqrt") return BigDecimal::sqrt(args[0].value, context_);
+                if (name == "exp") return BigDecimal::exp(args[0].value, context_);
+                if (name == "ln") return BigDecimal::ln(args[0].value, context_);
+                return BigDecimal::log10(args[0].value, context_);
+            } catch (const std::domain_error& e) {
+                throw ExpressionError(
+                    std::string("函数 '") + name + "' 的参数超出定义域：" + e.what(),
+                    args[0].position);
+            } catch (const std::overflow_error& e) {
+                throw ExpressionError(
+                    std::string("函数 '") + name + "' 的结果超出可计算范围：" + e.what(),
+                    args[0].position);
+            } catch (const std::invalid_argument& e) {
+                throw ExpressionError(
+                    std::string("函数 '") + name + "' 无法计算：" + e.what(),
+                    args[0].position);
+            }
+        }
+
+        if (name == "abs") {
+            need(1);
+            return BigDecimal::abs(args[0].value);
+        }
+
+        failAt("未知的函数 '" + name + "'", nameStart);
     }
 
     std::string_view text_;
     const Context& context_;
     std::size_t position_ = 0;
+    int depth_ = 0;
 };
 
 }  // namespace
 
 BigDecimal evaluate(std::string_view expression, const Context& context) {
-    Parser parser(expression, context);
-    return parser.parse();
+    // 精度本身的合法性在**进解析器之前**检查：精度越界是「上下文错误」，
+    // 不是「某个字符错了」，所以位置取 0（表达式的起点）。
+    //
+    // 超越函数的上限**不能**在这里检查 —— 那要等到真的用上超越函数才知道，
+    // 而只做加减乘除的表达式在 kMaxPrecision（100000）位以内都是合法的。
+    if (context.precision <= 0) {
+        throw ExpressionError("精度必须是正整数", 0);
+    }
+    if (context.precision > kMaxPrecision) {
+        throw ExpressionError("精度 " + std::to_string(context.precision) +
+                                  " 超出上限 " + std::to_string(kMaxPrecision),
+                              0);
+    }
+
+    try {
+        Parser parser(expression, context);
+        return parser.parse();
+    } catch (const ExpressionError&) {
+        throw;   // 已经是统一后的类型，原样抛出
+    } catch (const std::exception& e) {
+        // 兜底：内核抛出的其它异常（理论上不该漏到这里）也统一成
+        // ExpressionError，保证前端只需要 catch 一种类型。
+        throw ExpressionError(std::string("求值失败：") + e.what(), 0);
+    }
 }
 
 }  // namespace hpc
 ```
 
-- [ ] **Step 3: 写 `tests/tst_expression.cpp`**
+- [x] **Step 3: 写 `tests/tst_expression.cpp`**
 
 ```cpp
 #include "test_framework.h"
 
+#include <string>
+
 #include "core/Expression.h"
 
+using hpc::BigDecimal;
 using hpc::Context;
+using hpc::ExpressionError;
 using hpc::RoundingMode;
 
 namespace {
+
+// 求值并返回结果。
+//
+// **异常不外泄**：抛出的 ExpressionError 会被记成一个失败的断言，
+// 返回 0 作为哨兵。
+//
+// 理由：测试框架的 main 循环**不捕获**异常，一个用例抛出异常会直接
+// 终止整个测试二进制 —— 后面几十个用例一个都跑不到，失败原因也被
+// 淹没。测试辅助函数把异常变成断言失败，才能看到**全部**结果。
 BigDecimal eval(const std::string& text) {
-    return hpc::evaluate(text, Context{20, RoundingMode::HalfEven});
+    try {
+        return hpc::evaluate(text, Context{20, RoundingMode::HalfEven});
+    } catch (const ExpressionError& e) {
+        ::testing::reportFailure(__FILE__, __LINE__,
+                                 "求值 " + text + " 意外失败：" + e.what());
+        return BigDecimal(0);
+    }
 }
+
+// 指定精度与舍入模式的版本。
+BigDecimal eval(const std::string& text, int precision, RoundingMode mode) {
+    try {
+        return hpc::evaluate(text, Context{precision, mode});
+    } catch (const ExpressionError& e) {
+        ::testing::reportFailure(__FILE__, __LINE__,
+                                 "求值 " + text + " 意外失败：" + e.what());
+        return BigDecimal(0);
+    }
+}
+
+// 求值并返回结果字符串；出错时返回 "!" + 错误信息。
+std::string evalOrError(const std::string& text) {
+    try {
+        return hpc::evaluate(text, Context{20, RoundingMode::HalfEven}).toString();
+    } catch (const ExpressionError& e) {
+        return std::string("!") + e.what();
+    }
+}
+
+// 捕获 ExpressionError 并回填位置与信息。
+bool tryEval(const std::string& text, int& position, std::string& message) {
+    try {
+        hpc::evaluate(text, Context{20, RoundingMode::HalfEven});
+    } catch (const ExpressionError& e) {
+        position = e.position();
+        message = e.what();
+        return false;
+    }
+    position = -1;
+    message.clear();
+    return true;
+}
+
+// 指定精度下的版本。
+bool tryEvalAt(const std::string& text, int precision, RoundingMode mode, int& position,
+                std::string& message) {
+    try {
+        hpc::evaluate(text, Context{precision, mode});
+    } catch (const ExpressionError& e) {
+        position = e.position();
+        message = e.what();
+        return false;
+    }
+    position = -1;
+    message.clear();
+    return true;
+}
+
+// 断言「求值失败，且位置指向指定的那个字符」。
+void checkErrorAt(const std::string& text, int expectedPosition) {
+    int position = -1;
+    std::string message;
+    const bool ok = tryEval(text, position, message);
+    CHECK(!ok);
+    if (!ok) {
+        CHECK_EQ(position, expectedPosition);
+        CHECK(!message.empty());
+    }
+}
+
 }  // namespace
+
+// --- 算术与优先级 ---
 
 TEST(expression, arithmetic) {
     CHECK_EQ(eval("1+2").toString(), std::string("3"));
     CHECK_EQ(eval("2*3+4").toString(), std::string("10"));
     CHECK_EQ(eval("2+3*4").toString(), std::string("14"));
     CHECK_EQ(eval("(2+3)*4").toString(), std::string("20"));
-    CHECK_EQ(eval("10-4-3").toString(), std::string("3"));
     CHECK_EQ(eval("100/4").toString(), std::string("25"));
-    CHECK_EQ(eval("7%3").toString(), std::string("1"));
+    CHECK_EQ(eval("2*(3+4)").toString(), std::string("14"));
+    CHECK_EQ(eval("1+2*3-4/2").toString(), std::string("5"));
 }
 
-TEST(expression, unary_and_decimals) {
-    CHECK_EQ(eval("-5").toString(), std::string("-5"));
-    CHECK_EQ(eval("--5").toString(), std::string("5"));
+TEST(expression, leftAssociativity) {
+    // 左结合：10-4-3 = (10-4)-3 = 3，不是 10-(4-3) = 9。
+    CHECK_EQ(eval("10-4-3").toString(), std::string("3"));
+    // 8/2/2 = (8/2)/2 = 2，不是 8/(2/2) = 8。
+    CHECK_EQ(eval("8/2/2").toString(), std::string("2"));
+    // 20/5*2 = (20/5)*2 = 8，不是 20/(5*2) = 2。
+    CHECK_EQ(eval("20/5*2").toString(), std::string("8"));
+}
+
+TEST(expression, exactness) {
+    // 加减乘是精确运算，不受精度影响。
     CHECK_EQ(eval("0.1+0.2").toString(), std::string("0.3"));
     CHECK_EQ(eval("1.5*2").toString(), std::string("3"));
+    // 精确的除法不该被精度截断。
+    CHECK_EQ(eval("1/8").toString(), std::string("0.125"));
+    CHECK_EQ(eval("1/2").toString(), std::string("0.5"));
+    CHECK_EQ(eval("1/4").toString(), std::string("0.25"));
 }
+
+// --- 一元运算符 ---
+
+TEST(expression, unary) {
+    CHECK_EQ(eval("-5").toString(), std::string("-5"));
+    CHECK_EQ(eval("--5").toString(), std::string("5"));
+    CHECK_EQ(eval("---5").toString(), std::string("-5"));
+    CHECK_EQ(eval("+5").toString(), std::string("5"));
+    CHECK_EQ(eval("-+5").toString(), std::string("-5"));
+    CHECK_EQ(eval("2*-3").toString(), std::string("-6"));
+    CHECK_EQ(eval("-(3+4)").toString(), std::string("-7"));
+    CHECK_EQ(eval("-(3+4)*2").toString(), std::string("-14"));
+    CHECK_EQ(eval("-2*-3").toString(), std::string("6"));
+}
+
+// 一长串一元符号：迭代实现，不能把栈跑穿。
+TEST(expression, longUnaryChainDoesNotOverflowStack) {
+    std::string text(100001, '-');
+    text += "5";
+    CHECK_EQ(eval(text).toString(), std::string("-5"));
+
+    std::string even(100000, '-');
+    even += "5";
+    CHECK_EQ(eval(even).toString(), std::string("5"));
+}
+
+// --- 空白与空表达式 ---
+
+TEST(expression, whitespaceTolerated) {
+    CHECK_EQ(eval("1 + 2").toString(), std::string("3"));
+    CHECK_EQ(eval("  1+2  ").toString(), std::string("3"));
+    CHECK_EQ(eval("sqrt( 9 )").toString(), std::string("3"));
+    CHECK_EQ(eval("\t1 +\n2").toString(), std::string("3"));
+    CHECK_EQ(eval("pow( 2 , 10 )").toString(), std::string("1024"));
+    CHECK_EQ(eval("( 1 + 2 ) * 3").toString(), std::string("9"));
+}
+
+TEST(expression, emptyExpressionIsAnError) {
+    checkErrorAt("", 0);
+    checkErrorAt("   ", 3);
+    checkErrorAt("\t\n", 2);
+}
+
+// --- 函数 ---
 
 TEST(expression, functions) {
     CHECK_EQ(eval("sqrt(9)").toString(), std::string("3"));
     CHECK_EQ(eval("abs(-3)").toString(), std::string("3"));
+    CHECK_EQ(eval("abs(3)").toString(), std::string("3"));
     CHECK_EQ(eval("pow(2,10)").toString(), std::string("1024"));
+    CHECK_EQ(eval("exp(0)").toString(), std::string("1"));
     CHECK_EQ(eval("ln(1)").toString(), std::string("0"));
+    CHECK_EQ(eval("log10(100)").toString(), std::string("2"));
+    // sqrt(2) 在 20 位有效数字下是 1.4142135623730950488。
+    CHECK_EQ(eval("sqrt(2)").toString(), std::string("1.4142135623730950488"));
+    // sqrt(2)*sqrt(2) **不是** 2：两个 20 位近似值的乘积在第 20 位
+    // 上有 1 ulp 的偏差。这是精度语义的正确表现，不是缺陷。
+    CHECK_EQ(eval("sqrt(2)*sqrt(2)").toString(),
+             std::string("1.99999999999999999999522356663907438144"));
 }
+
+TEST(expression, nestedFunctions) {
+    CHECK_EQ(eval("sqrt(abs(-16))").toString(), std::string("4"));
+    CHECK_EQ(eval("pow(pow(2,3),2)").toString(), std::string("64"));
+    CHECK_EQ(eval("exp(ln(5))").toString(), std::string("5"));
+    CHECK_EQ(eval("log10(pow(10,3))").toString(), std::string("3"));
+}
+
+// --- 进制字面量与科学计数法 ---
 
 TEST(expression, bases) {
     CHECK_EQ(eval("0xFF").toString(), std::string("255"));
-    CHECK_EQ(eval("0b1010").toString(), std::string("10"));
     CHECK_EQ(eval("0xFF + 1").toString(), std::string("256"));
+    CHECK_EQ(eval("0b1010").toString(), std::string("10"));
+    CHECK_EQ(eval("0o777").toString(), std::string("511"));
+    CHECK_EQ(eval("0XFF").toString(), std::string("255"));
+    CHECK_EQ(eval("0x0").toString(), std::string("0"));
+    CHECK_EQ(eval("0x10 + 0b10 + 0o10").toString(), std::string("26"));
+    CHECK_EQ(eval("-0xFF").toString(), std::string("-255"));
 }
 
-TEST(expression, errors) {
-    bool threw = false;
-    try { eval("1+"); } catch (const hpc::ExpressionError& e) { threw = true; CHECK(e.position() >= 0); }
-    CHECK(threw);
+// 0x1e5 是十六进制的 1e5（485），不是科学计数法。
+TEST(expression, hexPrefixIsNotScientificNotation) {
+    CHECK_EQ(eval("0x1e5").toString(), std::string("485"));
+    CHECK_EQ(eval("0xE5").toString(), std::string("229"));
+    // 而 "0b1e5" 里 'e' 不是二进制数位 → 报错，位置指向 'e'。
+    checkErrorAt("0b1e5", 3);
+}
 
-    threw = false;
-    try { eval("(1+2"); } catch (const hpc::ExpressionError&) { threw = true; }
-    CHECK(threw);
+// 1e5 是科学计数法（100000），不是「1 后面跟着非法的 e」。
+TEST(expression, scientificNotation) {
+    CHECK_EQ(eval("1e5").toString(), std::string("100000"));
+    CHECK_EQ(eval("1E5").toString(), std::string("100000"));
+    CHECK_EQ(eval("2.5e-3").toString(), std::string("0.0025"));
+    CHECK_EQ(eval("2.5E-3").toString(), std::string("0.0025"));
+    CHECK_EQ(eval("1e5 + 1").toString(), std::string("100001"));
+    CHECK_EQ(eval("1.5e2").toString(), std::string("150"));
+    CHECK_EQ(eval("0e5").toString(), std::string("0"));
+    CHECK_EQ(eval("1e0").toString(), std::string("1"));
+    CHECK_EQ(eval("1e+3").toString(), std::string("1000"));
+    CHECK_EQ(eval("1e-3").toString(), std::string("0.001"));
+}
 
-    threw = false;
-    try { eval("1/0"); } catch (const hpc::ExpressionError&) { threw = true; }
-    CHECK(threw);
+TEST(expression, decimalLiterals) {
+    CHECK_EQ(eval("0.5").toString(), std::string("0.5"));
+    CHECK_EQ(eval(".5").toString(), std::string("0.5"));
+    CHECK_EQ(eval("5.").toString(), std::string("5"));
+    CHECK_EQ(eval("0.0000001").toString(), std::string("0.0000001"));
+    CHECK_EQ(eval("123456789012345678901234567890").toString(),
+             std::string("123456789012345678901234567890"));
+}
 
-    threw = false;
-    try { eval("unknown(1)"); } catch (const hpc::ExpressionError&) { threw = true; }
-    CHECK(threw);
+// --- 取余 ---
+
+TEST(expression, modulo) {
+    CHECK_EQ(eval("7%3").toString(), std::string("1"));
+    CHECK_EQ(eval("10%3").toString(), std::string("1"));
+    CHECK_EQ(eval("10%1").toString(), std::string("0"));
+    CHECK_EQ(eval("10%20").toString(), std::string("10"));
+}
+
+TEST(expression, moduloSignFollowsDividend) {
+    // 符号跟随被除数（与 C 的 % 一致）。
+    CHECK_EQ(eval("-7%3").toString(), std::string("-1"));
+    CHECK_EQ(eval("7%-3").toString(), std::string("1"));
+    CHECK_EQ(eval("-7%-3").toString(), std::string("-1"));
+}
+
+TEST(expression, moduloWithFractionalOperands) {
+    // 内核的取余是「整数余数」语义，但实现上是把两个数对齐到共同的小数位
+    // 再做整数长除法 —— 等价于 C 的 fmod：
+    //   5.5 = 2 * 2 + 1.5  → 5.5 % 2 = 1.5
+    //   10 = 0.3 * 33 + 0.1 → 10 % 0.3 = 0.1
+    CHECK_EQ(eval("5.5%2").toString(), std::string("1.5"));
+    CHECK_EQ(eval("10%0.3").toString(), std::string("0.1"));
+    CHECK_EQ(eval("-5.5%2").toString(), std::string("-1.5"));
+}
+
+// --- 错误 ---
+
+TEST(expression, syntaxErrors) {
+    CHECK(evalOrError("1+").rfind("!", 0) == 0);
+    CHECK(evalOrError("(1+2").rfind("!", 0) == 0);
+    CHECK(evalOrError("1+*2").rfind("!", 0) == 0);
+    CHECK(evalOrError("1.2.3").rfind("!", 0) == 0);
+    CHECK(evalOrError("*").rfind("!", 0) == 0);
+    CHECK(evalOrError("()").rfind("!", 0) == 0);
+    CHECK(evalOrError("1 2").rfind("!", 0) == 0);
+    CHECK(evalOrError(")").rfind("!", 0) == 0);
+    CHECK(evalOrError("1)").rfind("!", 0) == 0);
+}
+
+TEST(expression, divisionByZero) {
+    CHECK(evalOrError("1/0").rfind("!", 0) == 0);
+    CHECK(evalOrError("1/(2-2)").rfind("!", 0) == 0);
+    CHECK(evalOrError("1%0").rfind("!", 0) == 0);
+    // 抛的是 ExpressionError（不是内核的 domain_error）。
+    int position = -1;
+    std::string message;
+    CHECK(!tryEval("1/0", position, message));
+    CHECK(!tryEval("1/0", position, message));
+}
+
+TEST(expression, domainErrorsAreExpressionErrors) {
+    // sqrt(-1)、ln(0)、log10(0) 在内核里是 std::domain_error，
+    // 表达式层必须把它们变成 ExpressionError。
+    int position = -1;
+    std::string message;
+
+    CHECK(!tryEval("sqrt(-1)", position, message));
+    CHECK(!tryEval("ln(0)", position, message));
+    CHECK(!tryEval("log10(-1)", position, message));
+    CHECK(!tryEval("pow(0,0)", position, message));
+    CHECK(!tryEval("pow(-2,0.5)", position, message));
+
+    // 内核的其它异常类型也必须被转换。
+    bool caughtAsExpressionError = false;
+    try {
+        hpc::evaluate("exp(99999999)", Context{20, RoundingMode::HalfEven});
+    } catch (const ExpressionError&) {
+        caughtAsExpressionError = true;
+    } catch (const std::exception&) {
+        caughtAsExpressionError = false;
+    }
+    CHECK(caughtAsExpressionError);
+}
+
+TEST(expression, unknownFunction) {
+    CHECK(evalOrError("unknown(1)").rfind("!", 0) == 0);
+    CHECK(evalOrError("foo()").rfind("!", 0) == 0);
+    // 裸标识符（没有 '('）也是错误。
+    CHECK(evalOrError("x").rfind("!", 0) == 0);
+    CHECK(evalOrError("sqrt").rfind("!", 0) == 0);
+}
+
+TEST(expression, wrongArgumentCount) {
+    CHECK(evalOrError("sqrt()").rfind("!", 0) == 0);
+    CHECK(evalOrError("sqrt(1,2)").rfind("!", 0) == 0);
+    CHECK(evalOrError("pow(2)").rfind("!", 0) == 0);
+    CHECK(evalOrError("pow(2,3,4)").rfind("!", 0) == 0);
+    CHECK(evalOrError("abs()").rfind("!", 0) == 0);
+}
+
+// --- 错误位置 ---
+//
+// 位置必须指向**出错的字符本身**，而不是笼统的 0。
+// 「表达式意外结束」这类错误没有 offending 字符，位置指向串尾。
+
+TEST(expression, errorPositions) {
+    checkErrorAt("1+", 2);          // 串尾：缺失的操作数
+    checkErrorAt("1+*2", 2);        // '*' 不是一个合法的操作数开头
+    checkErrorAt("(1+2", 4);        // 串尾：缺失的 ')'
+    checkErrorAt("1/0", 2);         // 除数 '0' 所在的位置
+    checkErrorAt("1%0", 2);         // 除数 '0' 所在的位置
+    checkErrorAt("sqrt(-1)", 5);    // 出错的实参 '-1' 的起点
+    checkErrorAt("ln(0)", 3);       // 出错的实参 '0' 的起点
+    checkErrorAt("unknown(1)", 0);  // 未知的函数名
+    checkErrorAt("sqrt()", 0);       // 参数个数不对 → 函数名
+    checkErrorAt("pow(2)", 0);      // 参数个数不对 → 函数名
+    checkErrorAt("1.2.3", 3);       // 第二个小数点
+    checkErrorAt("0b2", 2);          // '2' 不是二进制数位
+    checkErrorAt("0x", 2);          // 前缀后没有数位
+    checkErrorAt("1e", 1);          // 指数部分非法 → 'e'
+    checkErrorAt("1e+", 1);         // 指数部分非法 → 'e'
+    checkErrorAt(")", 0);           // 多余的字符
+    checkErrorAt("1)2", 1);         // 多余的字符
+    checkErrorAt("1+2)", 3);        // 多余的字符
+    checkErrorAt("()", 1);          // 括号里什么都没有
+}
+
+TEST(expression, errorPositionForUnknownIdentifier) {
+    // 裸标识符的位置指向标识符的起点。
+    checkErrorAt("   x", 3);
+    checkErrorAt("1 + foo", 4);
+}
+
+TEST(expression, errorPositionForBaseDigits) {
+    // 进制字面量的非法数位：位置指向那个字符。
+    checkErrorAt("0b2", 2);
+    checkErrorAt("0xzz", 2);
+    checkErrorAt("0b1e5", 3);
+    checkErrorAt("0o8", 2);
+}
+
+// --- 嵌套深度 ---
+
+TEST(expression, deepNestingIsRejectedCleanly) {
+    // 300 层括号：超过上限，必须是**干净的错误**而不是崩溃。
+    std::string text(300, '(');
+    text += "1";
+    text += std::string(300, ')');
+    int position = -1;
+    std::string message;
+    CHECK(!tryEval(text, position, message));
+    CHECK(position >= 0);
+
+    // 100 层（低于上限）必须能正常算出。
+    std::string shallow(100, '(');
+    shallow += "1+2";
+    shallow += std::string(100, ')');
+    CHECK_EQ(eval(shallow).toString(), std::string("3"));
+}
+
+TEST(expression, deepFunctionNestingIsRejectedCleanly) {
+    std::string text;
+    for (int i = 0; i < 300; ++i) text += "sqrt(";
+    text += "4";
+    for (int i = 0; i < 300; ++i) text += ")";
+    int position = -1;
+    std::string message;
+    CHECK(!tryEval(text, position, message));
+    CHECK(position >= 0);
+}
+
+// --- 精度 ---
+
+TEST(expression, precisionIsSignificantDigits) {
+    // 精度是**有效数字位**，不是小数位数。
+    // 1/3 @ 20 位有效数字 → 20 位小数（因为结果在 0 与 1 之间）。
+    CHECK_EQ(eval("1/3").toString(), std::string("0.33333333333333333333"));
+    // 12345/1 @ 3 位有效数字 → 12300（3 位有效数字）。
+    CHECK_EQ(eval("12345/1", 3, RoundingMode::HalfEven).toString(),
+             std::string("12300"));
+    // 1000/3 @ 3 位有效数字 → 333（3 位有效数字，不是 3 位小数）。
+    CHECK_EQ(eval("1000/3", 3, RoundingMode::HalfEven).toString(), std::string("333"));
+    // 纯字面量不受精度影响（没有运算就没有舍入）。
+    CHECK_EQ(eval("12345", 3, RoundingMode::HalfEven).toString(),
+             std::string("12345"));
+    // 12345 + 0 仍是精确的加法。
+    CHECK_EQ(eval("12345+0", 3, RoundingMode::HalfEven).toString(),
+             std::string("12345"));
+}
+
+TEST(expression, roundingModesAffectDivision) {
+    // 1/2 是**精确**的（二进制可表示），不需要舍入 —— 所以 p=1 下
+    // 仍然是 0.5。舍入只在商**不精确**时才起作用。
+    CHECK_EQ(eval("1/2", 1, RoundingMode::HalfEven).toString(), std::string("0.5"));
+    CHECK_EQ(eval("-1/2", 1, RoundingMode::HalfEven).toString(), std::string("-0.5"));
+    // 5/2 = 2.5，p=1 下正好是一半：HalfEven → 2（偶数），HalfUp → 3。
+    CHECK_EQ(eval("5/2", 1, RoundingMode::HalfEven).toString(), std::string("2"));
+    CHECK_EQ(eval("5/2", 1, RoundingMode::HalfUp).toString(), std::string("3"));
+    CHECK_EQ(eval("-5/2", 1, RoundingMode::HalfEven).toString(), std::string("-2"));
+    CHECK_EQ(eval("-5/2", 1, RoundingMode::HalfUp).toString(), std::string("-3"));
+    // 15/10 = 1.5，p=1 下正好是一半：HalfEven → 2（偶数）。
+    CHECK_EQ(eval("15/10", 1, RoundingMode::HalfEven).toString(), std::string("2"));
+    CHECK_EQ(eval("15/10", 1, RoundingMode::HalfUp).toString(), std::string("2"));
+    // Down 向零截断，Up 远离零。
+    CHECK_EQ(eval("15/10", 1, RoundingMode::Down).toString(), std::string("1"));
+    CHECK_EQ(eval("15/10", 1, RoundingMode::Up).toString(), std::string("2"));
+    CHECK_EQ(eval("-15/10", 1, RoundingMode::Down).toString(), std::string("-1"));
+    CHECK_EQ(eval("-15/10", 1, RoundingMode::Up).toString(), std::string("-2"));
+    // Ceil 向 +∞，Floor 向 -∞。
+    CHECK_EQ(eval("15/10", 1, RoundingMode::Ceil).toString(), std::string("2"));
+    CHECK_EQ(eval("15/10", 1, RoundingMode::Floor).toString(), std::string("1"));
+    CHECK_EQ(eval("-15/10", 1, RoundingMode::Ceil).toString(), std::string("-1"));
+    CHECK_EQ(eval("-15/10", 1, RoundingMode::Floor).toString(), std::string("-2"));
+    // 1/3 在 p=3 下是 0.333…，六种模式给出不同的结果。
+    CHECK_EQ(eval("1/3", 3, RoundingMode::HalfEven).toString(), std::string("0.333"));
+    CHECK_EQ(eval("1/3", 3, RoundingMode::HalfUp).toString(), std::string("0.333"));
+    CHECK_EQ(eval("1/3", 3, RoundingMode::Down).toString(), std::string("0.333"));
+    CHECK_EQ(eval("1/3", 3, RoundingMode::Up).toString(), std::string("0.334"));
+    CHECK_EQ(eval("1/3", 3, RoundingMode::Ceil).toString(), std::string("0.334"));
+    CHECK_EQ(eval("1/3", 3, RoundingMode::Floor).toString(), std::string("0.333"));
+    // 2/3 在 p=3 下是 0.666…，向下取整时 0.666，向上取整时 0.667。
+    CHECK_EQ(eval("2/3", 3, RoundingMode::Down).toString(), std::string("0.666"));
+    CHECK_EQ(eval("2/3", 3, RoundingMode::Up).toString(), std::string("0.667"));
+    CHECK_EQ(eval("-2/3", 3, RoundingMode::Down).toString(), std::string("-0.666"));
+    CHECK_EQ(eval("-2/3", 3, RoundingMode::Up).toString(), std::string("-0.667"));
+    CHECK_EQ(eval("-2/3", 3, RoundingMode::Ceil).toString(), std::string("-0.666"));
+    CHECK_EQ(eval("-2/3", 3, RoundingMode::Floor).toString(), std::string("-0.667"));
+}
+
+TEST(expression, transcendentalPrecisionCeiling) {
+    // 默认精度 30 必须能算 sqrt(2)。
+    CHECK_EQ(eval("sqrt(2)", 30, RoundingMode::HalfEven).toString(),
+             std::string("1.41421356237309504880168872421"));
+
+    // 精度超过 kMaxTranscendentalPrecision（1000）时抛 ExpressionError，
+    // 而不是静默降精度，也不是漏出 std::invalid_argument。
+    int position = -1;
+    std::string message;
+    CHECK(!tryEvalAt("sqrt(2)", 1001, RoundingMode::HalfEven, position, message));
+    CHECK(position >= 0);
+    CHECK(!tryEvalAt("exp(1)", 1001, RoundingMode::HalfEven, position, message));
+    CHECK(!tryEvalAt("ln(2)", 1001, RoundingMode::HalfEven, position, message));
+    CHECK(!tryEvalAt("log10(2)", 1001, RoundingMode::HalfEven, position, message));
+    // pow 的**非整数指数**分支同样受限。
+    CHECK(!tryEvalAt("pow(2,0.5)", 1001, RoundingMode::HalfEven, position, message));
+
+    // 上限之内（正好 1000）必须能算。
+    CHECK(tryEvalAt("sqrt(2)", 1000, RoundingMode::HalfEven, position, message));
+
+    // 只做加减乘除的表达式不受这个上限约束（kMaxPrecision = 100000）。
+    // 1/3 @ 5000 位有效数字 → "0." + 5000 个 3。
+    const std::string third = eval("1/3", 5000, RoundingMode::HalfEven).toString();
+    CHECK_EQ(third.size(), static_cast<std::size_t>(5002));
+    CHECK_EQ(third.substr(0, 4), std::string("0.33"));
+    CHECK_EQ(third.substr(third.size() - 3), std::string("333"));
+
+    // pow 的**整数指数**分支是精确运算，同样不受这个上限约束。
+    CHECK_EQ(eval("pow(2,10)", 2000, RoundingMode::HalfEven).toString(),
+             std::string("1024"));
+}
+
+TEST(expression, precisionOutOfRange) {
+    // 精度越界是**上下文错误**，与表达式内容无关 —— 位置取 0。
+    // 注意：即使表达式里没有除法，精度越界也要报错（精度是全局契约，
+    // 静默忽略会让用户以为拿到了 0 位或 100001 位的答案）。
+    int position = -1;
+    std::string message;
+
+    const bool threwNonPositive = [&]() {
+        try {
+            hpc::evaluate("1+1", Context{0, RoundingMode::HalfEven});
+        } catch (const ExpressionError& e) {
+            position = e.position();
+            message = e.what();
+            return true;
+        }
+        return false;
+    }();
+    CHECK(threwNonPositive);
+    CHECK_EQ(position, 0);
+    CHECK(!message.empty());
+
+    const bool threwNegative = [&]() {
+        try {
+            hpc::evaluate("1+1", Context{-5, RoundingMode::HalfEven});
+        } catch (const ExpressionError&) {
+            return true;
+        }
+        return false;
+    }();
+    CHECK(threwNegative);
+
+    const bool threwTooBig = [&]() {
+        try {
+            hpc::evaluate("1+1", Context{hpc::kMaxPrecision + 1, RoundingMode::HalfEven});
+        } catch (const ExpressionError& e) {
+            position = e.position();
+            message = e.what();
+            return true;
+        }
+        return false;
+    }();
+    CHECK(threwTooBig);
+    CHECK_EQ(position, 0);
+
+    // 正好在上限之内是合法的。
+    CHECK(tryEvalAt("1+1", hpc::kMaxPrecision, RoundingMode::HalfEven, position, message));
+}
+
+// --- 结构安全：空集合 / 单元素 / 边界 ---
+
+TEST(expression, structuralSafety) {
+    // 单元素与空输入都不该崩溃。
+    CHECK_EQ(eval("0").toString(), std::string("0"));
+    CHECK_EQ(eval("1").toString(), std::string("1"));
+    CHECK(evalOrError("").rfind("!", 0) == 0);
+
+    // 只有一个参数、参数为空的函数。
+    CHECK(evalOrError("abs()").rfind("!", 0) == 0);
+
+    // 除数为零的两个变体。
+    CHECK(evalOrError("1/0.0").rfind("!", 0) == 0);
+    CHECK(evalOrError("1/(0*5)").rfind("!", 0) == 0);
 }
 ```
 
-- [ ] **Step 4: 构建并运行测试**
+- [x] **Step 4: 写 `tests/expression_probe.cpp`（差分探针）**
+
+```cpp
+// 表达式探针：读入一行表达式与可选的精度/舍入模式，输出求值结果。
+//
+// 输入格式（每行一条）：
+//   <precision> <mode> <expression>
+//   precision 是有效数字位，mode 取 HalfEven/HalfUp/Down/Up/Ceil/Floor。
+// 表达式的其余部分原样传给 hpc::evaluate —— 表达式里可以含空格，
+// 所以模式与表达式之间用一个制表符分隔。
+//
+// 输出：成功时是十进制结果；失败时是 "ERROR"。
+//
+// **错误消息不输出**：消息是中文的，Windows 控制台默认的 GBK 代码页下
+// 管道解码会失败（scripts/verify_expression.py 读 stdout 时抛
+// UnicodeDecodeError）。差分脚本只需要知道「成功还是失败」，
+// 错误消息的细节由单元测试覆盖。
+//
+// 供 scripts/verify_expression.py 做 Python 差分验证。
+#include <iostream>
+#include <sstream>
+#include <string>
+
+#include "core/Expression.h"
+
+namespace {
+
+hpc::RoundingMode parseMode(const std::string& name) {
+    if (name == "HalfUp") return hpc::RoundingMode::HalfUp;
+    if (name == "Down") return hpc::RoundingMode::Down;
+    if (name == "Up") return hpc::RoundingMode::Up;
+    if (name == "Ceil") return hpc::RoundingMode::Ceil;
+    if (name == "Floor") return hpc::RoundingMode::Floor;
+    return hpc::RoundingMode::HalfEven;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    std::ios::sync_with_stdio(false);
+
+    // 缺省精度。
+    int defaultPrecision = 20;
+    if (argc > 1) {
+        try {
+            defaultPrecision = std::stoi(argv[1]);
+        } catch (const std::exception&) {
+            defaultPrecision = 20;
+        }
+    }
+    if (defaultPrecision <= 0) defaultPrecision = 20;
+
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+
+        // 头是两个制表符分隔的字段：<precision>、<mode>，其余是表达式。
+        //
+        // 表达式里可以有空格，所以分隔符必须用制表符（表达式本身不含制表符）。
+        const std::size_t firstTab = line.find('\t');
+        if (firstTab == std::string::npos) {
+            std::cout << "ERROR\n";
+            continue;
+        }
+        const std::size_t secondTab = line.find('\t', firstTab + 1);
+        if (secondTab == std::string::npos) {
+            std::cout << "ERROR\n";
+            continue;
+        }
+
+        std::istringstream header(line.substr(firstTab + 1, secondTab - firstTab - 1));
+        std::string modeName;
+        header >> modeName;
+        if (modeName.empty()) modeName = "HalfEven";
+
+        int precision = defaultPrecision;
+        std::istringstream precisionField(line.substr(0, firstTab));
+        precisionField >> precision;
+        if (precision <= 0) precision = defaultPrecision;
+
+        const std::string expression = line.substr(secondTab + 1);
+
+        try {
+            const hpc::Context context{precision, parseMode(modeName)};
+            const hpc::BigDecimal result = hpc::evaluate(expression, context);
+            std::cout << result.toString() << "\n";
+        } catch (const hpc::ExpressionError&) {
+            std::cout << "ERROR\n";
+        } catch (const std::exception&) {
+            std::cout << "ERROR\n";
+        }
+    }
+    return 0;
+}
+```
+
+- [x] **Step 5: 写 `scripts/verify_expression.py`（Python 差分）**
+
+参考实现用 `fractions.Fraction` 做**精确**有理数运算（+ - * % 和字面量），
+用 `decimal` 做超越函数。C++ 端的精度是**有效数字位**（同 Python 的
+`prec`），所以参考值也要量化到同样的有效数字位数。
+
+关键点：**加、减、乘在 C++ 端是精确运算**（内核的 `operator+`/`-`/`*`
+不接受 Context），所以这些用例用 Fraction 精确比较；只有除法与超越函数
+才按精度舍入。求值模型必须与内核一致，否则差分会报一堆假阳性。
+
+**实测**：1589 / 1589 通过。
+
+- [x] **Step 6: 构建并运行测试**
 
 ```bash
 ./scripts/build-core.bat && ./scripts/run-ctest.bat
 ```
-预期：全部通过。
+预期：全部通过（142 / 142）。
 
-- [ ] **Step 5: 提交**
+**实测**：MSVC 与 GCC 都是 142 / 142，零警告。
+
+- [x] **Step 7: 提交**
 
 ```bash
-git add src/core/Expression.h src/core/Expression.cpp tests/tst_expression.cpp
+git add src/core/Expression.h src/core/Expression.cpp tests/tst_expression.cpp \
+        tests/expression_probe.cpp scripts/verify_expression.py CMakeLists.txt
 git commit -m "feat(core): 表达式解析与求值器"
 ```
 
 ---
+
+#### 初稿缺陷清单（本任务修正的 12 处）
+
+brief 的代码是**从未运行过的初稿**。下表的每一行都由
+`.superpowers/sdd/brief_vs_mine.cpp`（把 brief 原样抄一份与本实现对照跑）
+或 `brief_depth.cpp`（深嵌套实测）**实测确认**，不是推理。
+
+| # | 位置 | 缺陷 | 实测证据 | 后果 | 修法 |
+|---|------|------|---------|------|------|
+| 1 | `parseNumber` | 十进制字面量只扫描 `[0-9.]`，**不认识科学计数法** | brief: `1e5` → `ExpressionError(pos=1): 多余的字符`；`2.5e-3` → 同样报错 | 用户无法输入 `1e20`、`2.5e-3` —— 而 `BigDecimal::fromString` 早就支持科学计数法了 | 十进制字面量支持 `(e|E)[+|-]数字`；`'e'` 后没有数字时报「指数部分非法」，位置指向那个 `'e'` |
+| 2 | `parseNumber` | 进制字面量用 `isalnum` 扫描数位，把 `e`/`E` 也当成数位 | brief: `0x1e5` → 485（**恰好对**，但靠的是 `fromBaseString` 恰好接受 `e`）；`0b1e5` → `ExpressionError(pos=5): 非法的进制数字`，位置指向串尾而不是 `'e'` | 二进制下 `'e'` 是非法数位，错误位置指错 | 数位扫描改成 `isBaseDigit(c, base)`（**按进制**判定）；数位后紧跟字母数字时，位置指向那个字符 |
+| 3 | `parsePrimary` | 递归**没有深度上限**，括号嵌套几百层就把栈跑穿 | brief: 5000 层括号 → 进程崩溃（exit 127，无输出）；2000 层正常 | **崩溃**，不是可捕获的异常 —— 前端连错误提示都来不及显示 | 加 `kMaxExpressionNestingDepth = 256`，超限抛 `ExpressionError`（带位置） |
+| 4 | `parseUnary` | 一元符号用**递归**实现（`return parseUnary()`） | brief: 50000 个 `-` → 进程崩溃（exit 127） | 同上 | 改成**迭代**：先吃掉所有一元符号并记录取反奇偶，再解析 primary。一元符号链一定是平的，所以语义不变 |
+| 5 | `callFunction` | 内核抛的 `domain_error` / `overflow_error` / `invalid_argument` **原样漏出**，不是 `ExpressionError` | brief: `sqrt(-1)` → `domain_error`；`exp(99999999)` → `overflow_error`；`sqrt(2)` @p=1001 → `invalid_argument` | 前端要 catch **三种**异常类型；plan 里的 Task 7 CLI 只 catch `hpc::ExpressionError`，`sqrt(-1)` 会直接终止程序 | 在 `callFunction` 里按类型转成 `ExpressionError`；`evaluate` 另加一层兜底 catch，保证前端只需 catch 一种类型 |
+| 6 | `evaluate` | **完全不检查精度** | brief: `1/3` @p=0 → `invalid_argument: BigDecimal: precision 必须为正`（漏出内核异常） | 同上 | 进解析器之前检查 `precision ∈ [1, kMaxPrecision]`，越界抛 `ExpressionError`（位置 0 —— 精度是上下文错误，不是字符错误） |
+| 7 | `parseTerm` / `callFunction` | 超越函数的精度上限**没有前置检查**，靠内核抛 | brief: `sqrt(2)` @p=1001 → `invalid_argument` 漏出 | 同上 | 在调用前检查 `precision > kMaxTranscendentalPrecision`，给出带上下文的错误消息。**pow 分开处理**：整数指数分支是精确运算，不受此限（与内核一致） |
+| 8 | `fail()` | 错误位置一律用 `position_`，很多情况下指的是**出错的字符之后** | brief: `1/0` → pos=3（串尾，应指除数 `0`）；`unknown(1)` → pos=10（串尾，应指函数名）；`sqrt()` → pos=6（串尾） | 位置基本没用：前端没法高亮出错的字符 | 位置改为指向**出错的字符本身**：除数为零 → 除数的起点；未知函数/参数个数不对 → 函数名的起点；定义域错误 → 出错实参的起点 |
+| 9 | `parseNumber` | 进制字面量的错误信息把**任何**异常都吞成「非法的进制数字」，且 `digits.empty()` 时位置在串尾 | brief: `0xzz` → pos=4（串尾） | 位置指错 | 空数位与非法数位分开报错，位置指向那个字符 |
+| 10 | `parsePrimary` | **不接受** `.5`（只认 `isdigit` 开头） | brief: `.5` → `ExpressionError(pos=0): 意外的字符` | `.5` 是常见的写法，用户会以为是语法错误 | `parsePrimary` 也接受 `'.'` 开头 |
+| 11 | `parse` | 空表达式报「表达式意外结束」 | brief: `""` → `ExpressionError(pos=0): 表达式意外结束` | 信息误导：空输入不是「意外结束」，是「什么都没给」 | 单独的「表达式为空」错误 |
+| 12 | `parseIdentifier` | 裸标识符（`x`）与未知函数（`foo()`）的位置都在串尾 | brief: `x` → pos=1（串尾）；`foo()` → pos=5 | 同 8 | 位置指向标识符的起点 |
+
+另外两处 brief 之外、**实现过程中实测发现**的问题：
+
+| # | 位置 | 问题 | 修法 |
+|---|------|------|------|
+| 13 | `parseDecimalLiteral` | `1.2.3` 报的是「多余的字符」（字面量停在 `1.2`，剩下的 `.3` 由 `parse()` 兜住） | 位置对但**信息误导**（用户看到「多余」，实际是「多点」）。小数部分之后又出现小数点时直接报「小数点重复」，位置指向那个点 |
+| 14 | `tests/tst_expression.cpp` | 测试框架的 main 循环**不捕获**异常 —— 一个用例抛出异常会直接终止整个测试二进制，后面几十个用例一个都跑不到 | 测试辅助函数 `eval()` 把 `ExpressionError` 转成**失败的断言**而不是让它外泄。这不是「测试框架的 bug」，是「测试辅助函数必须自己兜住异常」 |
+
+#### 语义决策（与 brief 的差异）
+
+| 项 | brief | 本实现 | 理由 |
+|----|-------|--------|------|
+| 精度上限的处理 | 靠内核抛异常 | 前置检查并抛 `ExpressionError`；**不静默降精度** | 静默地把 5000 位降成 1000 位，等于给用户一个他没要求的答案，而错误信息里看不出这一点。前端要「夹到上限」的行为，自己在调用前夹（plan 的 Task 8 Web 前端已经这么做了） |
+| 超越函数精度的检查时机 | 无 | **只在真的用上超越函数时**才检查 | 只做加减乘除的表达式在 `kMaxPrecision`（100000）位以内都是合法的。在 `evaluate` 入口一刀切地按 1000 夹，会让 `1/3` @p=5000 这种合法的请求失败 |
+| `pow` 的精度上限 | 无 | 整数指数分支**不受** `kMaxTranscendentalPrecision` 约束，只有非整数指数分支受 | 与内核一致（内核的快速幂是精确运算，工作精度与超越函数无关） |
+| 取余的语义 | 直接调 `BigDecimal::modulo` | 同样调 `modulo`，并在注释里写明它是「整数余数但对齐小数位」的语义 | 实测：`5.5 % 2 = 1.5`（等价于 C 的 `fmod`），`10 % 0.3 = 0.1`，`-5.5 % 2 = -1.5`（符号跟随被除数）。**不是**「先取整再取余」（那是 `5 % 2 = 1`）。这是内核既有的契约，表达式层如实透传并记录 |
+| 除数为零的检查 | 在 `parseTerm` 里检查，但位置在串尾 | 位置改为**除数的起点** | 位置要能用来高亮 |
+| 定义域错误的类型 | 漏出 `std::domain_error` | 转成 `ExpressionError` | 前端只需 catch 一种类型；plan 的 Task 7 CLI 只 catch `hpc::ExpressionError` |
+| 嵌套深度上限 | 无 | 256 层（`kMaxExpressionNestingDepth`） | 正常表达式远远用不到；超限时报错而不是崩溃 |
+| 一元符号链的实现 | 递归 | 迭代 | 一万个 `-` 不该把栈跑穿 |
+| 错误消息的语言 | 中文 | 中文 | 与内核一致；但**探针的输出是纯 ASCII**（`ERROR`），因为 Windows 控制台默认 GBK 代码页下 Python 读管道会抛 `UnicodeDecodeError` |
+
+#### 错误位置的约定
+
+`position()` 指向**出错的字符本身**；「表达式意外结束」这类没有 offending
+字符的错误，位置指向**串尾**（缺失的字符本该出现的地方）。
+
+| 表达式 | 位置 | 指向 |
+|--------|------|------|
+| `1+` | 2 | 串尾（缺失的操作数） |
+| `1/0` | 2 | 除数 `0` |
+| `1%0` | 2 | 除数 `0` |
+| `sqrt(-1)` | 5 | 出错的实参 `-1` 的起点 |
+| `ln(0)` | 3 | 出错的实参 `0` 的起点 |
+| `unknown(1)` | 0 | 未知的函数名 |
+| `sqrt()` | 0 | 参数个数不对 → 函数名 |
+| `1.2.3` | 3 | 第二个小数点 |
+| `0b2` | 2 | 非法数位 `2` |
+| `0x` | 2 | 串尾（前缀后没有数位） |
+| `1e` | 1 | 指数部分非法的那个 `e` |
+| `1)2` | 1 | 多余的字符 `)` |
+| `   x` | 3 | 未知标识符 `x` 的起点 |
+
+#### 差分测试的变异验证
+
+差分脚本本身也要证明「能抓错」。往实现里注入两个已知的错误，确认脚本
+报出对应的失败数：
+
+| 注入的错误 | 差分脚本的结果 |
+|------------|---------------|
+| `-` 改成**右结合**（`a-b-c` 变成 `a-(b-c)`） | 1549 / 1589 —— 40 个用例失败 |
+| 取余的符号跟随**除数**（应为被除数） | 1412 / 1589 —— 177 个用例失败 |
+
+两次注入都在还原后回到 1589 / 1589。
 
 ### Task 7: 命令行前端
 
