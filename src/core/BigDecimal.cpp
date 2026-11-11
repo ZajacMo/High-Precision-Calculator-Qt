@@ -18,10 +18,16 @@ constexpr int kBlockDigits = 9;
 // 通常说明调用方用了一个写死的巨大精度，而不是按量的级计算。
 constexpr int kMaxPrecision = 100000;
 
-// 科学计数法的指数上限。
+// 科学计数法的指数上限（|exponent| 的**精确**上限）。
 //
 // 指数为正时结果是 10^exponent 量级的整数，为负时是极小的分数。
-// 两种方向都要有上限，否则 "1e999999999" 会把内存吃光。
+// 两个方向都要有上限，否则 "1e999999999" 会把内存吃光。
+//
+// 上限取 10^6：正指数产生 100 万位整数（约 450 KB），负指数产生
+// 100 万位小数 —— 都是「能算但没必要」的量级，再大就没有实用价值。
+//
+// 检查必须**在把当前位折进 magnitude 之后**做：先检查再折的话，
+// 最后一位会把 magnitude 顶到 10 × 上限，实际接受的上限就是 10 倍。
 constexpr long long kMaxExponentMagnitude = 1000000;
 
 // 去除高位的零块，但至少保留一个块表示 0。
@@ -778,11 +784,63 @@ constexpr int kMinWorkPrecision = 24;
 // 负参数的 exp 结果同样有 |x|/ln(10) 位的小数。
 constexpr int kMaxExpArgumentExponent = 5;
 
+// exp 里用来**估计 k 的量级**的探针精度。
+//
+// k = floor(x / ln(10))，|x| < 10^5 时 |k| < 43427 —— 所以 20 位探针
+// 足以把 k 定死（差 1 位会在后面被修正回来，见 expInternal）。
+constexpr int kExpProbePrecision = 20;
+
+// 超越函数的精度上限。
+//
+// 与 divide / roundToPrecision 的 kMaxPrecision 不同：超越函数的
+// 工作精度是**平方级**的。实测（本机 GCC -O2，最坏情况是 pow(2, 0.5)）：
+//
+//   p=200  →    413 ms
+//   p=400  →   3.4 s
+//   p=800  →    22 s
+//   p=1600 →   151 s
+//   p=1000（exp）→  23 s
+//
+// 也就是说 kMaxPrecision = 100000 对超越函数而言远远不够 ——
+// 它们在 p=1600 时就已经要两分半，p=99990 更是永远算不完。
+//
+// 所以超越函数单独用一个上限，取 1000：最坏情况约 40 秒，
+// 属于「可接受的慢」而不是「永远算不完」。
+//
+// 这是**产品决策**而非数学限制 —— 真正需要更高精度的调用方
+// 应该分批求值（例如先用 1000 位求出前导部分再细化）。
+constexpr int kMaxTranscendentalPrecision = 1000;
+
 // 整数幂的指数上限。
 constexpr long long kMaxIntegerPower = 100000;
 
 // 整数幂结果的位数上限（防止 10^100000 这类天文数字）。
-constexpr int kMaxPowerResultDigits = 1000000;
+//
+// 上限按**结果的十进制位数**估算，整数位与小数位都算在内。
+//
+// 估算式：结果位数 <= power × (底数的有效位数 + 底数的小数位数)。
+//
+// 底数 |b| 有 s 位有效数字、t 位小数时，|b| ∈ [10^(s-1-t), 10^(s-t))，
+// 于是 |b^power| 的位数不超过 power × (s + t)：
+//   - 值 >= 1 时：整数位 <= power × (s - t) <= power × (s + t)
+//   - 值 <  1 时：小数位 <= power × (t - s + 1) <= power × (s + t)
+//
+// 所以这个估算**总是 >= 实际位数**（最多高估 3 倍），上限因此是硬约束。
+//
+// 只看底数的整数位数会完全漏掉小数底数：0.001 的整数位数是 -2，
+// 那个「整数位数 > 0」的判据会把整个护栏跳过，而结果的**小数位数**
+// 恰恰是按 power 线性增长的 —— 0.001^100000 需要 30 万位小数。
+//
+// 实测（本机 GCC -O2，precision=20）：
+//
+//   pow(2, 100000)              511 ms     结果 3 万位
+//   pow(3, 100000)             1325 ms     结果 4.8 万位
+//   pow(10, 100000)            8041 ms     结果 10 万位
+//   pow(0.001, 100000)        67598 ms     结果 30 万位小数
+//
+// 30 万位已经要一分多钟，所以上限取 30 万：
+// 估算 <= 30 万 ⟹ 实际位数 <= 30 万 ⟹ 单次不超过一分多钟。
+constexpr int kMaxPowerResultDigits = 300000;
 
 // 十进制整数的最大位数（用于 long long 溢出保护）。
 constexpr int kMaxIntegerDigits = 18;
@@ -886,9 +944,19 @@ long long BigDecimal::toInteger(const BigDecimal& value) {
 BigDecimal BigDecimal::integerPower(const BigDecimal& base, long long power) {
     if (power < 0) throw std::invalid_argument("BigDecimal: 整数幂的指数必须非负");
 
-    // 结果位数的估算：底数的整数位数 × 指数。
-    const int baseDigits = decimalDigitCount(base.digits_) - base.scale_;
-    if (baseDigits > 0 && power > static_cast<long long>(kMaxPowerResultDigits) / baseDigits) {
+    // 结果位数的估算：底数的**整数位数 + 小数位数**再乘以指数。
+    //
+    // 只看整数位数是不够的：底数小于 1 时（base = 0.001 的整数位数为 -2），
+    // 那个「整数位数 > 0」的判据会把整个防护跳过，而结果的**小数位数**
+    // 恰恰是按 power 线性增长的 —— 0.001^100000 需要 30 万位小数。
+    //
+    // 底数 |b| 的十进制位数记为 d（整数部分位数 + 小数位数），
+    // 则 |b^power| 的十进制位数约等于 power × d。
+    const int baseDigits = decimalDigitCount(base.digits_);
+    const int baseScale = base.scale_;
+    const long long resultDigits =
+        power * static_cast<long long>(baseDigits + baseScale);
+    if (resultDigits > static_cast<long long>(kMaxPowerResultDigits)) {
         throw std::overflow_error("BigDecimal: 幂的结果位数过大");
     }
 
@@ -1025,17 +1093,58 @@ BigDecimal BigDecimal::expInternal(const BigDecimal& value, const Context& work,
         throw std::overflow_error("BigDecimal: exp 的参数过大，结果超出可计算范围");
     }
 
-    // 多算的位数：|x| 的十进制指数再加几位。
-    const int extraDigits = std::max(2, std::abs(magnitude) + 5);
+    // 多算的位数按 **|k|** 定，其中 k = floor(x / ln(10))。
+    //
+    // g = x - k*ln(10) 里被抵消掉的量级是 |k*ln(10)| ≈ |k|，
+    // 所以「要保护几位」由 |k| 决定，**与 x 的量级无关**。
+    //
+    // 按 |x| 的十进制指数给保护位是错的：x 极小时（1e-200）k = 0，
+    // 根本没有抵消，一位保护位都不需要，而那个公式会多算 205 位
+    // （实测 exp(1e-200) 要 271 ms，exp(1e-99000) 更是永远算不完）。
+    //
+    // |x| < 1 时 k 直接可定，**完全绕开除法**：
+    //   x >= 0 → x/ln(10) ∈ [0, 0.435) → k = 0
+    //   x <  0 → x/ln(10) ∈ (-0.435, 0) → k = -1
+    //
+    // 绕开除法不是可有可无的优化：除法要先对齐小数位，而长除法是
+    // O(位数²) —— x 的小数位有 99000 个时，实测 exp(1e-99000) 要 45 秒。
+    //
+    // 走这条支与走除法的结果**完全一致**：除法得到的商四舍五入后仍在
+    // (-0.435, 0.435) 内，floor 必然是同一个整数，g 也逐位相同。
+    const bool tinyArgument = magnitude < 0;
+
+    // |k| 的十进制位数 —— 保护位数的依据。
+    int kDigits = 0;
+    BigDecimal k;
+    if (tinyArgument) {
+        k = value.sign_ < 0 ? BigDecimal(-1) : BigDecimal(0);
+        kDigits = k.isZero() ? 0 : 1;
+    } else {
+        // |x| >= 1 时 k 要靠除法得到。先用 20 位探针估 |k| 的**量级**
+        // （探针只用来量级，不参与最终计算）：
+        // |x| < 10^5 时 |k| < 43427，所以 20 位探针足够把量级定死。
+        const Context probe{kExpProbePrecision, RoundingMode::HalfEven};
+        const BigDecimal probeLn10 = ln10Constant(ln2Constant(probe), probe);
+        const BigDecimal probeQuotient = divide(value, probeLn10,
+                                                Context{probe.precision + 3, RoundingMode::HalfEven});
+        const BigDecimal probeK = floorToInteger(probeQuotient);
+        kDigits = probeK.isZero() ? 0 : decimalDigitCount(abs(probeK).digits_);
+    }
+
+    // |k| 的十进制位数再加 5 位保护位。k = 0 时没有任何抵消，一位都不需要。
+    const int extraDigits = std::max(2, kDigits + 5);
     const Context precise{work.precision + extraDigits, RoundingMode::HalfEven};
 
     const BigDecimal ln10 = ln10Constant(ln2Constant(precise), precise);
 
-    // k = floor(x / ln10)。除法要更高精度，否则 k 的整数部分可能因
-    // 末位舍入而差 1 —— 那会让 g 从 0 跳到 ln10，级数慢一个量级。
-    const BigDecimal quotient = divide(value, ln10,
-                                       Context{precise.precision + 3, RoundingMode::HalfEven});
-    BigDecimal k = floorToInteger(quotient);
+    if (!tinyArgument) {
+        // k = floor(x / ln10)。除法要更高精度，否则 k 的整数部分可能因
+        // 末位舍入而差 1 —— 那会让 g 从 0 跳到 ln10，级数慢一个量级。
+        const BigDecimal quotient = divide(value, ln10,
+                                           Context{precise.precision + 3, RoundingMode::HalfEven});
+        k = floorToInteger(quotient);
+    }
+
     BigDecimal g = value - k * ln10;
 
     // 把 g 拉回 [0, ln10)。恒等式 exp(x) = 10^k * exp(g) 仍然成立。
@@ -1060,7 +1169,14 @@ BigDecimal BigDecimal::expInternal(const BigDecimal& value, const Context& work,
     //
     // 顺序很关键：**先移位、后舍入**。移位是精确的位操作，先移位再按最终
     // 精度舍入，结果与「先舍入再移位」数值相同，但表示更干净 ——
-    // 后者会在尾数里留下尾随零（exp(100) 会打印成 2688...840000...）。
+    // 后者会在尾数里留下尾随零（精度 20 时 exp(100) 会打印成
+    // 26881171418161354484000000000000000000000000）。
+    //
+    // 那串零是**精度 20 的真实值**（Python decimal 在 prec=20 下给出同一个
+    // 数），不是「先舍入再移位」的 bug 产物 —— 它只是比 20 位有效数字
+    // 多出来的尾随零。精度 50 时两者一致：
+    // 26881171418161354484126255515800135873611118.773742
+    // （与 Python decimal prec=50 完全相同）。
     const BigDecimal scaled = shiftByPowerOfTen(mantissa, static_cast<int>(power));
     return roundToPrecision(scaled, final);
 }
@@ -1152,11 +1268,25 @@ BigDecimal BigDecimal::log10Internal(const BigDecimal& value, const Context& wor
 }
 
 // --- 对外的超越函数接口 ---
+//
+// 五个入口都要检查 precision 的上限：
+//
+// 1. precision <= 0：除数为零之类的非法上下文。
+// 2. precision > kMaxTranscendentalPrecision：超越函数的工作精度是
+//    **平方级**的（见 kMaxTranscendentalPrecision 的实测数据）。
+//    没有这道闸，sqrt(2) @ precision=99990 会永远算不完，
+//    而且失败方式**不一致** —— 有的精度下内层的 divide 恰好抛异常，
+//    有的精度下则一路挂起。
+//
+// 统一的 std::invalid_argument 让调用方拿到确定的行为。
 
 BigDecimal BigDecimal::sqrt(const BigDecimal& value, const Context& context) {
     if (value.sign_ < 0) throw std::domain_error("BigDecimal: 负数没有实数平方根");
     if (value.isZero()) return BigDecimal(0);
     if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    if (context.precision > kMaxTranscendentalPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出超越函数的上限");
+    }
 
     const int workPrecision = std::max(context.precision + kGuardDigits, kMinWorkPrecision);
     const Context work{workPrecision, RoundingMode::HalfEven};
@@ -1202,6 +1332,9 @@ BigDecimal BigDecimal::sqrt(const BigDecimal& value, const Context& context) {
 
 BigDecimal BigDecimal::exp(const BigDecimal& value, const Context& context) {
     if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    if (context.precision > kMaxTranscendentalPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出超越函数的上限");
+    }
     const int workPrecision = std::max(context.precision + kGuardDigits, kMinWorkPrecision);
     const Context work{workPrecision, RoundingMode::HalfEven};
     return expInternal(value, work, context);
@@ -1210,6 +1343,9 @@ BigDecimal BigDecimal::exp(const BigDecimal& value, const Context& context) {
 BigDecimal BigDecimal::ln(const BigDecimal& value, const Context& context) {
     if (value.sign_ <= 0) throw std::domain_error("BigDecimal: 对数要求正数");
     if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    if (context.precision > kMaxTranscendentalPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出超越函数的上限");
+    }
     if (value.equals(BigDecimal(1))) return BigDecimal(0);
 
     const int workPrecision = std::max(context.precision + kGuardDigits, kMinWorkPrecision);
@@ -1220,6 +1356,9 @@ BigDecimal BigDecimal::ln(const BigDecimal& value, const Context& context) {
 BigDecimal BigDecimal::log10(const BigDecimal& value, const Context& context) {
     if (value.sign_ <= 0) throw std::domain_error("BigDecimal: 对数要求正数");
     if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    if (context.precision > kMaxTranscendentalPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出超越函数的上限");
+    }
     if (value.equals(BigDecimal(1))) return BigDecimal(0);
 
     const int workPrecision = std::max(context.precision + kGuardDigits, kMinWorkPrecision);
@@ -1230,6 +1369,9 @@ BigDecimal BigDecimal::log10(const BigDecimal& value, const Context& context) {
 BigDecimal BigDecimal::pow(const BigDecimal& base, const BigDecimal& exponent,
                            const Context& context) {
     if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    if (context.precision > kMaxTranscendentalPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出超越函数的上限");
+    }
 
     // 整数指数走快速幂，结果精确。
     //

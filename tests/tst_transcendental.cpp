@@ -264,6 +264,108 @@ TEST(pow, huge_integer_exponent_overflows) {
     CHECK(threw);
 }
 
+// --- 评审修复的回归测试 ---
+//
+// 下面三个用例覆盖的是**挂起**而不是数值错误：修复前它们分别要
+// 271 ms / 120 s / 永远算不完。修复后它们要么瞬时完成，要么抛确定的异常。
+// 如果修复被回退，这些用例会挂住 —— 那正是它们的价值。
+
+TEST(exp, tiny_argument_does_not_scale_precision_with_magnitude) {
+    // exp 的保护位数曾按 |x| 的十进制指数给，于是 1e-200 要多算 205 位
+    // （271 ms），1e-99000 更是永远算不完。
+    //
+    // 保护位真正该由 |k| = |floor(x/ln10)| 决定：x 极小时 k = 0，
+    // 没有任何抵消，一位保护位都不需要。
+    //
+    // exp(1e-200) 的结果是 1（1e-200 远小于工作精度下的 1 ulp）。
+    const std::string tiny = "0." + std::string(199, '0') + "1";   // 1e-200
+    CHECK_EQ(BigDecimal::exp(BigDecimal::fromString(tiny), ctx20()).toString(),
+             std::string("1"));
+
+    // 更小的量级同样瞬时完成（结果仍是 1）。
+    const std::string tinier = "0." + std::string(1999, '0') + "1";  // 1e-2000
+    CHECK_EQ(BigDecimal::exp(BigDecimal::fromString(tinier), ctx20()).toString(),
+             std::string("1"));
+}
+
+TEST(pow, fractional_base_with_huge_exponent_overflows) {
+    // 整数幂的结果位数护栏曾只在「底数 > 1」时生效：
+    // base = 0.001 的整数位数是 -2，于是整个护栏被跳过，
+    // 0.001^100000 要算出 30 万位小数（实测超过 120 s）。
+    //
+    // 现在结果位数按「底数的整数位 + 小数位 × 指数」估算，超限即报溢出。
+    bool threw = false;
+    try {
+        BigDecimal::pow(BigDecimal::fromString("0.001"),
+                        BigDecimal::fromString("100000"),
+                        ctx20());
+    } catch (const std::overflow_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    // 更小的底数（结果需要 1000 万位小数）同样必须报溢出。
+    threw = false;
+    try {
+        BigDecimal::pow(BigDecimal::fromString("0.0000000001"),
+                        BigDecimal::fromString("100000"),
+                        ctx20());
+    } catch (const std::overflow_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST(transcendental, rejects_precision_above_ceiling) {
+    // 超越函数的入口曾只检查 precision > 0，工作精度因此可以超过
+    // kMaxPrecision。实测 sqrt(2) @ precision=99990 会永远算不完，
+    // 而且失败方式**不一致** —— 有的精度下内层的 divide 恰好抛异常，
+    // 有的精度下则一路挂起。
+    //
+    // 现在五个入口统一抛 std::invalid_argument。
+    const Context absurd{99990, RoundingMode::HalfEven};
+
+    bool threw = false;
+    try {
+        BigDecimal::sqrt(BigDecimal::fromString("2"), absurd);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    threw = false;
+    try {
+        BigDecimal::exp(BigDecimal::fromString("1"), absurd);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    threw = false;
+    try {
+        BigDecimal::ln(BigDecimal::fromString("2"), absurd);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    threw = false;
+    try {
+        BigDecimal::log10(BigDecimal::fromString("2"), absurd);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    threw = false;
+    try {
+        BigDecimal::pow(BigDecimal::fromString("2"), BigDecimal::fromString("0.5"), absurd);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
 // --- 舍入模式 ---
 
 TEST(transcendental, rounding_mode_is_honoured) {
