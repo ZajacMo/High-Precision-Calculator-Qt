@@ -51,7 +51,9 @@ cpp/QtProject/calculator/
 ├── tests/
 │   ├── test_framework.h        复用兄弟项目的极简框架
 │   ├── tst_main.cpp
+│   ├── tst_framework.cpp       测试框架自检（负向自测专用，不放业务用例）
 │   ├── tst_bigdecimal.cpp      核心数值类型测试
+│   ├── tst_transcendental.cpp  超越函数测试
 │   ├── tst_format.cpp          进制与位运算测试
 │   └── tst_expression.cpp      表达式测试
 ├── scripts/
@@ -3610,6 +3612,7 @@ git commit -m "feat(core): 进制转换与整数位运算"
 - Create: `src/core/Expression.h`
 - Create: `src/core/Expression.cpp`
 - Create: `tests/expression_probe.cpp`
+- Create: `tests/tst_framework.cpp`（测试框架自检）
 - Modify: `tests/tst_expression.cpp`
 
 **Interfaces:**
@@ -3674,6 +3677,19 @@ inline constexpr int kMaxExpressionNestingDepth = 256;
 //
 // 数字支持十进制小数、**科学计数法**（1e20、2.5E-3）与 0x/0b/0o 前缀
 // 的整数。函数：sqrt abs pow exp ln log10。
+//
+// **取余（'%'）的语义**：**fmod**，不是「先取整再取余」。
+//
+//   - 符号跟随**被除数**（与 C 的 % 一致）：-7 % 3 == -1。
+//   - 左操作数带小数时，余数**也带小数**：5.5 % 2 == 1.5（而不是
+//     先把 5.5 取成 5 再取余得到的 1）。
+//
+// 内核的实现是把两个数对齐到共同的小数位再做整数长除法，所以
+// 10 % 0.3 == 0.1（0.3 的二进制展开是无限循环小数，对齐到共同小数位
+// 后余数是 0.1）。这与 C 的 fmod 一致。
+//
+// **零底数的次幂**：0^正数（含非整数指数）等于 **0**，不是错误；
+// 0^0 与 0^负数才是定义域错误。负底数的非整数次幂同样是定义域错误。
 //
 // **精度**：context.precision 是**有效数字位数**（同 Python decimal 的
 // prec），直接用于除法与超越函数；加、减、乘是精确运算，不受精度影响。
@@ -4024,7 +4040,21 @@ private:
                 ++cursor;
             }
             if (cursor < text_.size() && isDigit(text_[cursor])) {
+                // 指数的绝对值有上限（与内核的 kMaxExponentMagnitude 同一个），
+                // 超了就直接报错 —— 不去构造那个上百万位的移位。
+                //
+                // 检查放在**把当前位折进 magnitude 之后**（与内核一致）：
+                // 先检查再折的话，最后一位会把 magnitude 顶到 10 × 上限，
+                // 实际接受的上限就是 10 倍。
+                long long magnitude = 0;
                 while (cursor < text_.size() && isDigit(text_[cursor])) {
+                    const long long digit = text_[cursor] - '0';
+                    if (magnitude > (kMaxExponentMagnitude - digit) / 10) {
+                        // 位置指向那个 'e'，与 "1e" / "1e+" 的处理一致 ——
+                        // 出错的是**指数**，不是指数里的某个数字。
+                        failAt("非法的数字：指数过大", mark);
+                    }
+                    magnitude = magnitude * 10 + digit;
                     ++cursor;
                 }
                 position_ = cursor;
@@ -4213,10 +4243,6 @@ using hpc::ExpressionError;
 using hpc::RoundingMode;
 
 namespace {
-
-// volatile 读取不会被常量折叠，从而保证断言在运行时求值，
-// 否则 MSVC /W4 会因常量条件表达式报 C4127。
-volatile int kOne = 1;
 
 // 求值并返回结果。
 //
@@ -4432,6 +4458,30 @@ TEST(expression, scientificNotation) {
     CHECK_EQ(eval("1e-3").toString(), std::string("0.001"));
 }
 
+// 科学计数法的指数上限：|exponent| 的上限是 10^6（内核的
+// kMaxExponentMagnitude）。
+//
+// 上限之内要能算，上限之外要报错 —— 而且报错的位置指向那个 'e'，
+// 与 "1e" / "1e+" 的处理一致。
+TEST(expression, scientificNotationExponentLimit) {
+    // 正好在上限之内：正指数（上百万位的整数）与负指数（上百万位的
+    // 小数）都要能算出来。
+    const std::string big = eval("1e1000000").toString();
+    CHECK_EQ(big.size(), static_cast<std::size_t>(1000001));
+    CHECK_EQ(big.substr(0, 2), std::string("10"));
+    CHECK_EQ(big.substr(big.size() - 1), std::string("0"));
+
+    const std::string small = eval("1e-1000000").toString();
+    CHECK_EQ(small.size(), static_cast<std::size_t>(1000002));
+    CHECK_EQ(small.substr(0, 2), std::string("0."));
+    CHECK_EQ(small.substr(small.size() - 1), std::string("1"));
+
+    // 越界就是错误，位置指向那个 'e'。
+    checkErrorAt("1e1000001", 1);
+    checkErrorAt("1e-1000001", 1);
+    checkErrorAt("1e999999999", 1);
+}
+
 TEST(expression, decimalLiterals) {
     CHECK_EQ(eval("0.5").toString(), std::string("0.5"));
     CHECK_EQ(eval(".5").toString(), std::string("0.5"));
@@ -4594,6 +4644,9 @@ TEST(expression, errorPositions) {
     checkErrorAt("0x", 2);          // 前缀后没有数位
     checkErrorAt("1e", 1);          // 指数部分非法 → 'e'
     checkErrorAt("1e+", 1);         // 指数部分非法 → 'e'
+    checkErrorAt("1e999999999", 1); // 指数过大 → 'e'（不是指数里的数字）
+    checkErrorAt("1e-999999999", 1); // 指数过大 → 'e'
+    checkErrorAt("1.5e999999999", 3); // 指数过大 → 'e'
     checkErrorAt(")", 0);           // 多余的字符
     checkErrorAt("1)2", 1);         // 多余的字符
     checkErrorAt("1+2)", 3);        // 多余的字符
@@ -4624,7 +4677,18 @@ TEST(expression, deepNestingIsRejectedCleanly) {
     int position = -1;
     std::string message;
     CHECK(!tryEval(text, position, message));
-    CHECK(position >= 0);
+    // 位置要**钉死**：第 256 个 '(' 之后那个字符（实测 256）。
+    //
+    // 只断言 position >= 0 的话，将来深度的计数方式一变（少算一层、
+    // 多算一层），这个用例照样通过 —— 而错误位置是前端用来高亮
+    // 出错字符的，漂了就用不了了。
+    CHECK_EQ(position, 256);
+
+    // 正好在上限之内（255 层）必须能正常算出。
+    std::string atLimit(255, '(');
+    atLimit += "1";
+    atLimit += std::string(255, ')');
+    CHECK_EQ(eval(atLimit).toString(), std::string("1"));
 
     // 100 层（低于上限）必须能正常算出。
     std::string shallow(100, '(');
@@ -4641,7 +4705,19 @@ TEST(expression, deepFunctionNestingIsRejectedCleanly) {
     int position = -1;
     std::string message;
     CHECK(!tryEval(text, position, message));
-    CHECK(position >= 0);
+    // 位置钉死：第 257 次 "sqrt(" 的那个 's'（实测 1280）。
+    //
+    // 每次函数调用消耗一层深度（与括号一样），所以上限 256 层对应第
+    // 257 次调用被拒；位置指向**被拒的那次调用的第一个字符**。
+    // 1280 = 256 × 5（"sqrt(" 五个字符）。
+    CHECK_EQ(position, 1280);
+
+    // 正好在上限之内（255 次调用 = 255 层）必须能正常算出。
+    std::string atLimit;
+    for (int i = 0; i < 255; ++i) atLimit += "sqrt(";
+    atLimit += "1";
+    for (int i = 0; i < 255; ++i) atLimit += ")";
+    CHECK_EQ(eval(atLimit).toString(), std::string("1"));
 }
 
 // --- 精度 ---
@@ -4797,25 +4873,6 @@ TEST(expression, structuralSafety) {
     CHECK(evalOrError("1/0.0").rfind("!", 0) == 0);
     CHECK(evalOrError("1/(0*5)").rfind("!", 0) == 0);
 }
-
-// --- 负向自测 ---
-//
-// 验证断言失败**确实会被计数**。
-//
-// 若 reportFailure 退化成空操作，上面的用例照样全绿，而这套测试的
-// 全部意义就在于「失败能被检出」。failureCount() 返回引用，可存可
-// 复原；复原后 main 的 before/after 差值为 0，全局计数仍是 0，
-// 本用例本身判为 ok（main 会打印一行 FAIL，但那是**故意**的）。
-//
-// 这个自测放在**每个**测试文件里，而不是集中一处：每个文件的断言
-// 都必须自己证明「失败能被检出」，否则某个文件里的断言全部失效
-// （比如 CHECK 宏被误改）时，那个文件会**静默地**全绿。
-TEST(expression, frameworkDetectsFailures) {
-    const int before = ::testing::failureCount();
-    CHECK(kOne == 2);                                     // 故意失败
-    CHECK(::testing::failureCount() == before + 1);
-    ::testing::failureCount() = before;                   // 复原，避免污染全局计数
-}
 ```
 
 - [x] **Step 4: 写 `tests/expression_probe.cpp`（差分探针）**
@@ -4930,22 +4987,91 @@ int main(int argc, char** argv) {
 `decimal` 一致）。非整数指数的用例生成器要**能取到零底数** ——
 否则 `0^正数` 这条路径永远测不到，一旦内核改错，差分根本不会报警。
 
-**实测**：1595 / 1595 通过。
+**实测**：1604 / 1604 通过。
 
 - [x] **Step 6: 构建并运行测试**
 
 ```bash
 ./scripts/build-core.bat && ./scripts/run-ctest.bat
 ```
-预期：全部通过（144 / 144）。
+预期：全部通过（145 / 145）。
 
-**实测**：MSVC 与 GCC 都是 144 / 144，零警告。
+**实测**：MSVC 与 GCC 都是 145 / 145，零警告。
 
-- [x] **Step 7: 提交**
+- [x] **Step 7: 写 `tests/tst_framework.cpp`（测试框架自检）**
+
+这个文件**只**放框架自测，不放任何业务用例 —— 它必须放在一个**不会
+被后续任务整体重写**的文件里。
+
+理由：Task 5 与 Task 6 都把 `tst_format.cpp` / `tst_expression.cpp`
+**整体重写**过，而重写时把框架自测弄丢了（基线 `0895819` 的
+`tst_expression.cpp` 里有 `TEST(expression_placeholder,
+frameworkDetectsFailures)`，Task 6 之后全仓库一份都没有）。把自测放在
+一个「专用的、只放自测」的文件里，整体重写就碰不到它。
+
+这个自测是**承重**的：`tst_expression.cpp` 的 `eval()` 把捕获到的异常
+经由 `::testing::reportFailure` 变成断言失败。若 `reportFailure` 退化成
+空操作，那个文件里的**全部**用例会一起变绿，而没有任何东西能发现。
+
+新文件要**注册进 CMakeLists.txt** 的 `hpc_tests` 目标：
+
+```cmake
+    add_executable(hpc_tests
+        tests/tst_main.cpp
+        tests/tst_framework.cpp
+        ...
+    )
+```
+
+```cpp
+// 测试框架的**自检**：验证断言失败确实会被检出。
+//
+// 这个文件**只**放框架自测，不放任何业务用例 —— 它必须放在一个
+// 不会被后续任务整体重写的文件里。
+//
+// 为什么不能放在 tst_expression.cpp / tst_format.cpp 里：
+// Task 5 与 Task 6 都把那两个文件**整体重写**过，而重写时把这里的
+// 自测弄丢了（基线 0895819 的 tst_expression.cpp 里有，Task 6 之后
+// 全仓库一份都没有）。把自测放在一个「专用的、只放自测」的文件里，
+// 整体重写就碰不到它。
+//
+// 为什么自测是**承重**的：tst_expression.cpp 的 eval() 辅助函数把
+// 捕获到的异常经由 ::testing::reportFailure 变成断言失败
+// （tst_expression.cpp 的 eval() 两处）。若 reportFailure 退化成空
+// 操作，那个文件里的**全部**用例会一起变绿，而没有任何东西能发现。
+#include "test_framework.h"
+
+namespace {
+
+// volatile 读取不会被常量折叠，从而保证断言在运行时求值，
+// 否则 MSVC /W4 会因常量条件表达式报 C4127。
+volatile int kOne = 1;
+
+}  // namespace
+
+// 负向自测：验证断言失败**确实会被计数**。
+//
+// failureCount() 返回引用，可存可复原；复原后 main 的 before/after
+// 差值为 0，本用例仍判为 ok，全局计数仍是 0。
+//
+// 输出上会多出一行
+//     FAIL <文件>:<行>  CHECK failed: kOne == 2
+// 那是 reportFailure 自己打印的，**是故意的** —— 它就是「失败能被
+// 检出」的证据。套件的最终摘要仍然是「失败 0 个断言」。
+TEST(framework, detectsFailures) {
+    const int before = ::testing::failureCount();
+    CHECK(kOne == 2);                                     // 故意失败
+    CHECK(::testing::failureCount() == before + 1);
+    ::testing::failureCount() = before;                   // 复原，避免污染全局计数
+}
+```
+
+- [x] **Step 8: 提交**
 
 ```bash
 git add src/core/Expression.h src/core/Expression.cpp tests/tst_expression.cpp \
-        tests/expression_probe.cpp scripts/verify_expression.py CMakeLists.txt
+        tests/tst_framework.cpp tests/expression_probe.cpp scripts/verify_expression.py \
+        CMakeLists.txt
 git commit -m "feat(core): 表达式解析与求值器"
 ```
 
@@ -5021,16 +5147,36 @@ brief 的代码是**从未运行过的初稿**。下表的每一行都由
 
 | 注入的错误 | 差分脚本的结果 |
 |------------|---------------|
-| `-` 改成**右结合**（`a-b-c` 变成 `a-(b-c)`） | 1326 / 1595 —— 269 个用例失败 |
-| 取余的符号跟随**除数**（应为被除数） | 1540 / 1595 —— 55 个用例失败 |
-| `0^正数` 改成**定义域错误**（应返回 0） | 1579 / 1595 —— 16 个用例失败 |
-| `0^正数` 改成返回 **1**（应返回 0） | 1579 / 1595 —— 16 个用例失败 |
+| `-` 改成**右结合**（`a-b-c` 变成 `a-(b-c)`） | 1335 / 1604 —— 269 个用例失败 |
+| 取余的符号跟随**除数**（应为被除数） | 1549 / 1604 —— 55 个用例失败 |
+| `0^正数` 改成**定义域错误**（应返回 0） | 1588 / 1604 —— 16 个用例失败 |
+| `0^正数` 改成返回 **1**（应返回 0） | 1588 / 1604 —— 16 个用例失败 |
 
 后两行是**复审补上的**：原先的参考实现把 `0^非整数指数` 一律当成错误，
 于是这两个注入都测不出来 —— 差分脚本对着**错误**的实现报 1589 / 1589
 全绿。参考实现改正后，同样的注入立刻被抓出来。
 
-四次注入都在还原后回到 1595 / 1595。
+四次注入都在还原后回到 1604 / 1604。
+
+**参考实现的一个已知局限**：上百万位的**负**指数（`1e-1000000`）没有
+进差分用例 —— 参考实现的 `render_fraction` 要把分母的因子 2 与 5 逐个
+剥掉，对上百万位的分母是 O(n^2)，慢到不可用（实测超过 10 分钟）。
+那一侧由单元测试（`tst_expression.cpp` 的
+`scientificNotationExponentLimit`）覆盖：上限之内要能算，上限之外要
+报错且位置指向那个 `e`。
+
+#### 复审补上的修法
+
+| # | 位置 | 问题 | 修法 |
+|---|------|------|------|
+| 15 | `scripts/verify_expression.py` 的 oracle | 参考实现把 `0^非整数指数` 一律当成定义域错误，与内核的契约不符（内核对 `0^正数` 返回 `0`，与 Python 的 `decimal` 一致） | oracle 改正：零底数时指数 `<= 0` 才是错误，指数为正返回精确的 `0` |
+| 16 | `scripts/verify_expression.py` 的用例生成器 | 整数指数与非整数指数两条路径都取不到零底数，`0^正数` 从来没被测到 —— 差分脚本对着**坏掉的**实现报全绿 | 生成器两条路径都能取到零底数；另加 6 条显式的零底数用例 |
+| 17 | `tests/tst_expression.cpp` 的 `divisionByZero` | 两条 `CHECK(!tryEval("1/0", ...))` **逐字重复**；且注释声称「抛的是 ExpressionError」，但 `tryEval` **只**捕获 `ExpressionError` —— 内核的 `domain_error` 若漏出来会一路传播，而测试框架的 `main` **不捕获**异常，整个测试二进制直接终止 | 删掉重复的那条；改成显式 `catch (const std::exception&)` 并断言「漏出来的不是别的东西」 |
+| 18 | `tests/` 全目录 | 框架的**负向自测**（`frameworkDetectsFailures`）在 Task 6 重写文件时被弄丢了 —— 全仓库一份都没有。而自测是**承重**的：`tst_expression.cpp` 的 `eval()` 把捕获到的异常经由 `reportFailure` 变成断言失败，若 `reportFailure` 退化成空操作，那个文件的**全部**用例会一起变绿 | 新建 `tests/tst_framework.cpp` **专供**自测，不放任何业务用例 —— 它不会被 Task 5/6 式的整体重写碰掉 |
+| 19 | `src/core/Expression.h` | 语法注释写的是递归的 `unary := ('+' \| '-') unary \| primary`，而实现是**迭代**的 `unary := ('+' \| '-')* primary` | 注释改成迭代形式 |
+| 20 | `tests/tst_expression.cpp` 的深度用例 | 只断言 `position >= 0`，没钉死具体值 —— 将来深度的计数方式一变，用例照样通过，而错误位置是前端用来高亮出错字符的 | 钉死：括号 → 256、`sqrt(` → 1280（实测值）；另加「正好在上限之内必须能算出」的用例 |
+| 21 | `src/core/Expression.cpp` 的 `parseDecimalLiteral` | `1e999999999` 报 pos=11（指数里的数字）、消息「非法的数字」，与 `1e` / `1e+` 的行为不一致（那两个经 `failAt(mark)` 指向 pos=1 的 `e`） | 解析指数时就检查上限（与内核的 `kMaxExponentMagnitude` 同一个），超限经 `failAt(mark)` 指向那个 `e` |
+| 22 | `src/core/Expression.h` | 取余的 **fmod 语义**（符号跟随被除数、带小数的左操作数保留小数）只写在 `Expression.cpp` 的注释里，没进头文件 —— 而 Task 7/8 的前端作者是**读头文件**的 | 把 fmod 语义与零底数次幂的语义都补进头文件 |
 
 ### Task 7: 命令行前端
 
