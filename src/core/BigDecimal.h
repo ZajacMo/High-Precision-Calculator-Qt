@@ -14,6 +14,83 @@
 
 namespace hpc {
 
+// --- 运算上限 ---
+//
+// 这些上限是**公开契约**：调用方（尤其是前端）需要知道自己能请求多大的
+// 精度，否则只能靠试错发现某个值会抛异常。
+//
+// 分成两层，因为两类运算的代价模型完全不同：
+
+// 除法与舍入的精度上限。
+//
+// 除法要按位做长除法，代价随精度线性增长（再乘上被除数的位数）。
+// 实测 p=100000 时单次除法要几十秒 —— 已经很慢，但能算完。
+inline constexpr int kMaxPrecision = 100000;
+
+// 超越函数的精度上限。
+//
+// 与 kMaxPrecision 不同：超越函数的工作精度是**平方级**的。
+// 实测（本机 GCC -O2，最坏情况是 pow(2, 0.5)）：
+//
+//   p=200  →    413 ms
+//   p=400  →   3.4 s
+//   p=800  →    22 s
+//   p=1600 →   151 s
+//   p=1000（exp）→  23 s
+//
+// 也就是说 kMaxPrecision = 100000 对超越函数而言远远不够 ——
+// 它们在 p=1600 时就已经要两分半，p=99990 更是永远算不完。
+//
+// 所以超越函数单独用一个上限，取 1000：最坏情况约 40 秒，
+// 属于「可接受的慢」而不是「永远算不完」。
+//
+// 这是**产品决策**而非数学限制 —— 真正需要更高精度的调用方
+// 应该分批求值（例如先用 1000 位求出前导部分再细化）。
+inline constexpr int kMaxTranscendentalPrecision = 1000;
+
+// 整数幂的指数上限。
+inline constexpr long long kMaxIntegerPower = 100000;
+
+// 整数幂结果的位数上限（防止 10^100000 这类天文数字）。
+//
+// 上限按**结果的十进制位数**估算，整数位与小数位都算在内。
+//
+// 估算式：结果位数 <= power × (底数的有效位数 + 底数的小数位数)。
+//
+// 底数 |b| 有 s 位有效数字、t 位小数时，|b| ∈ [10^(s-1-t), 10^(s-t))，
+// 于是 |b^power| 的位数不超过 power × (s + t)：
+//   - 值 >= 1 时：整数位 <= power × (s - t) <= power × (s + t)
+//   - 值 <  1 时：小数位 <= power × (t - s + 1) <= power × (s + t)
+//
+// 所以这个估算**总是 >= 实际位数**（最多高估 3 倍），上限因此是硬约束。
+//
+// 只看底数的整数位数会完全漏掉小数底数：0.001 的整数位数是 -2，
+// 那个「整数位数 > 0」的判据会把整个护栏跳过，而结果的**小数位数**
+// 恰恰是按 power 线性增长的 —— 0.001^100000 需要 30 万位小数。
+//
+// 实测（本机 GCC -O2，precision=20）：
+//
+//   pow(2, 100000)              511 ms     结果 3 万位
+//   pow(3, 100000)             1325 ms     结果 4.8 万位
+//   pow(10, 100000)            8041 ms     结果 10 万位
+//   pow(0.001, 100000)        67598 ms     结果 30 万位小数
+//
+// 30 万位已经要一分多钟，所以上限取 30 万：
+// 估算 <= 30 万 ⟹ 实际位数 <= 30 万 ⟹ 单次不超过一分多钟。
+inline constexpr int kMaxPowerResultDigits = 300000;
+
+// 科学计数法的指数上限（|exponent| 的**精确**上限）。
+//
+// 指数为正时结果是 10^exponent 量级的整数，为负时是极小的分数。
+// 两个方向都要有上限，否则 "1e999999999" 会把内存吃光。
+//
+// 上限取 10^6：正指数产生 100 万位整数（约 450 KB），负指数产生
+// 100 万位小数 —— 都是「能算但没必要」的量级，再大就没有实用价值。
+//
+// 检查必须**在把当前位折进 magnitude 之后**做：先检查再折的话，
+// 最后一位会把 magnitude 顶到 10 × 上限，实际接受的上限就是 10 倍。
+inline constexpr long long kMaxExponentMagnitude = 1000000;
+
 // 小端 base-10^9 分块序列：blocks[0] 是最低位块，blocks.back() 是最高位块。
 using Blk = std::vector<std::uint32_t>;
 
@@ -38,10 +115,14 @@ public:
 
     // 不精确运算：必须显式给出精度。
     // 除数为零时抛出 std::domain_error。
+    // context.precision > kMaxPrecision 时抛 std::invalid_argument。
     static BigDecimal divide(const BigDecimal& lhs, const BigDecimal& rhs, const Context& context);
 
     // 取余：lhs - trunc(lhs/rhs) * rhs。结果符号跟随被除数（与 C 的 % 一致）。
     // 除数为零时抛出 std::domain_error。
+    //
+    // 取余是**精确**运算（整数长除法），不接受 Context，因此不受
+    // kMaxPrecision 约束。
     static BigDecimal modulo(const BigDecimal& lhs, const BigDecimal& rhs);
 
     // 取整：按 context.precision 位有效数字取整（floor 向 -∞，ceil 向 +∞，
@@ -96,10 +177,30 @@ public:
     // 定义域之外抛 std::domain_error：
     //   sqrt：负数
     //   ln / log10：非正数
-    //   pow：负底数的非整数次幂、零的负数次幂
+    //   pow：负底数的非整数次幂、零的负数次幂、零的零次幂
     //
     // 结果规模超出可计算范围时抛 std::overflow_error（exp 的参数过大、
-    // pow 的整数指数过大）。
+    // pow 的整数指数过大、pow 的结果位数过大）。
+    //
+    // 精度超出上限时抛 std::invalid_argument：
+    //
+    //   - sqrt / exp / ln / log10 与 pow 的**非整数指数**分支：
+    //     context.precision > kMaxTranscendentalPrecision。
+    //     这五个入口的工作精度是平方级的（见 kMaxTranscendentalPrecision
+    //     的实测数据），p=1600 时 pow(2, 0.5) 要跑 151 s，p=99990 更是
+    //     永远算不完 —— 而且失败方式**不一致**（有的精度下内层的 divide
+    //     恰好抛异常，有的精度下则一路挂起）。统一的 std::invalid_argument
+    //     让调用方拿到确定的行为。
+    //
+    //   - divide / roundToPrecision / floor / ceil / round：
+    //     context.precision > kMaxPrecision。除法的代价随精度线性增长，
+    //     p=100000 时单次要几十秒 —— 能算完，但已经不值得。
+    //
+    // 注意两者的区别：**pow 的整数指数分支不受
+    // kMaxTranscendentalPrecision 约束** —— 整数次幂走的是精确的快速幂，
+    // 代价由 kMaxIntegerPower（指数）与 kMaxPowerResultDigits（结果位数）
+    // 单独约束，与超越函数的工作精度毫无关系。pow(10, 100000) 在
+    // precision=2000 下完全合法。
 
     // 平方根。
     static BigDecimal sqrt(const BigDecimal& value, const Context& context);

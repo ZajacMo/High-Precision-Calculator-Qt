@@ -357,10 +357,110 @@ TEST(transcendental, rejects_precision_above_ceiling) {
     }
     CHECK(threw);
 
+    // pow 只有**非整数指数**这条分支是超越函数，因此只有它被拒。
+    // 整数指数的精确快速幂不受这个上限约束（见下面的
+    // pow_integer_exponent_ignores_transcendental_ceiling）。
     threw = false;
     try {
         BigDecimal::pow(BigDecimal::fromString("2"), BigDecimal::fromString("0.5"), absurd);
     } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+// --- 超越函数上限**不**适用于精确整数次幂 ---
+//
+// 超越函数的精度上限（kMaxTranscendentalPrecision）约束的是**工作精度**
+// 平方级的那条路径 —— sqrt / exp / ln / log10 与 pow 的非整数指数分支。
+// pow 的**整数指数**分支走的是精确的快速幂，代价由 kMaxIntegerPower
+// （指数）与 kMaxPowerResultDigits（结果位数）单独约束。
+//
+// 早先的版本把闸门放在 pow 的最前面，于是精确的整数次幂也被拒：
+// pow(2, 100) 在 precision=2000 时抛 "precision 超出超越函数的上限"。
+// 那是在拒绝一个与该上限毫无关系的能力 —— 上限的名字就叫「超越函数」，
+// 而精确整数次幂不是超越函数。
+
+TEST(pow, integer_exponent_ignores_transcendental_ceiling) {
+    // 精度高于 kMaxTranscendentalPrecision（1000）时，精确整数次幂必须
+    // 照常算出来，而且结果**精确**（不是舍入过的近似值）。
+    const Context above{2000, RoundingMode::HalfEven};
+    CHECK(above.precision > hpc::kMaxTranscendentalPrecision);
+
+    // 2^100 = 1267650600228229401496703205376（31 位）。
+    CHECK_EQ(BigDecimal::pow(BigDecimal::fromString("2"), BigDecimal::fromString("100"),
+                              above).toString(),
+             std::string("1267650600228229401496703205376"));
+
+    // 指数为 0：结果精确地是 1。
+    CHECK_EQ(BigDecimal::pow(BigDecimal::fromString("3"), BigDecimal::fromString("0"),
+                              above).toString(),
+             std::string("1"));
+
+    // 负整数指数：1 / base^n，仍是精确值（有限小数）。
+    CHECK_EQ(BigDecimal::pow(BigDecimal::fromString("2"), BigDecimal::fromString("-3"),
+                              above).toString(),
+             std::string("0.125"));
+
+    // 零底数：0^正数 = 0。
+    CHECK_EQ(BigDecimal::pow(BigDecimal::fromString("0"), BigDecimal::fromString("2"),
+                              above).toString(),
+             std::string("0"));
+
+    // 同一个幂在低精度下会被**舍入**（结果按 context.precision 位有效数字
+    // 舍入）—— 这正说明 p=2000 走的是同一条舍入路径，而不是绕过了它。
+    // p=2000 时 31 位有效数字全部保留，是**精确**值。
+    CHECK_EQ(BigDecimal::pow(BigDecimal::fromString("2"), BigDecimal::fromString("100"),
+                              ctx20()).toString(),
+             std::string("1267650600228229401500000000000"));
+}
+
+TEST(pow, non_integer_exponent_still_rejects_precision_above_ceiling) {
+    // 上限对**非整数指数**仍然生效 —— 那条分支才是真正的超越函数
+    // （exp(b·ln a)），工作精度是平方级的。
+    const Context above{2000, RoundingMode::HalfEven};
+
+    bool threw = false;
+    try {
+        BigDecimal::pow(BigDecimal::fromString("2"), BigDecimal::fromString("0.5"), above);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    // 恰好在上限上：允许，且给出 1000 位有效数字的结果。
+    const Context atCeiling{hpc::kMaxTranscendentalPrecision, RoundingMode::HalfEven};
+    const std::string atLimit =
+        BigDecimal::pow(BigDecimal::fromString("2"), BigDecimal::fromString("0.5"),
+                        atCeiling).toString();
+    CHECK(atLimit.size() == 1001);
+    // 前 20 位有效数字与 Python decimal 在 prec=1000 下的结果一致。
+    CHECK_EQ(atLimit.substr(0, 21), std::string("1.4142135623730950488"));
+}
+
+TEST(pow, integer_exponent_result_digits_limit_still_applies) {
+    // 整数次幂**真正**的上限是结果位数（kMaxPowerResultDigits），而不是
+    // 超越函数的精度上限。0.001^100000 需要 30 万位小数，超过上限，
+    // 必须报 std::overflow_error —— 且这个判定与请求的精度无关。
+    const Context above{2000, RoundingMode::HalfEven};
+
+    bool threw = false;
+    try {
+        BigDecimal::pow(BigDecimal::fromString("0.001"),
+                        BigDecimal::fromString("100000"),
+                        above);
+    } catch (const std::overflow_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    // 指数本身的上限（kMaxIntegerPower）同样仍然生效。
+    threw = false;
+    try {
+        BigDecimal::pow(BigDecimal::fromString("2"),
+                        BigDecimal::fromString("100000000000000000000"),
+                        above);
+    } catch (const std::overflow_error&) {
         threw = true;
     }
     CHECK(threw);

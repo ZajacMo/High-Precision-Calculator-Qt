@@ -2278,6 +2278,24 @@ namespace hpc {
 // 该进制下能有限表示的值给出最短的精确形式（0.5 在二进制下是 "0.1"），
 // 只有确实发生了截断时才补上 "..." 标记 —— 标记是如实的，值算得完就没有
 // 标记。
+//
+// **「...」的契约**（截断与精度的唯一约定）：
+//
+//   - "..." 表示「展开**被截断了**」，且截断的是**小数部分**。
+//   - 出现 "..." 时，前面的数字是展开的**真实前缀**（不是四舍五入的
+//     近似值），末位数字也是真实数字 —— 删掉它会改变数值。
+//   - 该进制下**能**有限表示的值**绝不会**带 "..."；反过来，不能有限
+//     表示的值**一定**带 "..."（除非自动位数被工作量上限截断，见下）。
+//   - 精度预算（fractionDigits，或自动推算的位数）不足时会截断并标记；
+//     这**不是**错误。
+//
+// **工作量上限**：展开代价是 O(位数 × 块数)。当预算大到算不完时，
+// toBaseString **不会**抛异常 —— 它算出算得动的那部分位，**截断**并
+// 如实加上 "..." 标记。理由：计算器的调用方要的是一个答案（哪怕是带
+// 标记的近似值），而不是一个空洞的异常；而且「...」的含义本来就是
+// 「没算完」，如实标记不算撒谎。
+//
+// 唯一的例外是**非法输入**：base 越界抛 std::invalid_argument。
 std::string toBaseString(const BigDecimal& value, int base, bool uppercase = false,
                           int fractionDigits = 0);
 
@@ -2348,9 +2366,13 @@ constexpr int kMaxFractionDigits = 4096;
 // 一个 10^6 位小数的值转成二进制需要 10^11 次块运算 —— 那不是「慢」，
 // 而是永远算不完。
 //
-// 触及上限时抛 std::overflow_error：这与「截断」不同 —— 截断要输出一个
-// 不精确的结果并标记它，而这里直接拒绝，因为该值本来是**可以**精确表示的，
-// 只是算不起。谎报截断比报错更糟。
+// 触及上限时**不报错**，而是停在算得动的地方并如实标记「...」：
+// 「...」的含义本来就是「展开被截断了」，而报错是把一个本来能给出
+// （哪怕是截断的）结果的请求整个拒掉 —— 计算器用户更愿意看到一个
+// 带标记的近似值，也不要一个空洞的异常。
+//
+// 这与「谎报截断」是相反的错误：谎报截断是把截断说成完整；这里
+// 明确说「没算完」。
 constexpr long long kMaxExpansionWork = 100000000LL;
 
 // 左移位数的上限：2^bits 的十进制位数约是 bits 的 0.301 倍，
@@ -2642,7 +2664,12 @@ constexpr std::uint32_t kPow10[kBlockDigits] = {
 // 块序列就地除以一个小的正整数（divisor <= 5）。
 //
 // 块内不会溢出 64 位：余数 < divisor，当前值 < 5 * 10^9。
-void divideBlkBySmall(Blk& blocks, std::uint32_t divisor) {
+// 块序列除以一个 64 位正整数，返回余数（块序列就地变成商）。
+//
+// divisor 必须是 2 或 5 的幂 —— 这样每一步的「余数 · 10^9 + 块」都
+// 不会溢出 64 位：余数 < divisor，当前值 < divisor · 10^9 <= 2^32 · 10^9
+// = 4.3·10^18 < 1.8·10^19 = 2^64。
+std::uint64_t divideBlkByPower(Blk& blocks, std::uint64_t divisor) {
     std::uint64_t remainder = 0;
     for (std::size_t i = blocks.size(); i-- > 0;) {
         const std::uint64_t current = remainder * kBase + blocks[i];
@@ -2650,18 +2677,41 @@ void divideBlkBySmall(Blk& blocks, std::uint32_t divisor) {
         remainder = current % divisor;
     }
     blocks = trimBlk(std::move(blocks));
+    return remainder;
+}
+
+// 块序列除以 divisor 的余数（不修改块序列）。
+//
+// divisor 必须是 2 或 5 的幂（见 divideBlkByPower 的溢出论证）。
+std::uint64_t remainderBlk(const Blk& blocks, std::uint64_t divisor) {
+    std::uint64_t remainder = 0;
+    for (std::size_t i = blocks.size(); i-- > 0;) {
+        const std::uint64_t current = remainder * kBase + blocks[i];
+        remainder = current % divisor;
+    }
+    return remainder;
 }
 
 // 分子（绝对值）能被 prime 整除的次数（上限 cap）。
 //
+// 返回 min(v_p(M), cap)；返回 -1 表示「工作量超限，算不出来」。
+//
 // prime 只取 2 或 5，而块的基数 10^9 = 2^9 · 5^9 —— 因此**整除性只看
-// 最低块**：M = m_0 + 10^9 · H，v_p(10^9 · H) >= 9，所以当
-// v_p(m_0) < 9 时 v_p(M) = v_p(m_0)（两个加数的 2-adic 赋值不同）。
+// 最低块**：M = m_0 + 10^9 · H，且 v_p(10^9 · H) >= 9。
 //
-// 常见情况只查最低块就够了（v_2 的命中率 511/512）。
+// 但「只看最低块」**只在两个加数的赋值不同时**才成立：
 //
-// 罕见情况（最低块恰好含 9 个以上 prime 因子）才走逐次相除，那条路是
-// O(赋值 × 块数)，因此设一道工作量闸。
+//   v_p(m_0) <  9 → 与 v_p(10^9·H) >= 9 必然不同 → v_p(M) = v_p(m_0)（精确）；
+//   v_p(m_0) >= 9 → 两者**可能相同**（m_0 恰好也含 9 个 p 因子），
+//                    此时 m_0 与 10^9·H 可能互相抵消，v_p(M) 可以**大于**
+//                    v_p(m_0) —— 便宜路径的结论不可信。
+//
+// 旧实现在这里直接把 cap（或 quick）当答案返回，于是**低估**了赋值：
+// m_0 = 2^scale·k、10^9·H 恰好抵消的情形下会算出一个偏大的赋值，
+// 于是展开被**提前**截断（无声的精度损失），并把本来无限的展开误报成
+// 有限。
+//
+// 因此便宜路径只在**能证明**赋值就是答案时才用，其余一律走精确路径。
 int valuationCapped(const Blk& numerator, std::uint32_t prime, int cap) {
     if (cap <= 0) return 0;
 
@@ -2669,34 +2719,66 @@ int valuationCapped(const Blk& numerator, std::uint32_t prime, int cap) {
     std::uint32_t low = numerator[0];
     int quick = 0;
     while (quick < 31 && low % prime == 0) { ++quick; low /= prime; }
-    if (quick >= cap) return cap;
-    if (quick < 9) return quick;
 
-    // 第二级：最低两块合成一个 64 位数。v_p(D) < 18 时同样是答案。
-    if (numerator.size() >= 2) {
-        const std::uint64_t pair =
-            static_cast<std::uint64_t>(numerator[0]) +
-            static_cast<std::uint64_t>(numerator[1]) * kBase;
-        std::uint64_t rest = pair;
-        int count = 0;
-        while (count < 63 && rest % prime == 0) { ++count; rest /= prime; }
-        if (count >= cap) return cap;
-        if (count < 18) return count;
-    }
+    // 分子只有一个块时它**就是**整个分子：赋值已知，无需再猜。
+    //
+    // 单块的赋值一定 < 31（2^29 < 10^9 < 2^30，5^12 < 10^9 < 5^13），
+    // 所以上面的循环不会提前截断 quick。
+    if (numerator.size() == 1) return quick >= cap ? cap : quick;
 
-    // 罕见路径：逐次相除。
+    // quick < 9：两个加数的赋值必不同，v_p(M) = quick（精确）。
+    if (quick < 9) return quick >= cap ? cap : quick;
+
+    // quick >= 9：只能确定 v_p(M) >= 9。cap <= 9 时答案就是 cap。
+    if (cap <= 9) return cap;
+
+    // 第二级：最低两块合成一个 64 位数（M 的低 18 位十进制数字）。
+    // v_p(10^18 · H) >= 18，所以 count < 18 时 v_p(M) = count（仍是精确的）。
+    const std::uint64_t pair =
+        static_cast<std::uint64_t>(numerator[0]) +
+        static_cast<std::uint64_t>(numerator[1]) * kBase;
+    std::uint64_t rest = pair;
+    int count = 0;
+    while (count < 63 && rest % prime == 0) { ++count; rest /= prime; }
+    if (count < 18) return count >= cap ? cap : count;
+
+    // count >= 18：只能确定 v_p(M) >= 18。cap <= 18 时答案就是 cap。
+    if (cap <= 18) return cap;
+
+    // 第三级：精确路径 —— 逐次相除。
+    //
+    // 为了少跑几遍，每次尽量除以 p^k（k 取「p^k · 10^9 不溢出 64 位」
+    // 的最大值）：p = 2 时 k = 32，p = 5 时 k = 13。
+    const int chunk = (prime == 2) ? 32 : 13;
+    std::uint64_t chunkDivisor = 1;
+    for (int i = 0; i < chunk; ++i) chunkDivisor *= prime;
+
     Blk value = numerator;
     const long long blockCount = static_cast<long long>(value.size());
-    int count = 0;
-    while (count < cap) {
-        if (value[0] % prime != 0) break;
-        divideBlkBySmall(value, prime);
-        ++count;
-        if (static_cast<long long>(count) * blockCount > kMaxExpansionWork) {
-            throw std::overflow_error("toBaseString: 小数位过多，无法展开");
-        }
+    long long work = 0;
+    int exact = 0;
+
+    // 整块相除：只有 p^chunk 整除时才除，否则退回单个 p。
+    while (exact + chunk <= cap) {
+        if (remainderBlk(value, chunkDivisor) != 0) break;
+        divideBlkByPower(value, chunkDivisor);
+        exact += chunk;
+        work += blockCount;
+        if (work > kMaxExpansionWork) return -1;
     }
-    return count;
+
+    // 收尾：单个 p 因子。
+    //
+    // 整除性只看最低块：M ≡ m_0 (mod 10^9)，而 p | 10^9，所以
+    // 「M 被 p 整除」等价于「最低块被 p 整除」。
+    while (exact < cap) {
+        if (value[0] % prime != 0) break;
+        divideBlkByPower(value, prime);
+        ++exact;
+        work += blockCount;
+        if (work > kMaxExpansionWork) return -1;
+    }
+    return exact;
 }
 
 // base 中 prime 的指数（base 能被 prime 整除的次数）。
@@ -2725,6 +2807,19 @@ int ceilDiv(int a, int b) { return (a + b - 1) / b; }
 // 关于分子的选取：整数部分不影响展开长度 —— 对 p ∈ {2, 5}，
 // v_p(整数部分 × 10^s) >= s，而 v_p(N) < s 时 v_p(分子) = v_p(N)，
 // 所以「分子的 2/5 因子个数（上限 s）」与「小数部分的分子」相同。
+// 该值在 base 进制下的**精确**小数位数；返回 -1 表示无法有限表示。
+//
+// 值 = ±N / 10^s（N 是分子的绝对值，s 是十进制小数位）。
+// base 进制下存在有限展开 ⟺ ∃k: 10^s | N · base^k，而
+//
+//   v2(N · base^k) = v2(N) + k · v2(base) >= s
+//   v5(N · base^k) = v5(N) + k · v5(base) >= s
+//
+// 必须**同时**成立。满足这两条的最小 k 就是精确位数。
+//
+// 关于分子的选取：整数部分不影响展开长度 —— 对 p ∈ {2, 5}，
+// v_p(整数部分 × 10^s) >= s，而 v_p(N) < s 时 v_p(分子) = v_p(N)，
+// 所以「分子的 2/5 因子个数（上限 s）」与「小数部分的分子」相同。
 int exactFractionDigits(const BigDecimal& value, int base) {
     const int scale = value.scale();
     if (scale <= 0) return 0;
@@ -2732,9 +2827,21 @@ int exactFractionDigits(const BigDecimal& value, int base) {
     const int baseTwo = factorExponent(base, 2);
     const int baseFive = factorExponent(base, 5);
 
+    // 十进制特判：**任何**有限十进制小数在十进制下都精确表示，位数就是
+    // scale 本身。
+    //
+    // 这条特判不只是优化 —— 它把十进制路径与「赋值计算」彻底解耦。
+    // 赋值计算是唯一可能触及工作量上限的环节（见 valuationCapped），而
+    // 十进制不该因为它失败就退化。内核的原生表示本来就知道答案。
+    if (base == 10) return scale;
+
     const Blk& numerator = value.numeratorBlocks();
     const int two = valuationCapped(numerator, 2, scale);
     const int five = valuationCapped(numerator, 5, scale);
+
+    // 赋值算不出来（工作量超限）：不能断言该值能有限表示 —— 保守地当作
+    // 「不能」，让调用方走截断路径。那只是少给几位，而不会谎称精确。
+    if (two < 0 || five < 0) return -1;
 
     // base 里没有的质因子必须已经被分子消掉，否则展开是无限的。
     if (baseTwo == 0 && two < scale) return -1;
@@ -2875,11 +2982,23 @@ std::string decimalFractionDigits(const BigDecimal& value) {
 // 块数按**最坏情况**估：余数始终 < 1，它的小数位不超过 scale，整数位最多
 // 1 位，因此块数不超过 scale/9 + 1。用分子的块数估会严重低估 ——
 // 分子的块数可能只有 1，而余数的块数会随展开线性增长。
-void checkExpansionWork(const BigDecimal& value, int digits) {
+// 展开 digits 位小数的工作量上限：算出最多能算多少位。
+//
+// 每提取一位都要把整个余数乘一次进制并按十进制位切开，代价 O(块数)。
+//
+// 块数按**最坏情况**估：余数始终 < 1，它的小数位不超过 scale，整数位最多
+// 1 位，因此块数不超过 scale/9 + 1。用分子的块数估会严重低估 ——
+// 分子的块数可能只有 1，而余数的块数会随展开线性增长。
+//
+// 返回**实际能展开的位数**（<= digits）。触及上限时**不报错**，而是
+// 少给几位并由调用方标记「...」—— 见 kMaxExpansionWork 的说明。
+int affordableExpansionDigits(const BigDecimal& value, int digits) {
+    if (digits <= 0) return 0;
     const long long blocks = static_cast<long long>(value.scale()) / 9 + 2;
-    if (static_cast<long long>(digits) * blocks > kMaxExpansionWork) {
-        throw std::overflow_error("toBaseString: 小数位过多，无法展开");
-    }
+    if (blocks <= 0) return digits;
+    const long long affordable = kMaxExpansionWork / blocks;
+    if (affordable >= digits) return digits;
+    return static_cast<int>(affordable);
 }
 
 // 按 base 进制逐位提取小数部分，最多 digits 位。
@@ -2991,8 +3110,18 @@ std::string toBaseString(const BigDecimal& value, int base, bool uppercase, int 
                 // 十进制是内核的原生表示，直接取数字即可，代价 O(位数)。
                 fractionText = decimalFractionDigits(value);
             } else {
-                checkExpansionWork(value, budget);
-                expandFraction(value, base, budget, table, fractionText, truncated);
+                // 预算超过工作量上限时**截断**而不是报错：算得动多少给多少，
+                // 剩下的用「...」如实标记（见 kMaxExpansionWork）。
+                const int affordable = affordableExpansionDigits(value, budget);
+                if (affordable > 0) {
+                    expandFraction(value, base, affordable, table, fractionText, truncated);
+                }
+                // 预算没算完 —— 展开一定没写完，标记是如实的。
+                //
+                // 注意这个判断**不能**放进 expandFraction 里：它会把
+                // truncated 覆盖成「余数是否为零」，从而丢掉「预算本身
+                // 就不够」这个事实。
+                if (affordable < budget) truncated = true;
             }
 
             if (truncated) {
@@ -3271,6 +3400,14 @@ Task 4 遗留的缺口：内核原本不支持 `'e'` 记法。**扩展 `fromStri
   带标记；0.5 在二进制下不带。
 - `base.explicit_fraction_digits_budget_truncates`：显式 `fractionDigits`
   仍是**预算**，位数不足时照样标记。
+- `base.valuation_underestimate_does_not_truncate_early`：四个复现值
+  （`0.1009765625` 二进制/八进制、`0.1000001024` 五进制/二十五进制）的
+  展开**长度**必须与 `fractions.Fraction` 精确算出的期望一致，且都带标记。
+- `base.non_terminating_is_reported_as_non_terminating`：`0.1009765625`
+  在五进制下必须被报成**非有限**（15 位 + 标记）—— 旧实现误报成有限。
+- `base.expansion_work_limit_truncates_instead_of_throwing`：超出工作量
+  上限时**截断 + 标记**，不再抛 `std::overflow_error`。
+- `base.values_within_work_limit_stay_exact`：工作量之内仍然精确展开。
 - `scientific.enforces_exponent_limit_exactly` / `scientific.exponent_limit_bounds_the_scale`：
   `1e1000001` 及以上（含负指数）抛 `std::invalid_argument`。
 
@@ -3315,8 +3452,8 @@ shr <十进制值> <位数>
 
 | 项 | 结果 |
 |----|------|
-| 差分测试 | **1699 / 1699 通过** |
-| 单元测试 | **93 / 93 个用例，失败 0 个断言** |
+| 差分测试 | **1699 / 1699 通过**（第一轮）；第二轮补上长度/终止性差分后为 **20125 / 20125 通过** |
+| 单元测试 | **93 / 93 个用例，失败 0 个断言**（第二轮后为 109 / 109） |
 | MSVC 构建 | 零警告 |
 | GCC 构建 | 零警告 |
 
@@ -3328,8 +3465,22 @@ shr <十进制值> <位数>
 ```bash
 ./scripts/build-core.bat && ./scripts/run-ctest.bat
 python scripts/verify_format.py ./build/format_probe.exe
+python scripts/verify_format_len.py ./build/format_probe.exe
 ```
 预期：全部通过。
+
+`scripts/verify_format_len.py` 是**第二轮评审后补上**的差分测试：它专门比对
+展开的**长度**与**终止性**（而 `verify_format.py` 比对的是完整输出串），
+期望值全部由 `fractions.Fraction` 精确算出。它覆盖约 2 万个「随机分数 ×
+全部 35 个进制」的组合，并**刻意**大量构造会触发赋值缺陷的值
+（最低块恰含 9 个以上 2 因子或 5 因子的分子）。
+
+实测：**20125 / 20125 通过**；对修复前的代码则报出 **230 处**长度或
+终止性不符 —— 也就是说这个差分测试确实能抓住那个缺陷。
+
+另有 `scripts/probe_valuation_fix.py` 做聚焦对照：把四个复现值 × 若干
+进制的「C++ 实际长度」与「Python 精确期望长度」并排打出来，
+修复前 2/6 相符、修复后 6/6 相符。
 
 - [x] **Step 8: 提交**
 
@@ -3370,6 +3521,8 @@ git commit -m "feat(core): 进制转换与整数位运算"
 | 11 | `toBaseString` 的小数位数 | 用「最小的 D 使 `base^D >= 10^scale`」估算自动位数 | 该估算只在 base 是 2 或 5 的幂时等价。base 同时带 2 与 5 且指数不等时（20 = 2^2·5、30 = 2·3·5）估算值**短于**真实展开长度，于是输出挂上一个**并不存在**的截断标记：`toBaseString(0.00001, 20)` 得 `0.0001...`（精确值是 `0.0001c`）、`toBaseString(0.0001, 30)` 得 `0.002...`（精确值是 `0.002l`）。违反规格 §2.5「能有限表示时给出最短的精确形式」 | 位数改由**值的最简分数**算出：`exactFractionDigits` 用 `v_2`/`v_5` 的赋值求出精确展开长度（能有限表示则返回长度，否则返回 -1）。展开本身也从「BigDecimal 逐位乘」换成**块级长除法**（`lowDecimalDigits` + `splitDigitAndRemainder`），O(位数 × 块数) → O(位数) |
 | 12 | `toBaseString` 的十进制路径 | 把 4096 当成「十进制展开的上限」 | `1e-4097` 在十进制下**精确可表示**（4097 位小数），却被打上截断标记。4096 是**预算**上限，不是可表示性上限；能算完就没有标记 | 自动位数时预算取精确展开长度（不受 4096 限制）；十进制另走一条特判：十进制是内核的**原生**表示，小数位直接取分子的低 scale 位，代价 O(位数) 且永远不带标记 |
 | 13 | `BigDecimal::fromString` 的指数守卫 | 上限检查在把当前数字折进 magnitude **之前**做 | 最后一位会把 magnitude 顶到 10 × 上限 —— 实际上限是 10^7 而不是文档写的 10^6，`1e1000009`/`1e1000010`/`1e9999999` 全部被接受。负指数同样如此，`scale` 会到 10^7，一个字面量就能撑爆内存 | 检查改为 `magnitude > (kMaxExponentMagnitude - digit) / 10`（折进之后判定），实际接受的上限与文档一致 |
+| 14 | `valuationCapped` 的质因子赋值 | 「整除性只看最低块」的捷径在 `v_p(m_0) >= 9` 时**不成立**，但代码在检查 `quick < 9` **之前**就返回了 `cap` | 分子的最低块含 9 个以上 p 因子时（`m_0 = 2^scale·k`、`10^9·H` 恰好抵消），真实赋值 `v_p(M)` **大于** `v_p(m_0)`，而代码把它当成了 `cap`。后果：展开被**提前**截断（无声的精度损失），且把本来无限的展开误报成有限。实测 `0.1009765625` 在二进制下只给 10 位（应为 34 位）、八进制下只给 4 位（应为 12 位）；`0.1000001024` 在五进制下只给 10 位（应为 15 位）、二十五进制下只给 5 位（应为 8 位） | 便宜路径只在**能证明**赋值就是答案时才用：`quick < 9`（两个加数的赋值必不同）、`count < 18`（同上），其余一律走精确的逐次相除路径；分子只有一个块时赋值已知，直接返回 |
+| 15 | `kMaxExpansionWork` 超出时的行为 | 触及工作量上限时抛 `std::overflow_error` | 契约里「`...`」的含义本来就是「展开被截断了」，而抛异常是把一个本来能给出结果的请求整个拒掉 —— 与「显式 `fractionDigits` 不足时截断并标记」的既有行为**自相矛盾**。计算器用户要的是一个答案（哪怕带标记），不是一个空洞的异常 | 超限时**截断**并如实标记「...」：算出算得动的那部分位，剩余的用标记说明。`valuationCapped` 同理，改为返回 -1（算不出来）而不是抛异常；`exactFractionDigits` 收到 -1 时保守地当作「不能有限表示」，只少给几位而不会谎称精确。十进制另走特判，不受赋值计算影响 |
 
 补充说明：
 

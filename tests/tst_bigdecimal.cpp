@@ -533,6 +533,11 @@ TEST(scientific, enforces_exponent_limit_exactly) {
     CHECK(BigDecimal::fromString("1e1000000").scale() == 0);
     CHECK(BigDecimal::fromString("1e1000000").toString().size() == 1000001);
 
+    // 上限之内、但离上限还有余量：必须接受（曾经被误拒的那一类）。
+    // 999999 < 1000000，所以 1e999999 是合法的。
+    CHECK(BigDecimal::fromString("1e999999").scale() == 0);
+    CHECK(BigDecimal::fromString("1e999999").toString().size() == 1000000);
+
     // 超过上限：拒绝。
     const char* tooLarge[] = {"1e1000001", "1e1000009", "1e1000010", "1e9999999"};
     for (const char* text : tooLarge) {
@@ -548,6 +553,7 @@ TEST(scientific, enforces_exponent_limit_exactly) {
 
     // 上限之内的负指数可以接受。
     CHECK(BigDecimal::fromString("1e-1000000").scale() == 1000000);
+    CHECK(BigDecimal::fromString("1e-999999").scale() == 999999);
 }
 
 // 指数上限必须同时挡住「荒唐的指数」与「荒唐的分配」。
