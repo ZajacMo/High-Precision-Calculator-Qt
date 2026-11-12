@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -144,17 +145,30 @@ public:
 
     // ---- 上限与超时 ----
     //
-    // 请求体上限 1 MiB。合法请求里最大的载荷是「几十万位的十进制数」
-    // （/api/convert 的 value 字段），几百 KB；1 MiB 留足了余量，
-    // 同时把单个连接占用的内存钉在一个有限的值上。
-    static constexpr std::size_t kMaxRequestBodyBytes = 1024u * 1024u;
-    // 请求头上限 64 KiB。
+    // 请求体上限 4 MiB。这个 API 的请求体实际上只需要几 KB
+    // （一个 JSON 对象，字段是几个字符串），4 MiB 已经非常宽裕。
+    //
+    // 为什么必须有上限：**请求体路径原本完全没有上限**，
+    // `contentLengthOf` 的值被直接信任 —— 声明
+    // `Content-Length: 1000000000` 就能让服务端缓冲 1 GB。
+    //
+    // 取 4 MiB 而不是更小的值：合法请求里最大的载荷是
+    // 「上百万位的十进制数」（/api/convert 的 value 字段），
+    // 4 MiB 给它留了余量，同时把单个连接占用的内存钉在一个有限的值上。
+    static constexpr std::size_t kMaxRequestBodyBytes = 4u * 1024u * 1024u;
+    // 请求头上限 64 KiB。HTTP 请求头本来就只有几 KB。
     static constexpr std::size_t kMaxHeaderBytes = 64u * 1024u;
     // 一次读操作允许的「无数据」时长（毫秒）。超过就认定客户端停滞。
+    //
+    // 这挡的是「连上但完全不发数据」的客户端。
     static constexpr int kReadTimeoutMillis = 5000;
-    // 收到整个请求的总时限（毫秒）—— 挡住「声明巨大 Content-Length
-    // 再慢慢滴字节」的打法：只靠单次读的超时挡不住它。
-    static constexpr int kRequestTimeoutMillis = 15000;
+    // **整条连接**的总时限（毫秒），从 accept 那一刻起算。超过就断开。
+    //
+    // 这挡的是「慢速滴字节」的客户端 —— 逐次读超时挡不住它：
+    // 一个每 2 秒滴 1 字节的客户端，每次单独的读都很快返回，
+    // 静默计时器一直不触发。只有「这条连接总共能活多久」的上限
+    // 才能断开它。
+    static constexpr int kConnectionTimeoutMillis = 15000;
     // 写响应的时限（毫秒）。
     static constexpr int kWriteTimeoutMillis = 10000;
     // 并发连接数上限。
@@ -163,8 +177,10 @@ public:
     static constexpr int kStopGraceMillis = 500;
 
 private:
-    static Response handleStatic(const State& state, const Request& request);    static Response dispatch(const State& state, const Request& request);
-    static void runConnection(std::shared_ptr<State> state, std::intptr_t rawSocket);
+    static Response handleStatic(const State& state, const Request& request);
+    static Response dispatch(const State& state, const Request& request);
+    static void runConnection(std::shared_ptr<State> state, std::intptr_t rawSocket,
+                              std::chrono::steady_clock::time_point acceptedAt);
 
     std::shared_ptr<State> m_state;
     int m_boundPort = 0;

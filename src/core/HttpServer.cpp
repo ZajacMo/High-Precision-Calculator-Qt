@@ -505,7 +505,8 @@ bool Server::listen(const std::string& host, int port) {
 //
 // 共享状态放在 State 里，用 shared_ptr 持有：Server 析构后
 // 连接线程仍可安全地读完它要读的东西。
-void Server::runConnection(std::shared_ptr<State> state, std::intptr_t rawSocket) {
+void Server::runConnection(std::shared_ptr<State> state, std::intptr_t rawSocket,
+                           Clock::time_point acceptedAt) {
     const SocketHandle clientSocket = static_cast<SocketHandle>(rawSocket);
 
     // 作用域退出时把并发计数减回去 —— 下面有若干条提前返回的路径，
@@ -522,12 +523,21 @@ void Server::runConnection(std::shared_ptr<State> state, std::intptr_t rawSocket
     } activeGuard{state};
 
     // 两个时限：
-    //   overall —— 整个请求的总时限；
-    //   idle    —— 一次读之间允许的静默时长（停滞客户端就是死在这里）。
+    //
+    //   overall —— **整条连接**的总时限，**从 accept 那一刻起算**。
+    //              这是真正堵住「慢速滴字节」的那一条：逐次读超时挡不住
+    //              一个每 4 秒滴 1 字节的客户端（每次单独的读都很快返回），
+    //              只有「这条连接总共能活多久」的上限才能断开它。
+    //
+    //   idle    —— 一次读之间允许的静默时长（完全不发数据的停滞客户端
+    //              死在这里；比 overall 先触发，所以它的报错更准确）。
+    //
+    // acceptedAt 由 accept 循环在 accept() 返回的那一刻记下 —— 连接线程
+    // 是另起的线程，如果在线程里才起算，就漏掉了线程调度的那段时间。
     const Clock::time_point overallDeadline =
-        Clock::now() + std::chrono::milliseconds(kRequestTimeoutMillis);
+        acceptedAt + std::chrono::milliseconds(kConnectionTimeoutMillis);
     Clock::time_point idleDeadline =
-        Clock::now() + std::chrono::milliseconds(kReadTimeoutMillis);
+        std::min(overallDeadline, acceptedAt + std::chrono::milliseconds(kReadTimeoutMillis));
 
     std::string buffer;
     size_t headerEnd = std::string::npos;
@@ -748,6 +758,12 @@ void Server::serve() {
             if (!m_state->running.load()) break;
             continue;
         }
+        // 整条连接的总时限**从 accept 这一刻起算**。
+        //
+        // 记在这里而不是在线程里起算：连接线程是另起的线程，从线程里
+        // 起算就漏掉了线程调度的那段时间 —— 一个刚好卡在边界上的
+        // 慢滴客户端就能多占住几毫秒。
+        const Clock::time_point acceptedAt = Clock::now();
 
         // 并发上限：连接数满了就回 503 并关掉这个连接。
         // 线程不是无限的，失控的客户端不能无限地拉起线程。
@@ -763,8 +779,9 @@ void Server::serve() {
         // 线程只持有 shared_ptr<State>，Server 析构后它依然安全。
         try {
             std::thread worker([state = m_state,
-                                client = static_cast<std::intptr_t>(clientSocket)]() {
-                runConnection(state, client);
+                                client = static_cast<std::intptr_t>(clientSocket),
+                                acceptedAt]() {
+                runConnection(state, client, acceptedAt);
             });
             worker.detach();
         } catch (const std::system_error&) {
