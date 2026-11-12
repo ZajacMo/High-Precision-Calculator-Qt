@@ -184,7 +184,63 @@ int main(int argc, char** argv) {
     button->click();
     checkEqual(output->toPlainText(), QStringLiteral("1.5"), "fmod 语义：5.5 % 2");
 
-    // --- 10. 离屏渲染一张截图，确认能绘制 ---
+    // --- 10. 错误位置指向**串尾**时，注解不能说「已选中」 ---
+    //
+    // 内核对「表达式意外结束」这类错误报的位置是**串尾**（缺失的字符
+    // 本该出现的地方），那里**没有字符**可选。界面此时只能把光标放到
+    // 末尾 —— 所以注解**不能**说「已在输入框中选中该字符」：说了一件
+    // 假话，用户读完美目张望看不到任何高亮。
+    //
+    // "1+" 的位置是 2，正好等于串长（字节数），落进「超出末尾」那条路。
+    lineEdit->setText("1+");
+    combo->setCurrentIndex(0);
+    button->click();
+    check(output->toPlainText().contains(QStringLiteral("表达式意外结束")),
+          "1+ 报「表达式意外结束」");
+    check(output->toPlainText().contains(QStringLiteral("位置 2")), "1+ 的错误位置是 2");
+    check(lineEdit->selectedText().isEmpty(),
+          "位置指向串尾时没有选中任何字符（那里本来就没有字符）");
+    check(!note->text().contains(QStringLiteral("已在输入框中选中该字符")),
+          "位置指向串尾时注解不声称「已选中该字符」");
+    check(note->text().contains(QStringLiteral("已把光标放到表达式末尾")),
+          "位置指向串尾时注解说明光标被放到了末尾");
+    check(lineEdit->cursorPosition() == lineEdit->text().size(),
+          "位置指向串尾时光标落在表达式末尾");
+
+    // "sqrt(" 同理：位置 5 == 串长。
+    lineEdit->setText("sqrt(");
+    button->click();
+    check(lineEdit->selectedText().isEmpty(), "sqrt( 的错误位置也在串尾，选区为空");
+    check(!note->text().contains(QStringLiteral("已在输入框中选中该字符")),
+          "sqrt( 的注解同样不声称「已选中该字符」");
+
+    // --- 11. 非 BMP 字符：选中**整个**字符，不是半个 ---
+    //
+    // U+1F600（😀）在 UTF-16 里是**两个**码元（代理对 D83D DE00）。
+    // 选区长度必须按码点算 —— 写死 1 只会选中高代理那半个：既不是用户
+    // 看到的那个字符，复制出去也不是那个码点。
+    const QString grinning = QString(QChar(0xD83D)) + QString(QChar(0xDE00));
+    check(grinning.size() == 2, "U+1F600 在 UTF-16 里占 2 个码元");
+
+    // 错误位置 0 正好落在那个代理对上。
+    lineEdit->setText(grinning + QStringLiteral("1/0"));
+    button->click();
+    check(output->toPlainText().contains(QStringLiteral("意外的字符")),
+          "非 BMP 字符 + 1/0 报「意外的字符」");
+    check(output->toPlainText().contains(QStringLiteral("位置 0")), "非 BMP 字符 + 1/0 的错误位置是 0");
+    checkEqual(lineEdit->selectedText(), grinning,
+               "非 BMP 字符被**整个**选中（不是半个代理）");
+    check(lineEdit->selectedText().size() == 2,
+          "非 BMP 字符的选区长度是 2 个 UTF-16 码元");
+
+    // 前面带 ASCII 前缀时同样成立：位置 2（字节）落在代理对上。
+    lineEdit->setText(QStringLiteral("1/") + grinning);
+    button->click();
+    check(output->toPlainText().contains(QStringLiteral("位置 2")), "1/ + 非 BMP 字符 的错误位置是 2");
+    checkEqual(lineEdit->selectedText(), grinning,
+               "带 ASCII 前缀时非 BMP 字符也被整个选中");
+
+    // --- 12. 离屏渲染一张截图，确认能绘制 ---
     QPixmap pixmap;
     try {
         pixmap = window.grab();
