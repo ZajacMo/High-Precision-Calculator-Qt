@@ -6044,7 +6044,8 @@ if(BUILD_SERVER)
                 "${CMAKE_CURRENT_SOURCE_DIR}/web" "$<TARGET_FILE_DIR:hpc_server>/web"
         COMMENT "同步 Web 前端资源到构建目录")
     add_dependencies(hpc_server web_assets)
-endif()```
+endif()
+```
 
 - [x] **Step 3: 写 `src/api/ApiRoutes.h`**
 
