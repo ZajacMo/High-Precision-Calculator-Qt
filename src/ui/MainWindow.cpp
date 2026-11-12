@@ -228,10 +228,19 @@ void MainWindow::evaluate() {
             // "..." 表示「展开**被截断了**」。必须说出来 —— 把截断值当成
             // 精确值展示就是在骗用户。整数部分仍是精确的，一并说明。
             const std::size_t dot = converted.find('.');
-            const QString integerPart =
+            QString integerPart =
                 dot == std::string::npos
                     ? QString::fromStdString(converted)
                     : QString::fromStdString(converted.substr(0, dot));
+            // 负的非整数在截断到整数部分时会得到「-0」—— 但 **-0 不是
+            // 精确值**：它只是「整数部分为零」的另一种写法，而「零」才是
+            // 精确的那个数。注解里说「整数部分 -0 是精确的」就是在说谎。
+            //
+            // 所以把「-0」规整成「0」。这**不**改动输出区显示的值本身
+            // （那里显示的 -0.0101… 是对的），只修注解里那句话。
+            if (integerPart == QStringLiteral("-0")) {
+                integerPart = QStringLiteral("0");
+            }
             setNote(QStringLiteral("注意：末尾的 “...” 表示该进制下的小数展开被截断了，"
                                    "不是精确值；整数部分 %1 是精确的。")
                         .arg(integerPart));

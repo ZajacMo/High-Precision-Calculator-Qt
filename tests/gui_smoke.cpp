@@ -141,6 +141,23 @@ int main(int argc, char** argv) {
     check(!output->toPlainText().contains(QStringLiteral("...")),
           "能有限表示的值不带截断标记");
 
+    // --- 5b. 负的非整数：截断注解里不能出现「整数部分 -0 是精确的」 ---
+    //
+    // -1/3 在二进制下是 "-0.0101…" —— 截断到整数部分得到 "-0"。
+    // 但 **-0 不是精确值**：它只是「整数部分为零」的另一种写法，而
+    // 「零」才是精确的那个数。注解说「整数部分 -0 是精确的」就是说谎。
+    lineEdit->setText("-1/3");
+    combo->setCurrentIndex(1);          // 2（二进制）
+    button->click();
+    check(output->toPlainText().contains(QStringLiteral("...")),
+          "-1/3 在二进制下带截断标记");
+    check(output->toPlainText().startsWith(QStringLiteral("-0.")),
+          "-1/3 在二进制下以 -0. 开头（输出区显示的是对的）");
+    check(note->text().contains(QStringLiteral("整数部分 0 是精确的")),
+          "注解说「整数部分 0 是精确的」，不是「-0」");
+    check(!note->text().contains(QStringLiteral("-0")),
+          "注解里没有「-0」");
+
     // --- 6. 错误：消息 + 位置 + 选中出错的字符 ---
     //
     // 期望值取自 hpc_cli：1/0 → "除数为零（位置 2）"。
