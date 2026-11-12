@@ -202,6 +202,18 @@ if(BUILD_TESTS)
         #
         # 脚本自己会拉起服务（端口上已有服务就复用），所以这里传的是
         # **可执行文件的绝对路径** + 端口。
+        #
+        # 端口分配：**三个 api 用例必须互不重叠**。
+        #
+        # api_stall_test.py 会用 PORT、PORT+1、PORT+2 三个端口
+        # （主用例、C 用例、D 用例各起一个服务）。所以给它的基准端口
+        # 8097 时，它占的是 8097/8098/8099 —— 而 api_e2e 用 8099，
+        # **正好撞上**。撞上的后果不是「测试失败」而是「测的不是自己
+        # 的东西」：api_stall 的 D 用例会连到 api_e2e 留下的服务上，
+        # Ctrl+C 事件发给错误的进程，用例要么假失败要么假通过。
+        #
+        # 所以这里给 api_stall 一个不与 api_e2e 相邻的基准端口：
+        # 8090 → 占 8090/8091/8092，与 api_e2e 的 8099 隔开。
         if(BUILD_SERVER)
             add_test(NAME api_e2e
                      COMMAND ${Python3_EXECUTABLE}
@@ -213,7 +225,7 @@ if(BUILD_TESTS)
             # Ctrl+C 必须能及时停服。
             add_test(NAME api_stall
                      COMMAND ${Python3_EXECUTABLE}
-                             "${_hpc_scripts}/api_stall_test.py" 8097
+                             "${_hpc_scripts}/api_stall_test.py" 8090
                              $<TARGET_FILE:hpc_server>)
             set_tests_properties(api_stall PROPERTIES TIMEOUT 600)
         endif()
