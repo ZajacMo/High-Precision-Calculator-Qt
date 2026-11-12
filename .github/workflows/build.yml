@@ -1,4 +1,30 @@
-name: 构建与测试
+# Build and test pipeline.
+#
+# ASCII ONLY. GitHub Actions parses this file as UTF-8, but keeping it
+# pure ASCII avoids encoding surprises: a stray byte that a local
+# editor wrote in the system code page can make the YAML parser reject
+# the whole file, and the failure message then points at a line that
+# looks perfectly fine. The same rule applies to the .bat scripts in
+# scripts/ (those really do break under the ANSI code page).
+#
+# Three jobs:
+#   core - the kernel, CLI, HTTP server and all tests, on three OSes.
+#          BUILD_GUI=OFF, so no third-party dependency is involved and
+#          the job works on any platform.
+#   gcc  - an explicit GCC build. Not redundant: MSVC transitively
+#          pulls in standard library headers (e.g. <algorithm>), which
+#          hides missing includes. GCC does not, so this job exists to
+#          expose "compiles on MSVC, does not compile on GCC" defects.
+#          It has already caught one such bug in CI.
+#   gui  - builds the Qt 6 GUI target and runs the offscreen smoke
+#          test. Qt is pulled with jurplel/install-qt-action (aqtinstall).
+#
+# The differential test suites are registered as CTest tests (see the
+# "diff_*" add_test() calls in CMakeLists.txt), so a plain
+# "ctest --test-dir build" covers the unit tests AND every differential
+# suite. That is why this workflow does not have a separate step for
+# them: the ctest step below already runs all twelve tests.
+name: Build and test
 
 on:
   push:
@@ -8,9 +34,7 @@ on:
 
 jobs:
   core:
-    # 内核、命令行与 Web 服务只需要 C++17 编译器，不依赖任何第三方库，
-    # 因此可以在任意平台上构建。
-    name: 核心算法与单元测试 (${{ matrix.os }})
+    name: Core and unit tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -20,70 +44,74 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 Python
+      - name: Install Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
-      - name: 配置
+      - name: Configure
         run: >
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           -DBUILD_GUI=OFF -DBUILD_CLI=ON -DBUILD_SERVER=ON -DBUILD_TESTS=ON
 
-      - name: 编译
+      - name: Build
         run: cmake --build build --config Release
 
-      - name: 运行单元测试
+      # Runs all twelve tests: the unit tests, the API unit tests,
+      # the eight differential suites (whose reference implementation
+      # is Python's decimal / fractions, sharing no code with the C++
+      # kernel), and the two end-to-end API tests.
+      - name: Run tests
         run: ctest --test-dir build --output-on-failure -C Release
 
-      - name: 差分测试（Python decimal / Fraction 为独立基准）
+      # The differential suites are already covered by ctest above.
+      # This step runs them a second time, but the other way round:
+      # scripts/run_differential.py drives each suite directly and
+      # reports which suite failed, which is what you want when a
+      # failure has to be diagnosed rather than just re-run.
+      #
+      # verify_cli_oj.py needs the legacy executable for its part 1
+      # (byte-for-byte comparison against the original implementation).
+      # CI does not have it, so that part is skipped with a printed
+      # reason and the script still exits 0. Parts 2, 3 and 4 (against
+      # correct arithmetic, malformed-input robustness, and input-stream
+      # alignment) do run.
+      - name: Differential suites (verbose per-suite report)
         run: python scripts/run_differential.py --build build
 
-      - name: API 端到端测试
-        shell: bash
-        run: |
-          # 启动服务 → 跑端到端用例 → 关闭服务。
-          # api_test.py 自己会拉起服务（找不到就在跑时启动），所以这里
-          # 不用手工 start/kill —— 手工管进程反而更容易在 CI 上留下
-          # 一个孤儿服务占着端口。
-          python scripts/api_test.py 8099
-
-      - name: 停滞客户端回归测试
-        shell: bash
-        run: python scripts/api_stall_test.py 8097
-
   gcc:
-    # 显式用 GCC 构建。MSVC 会传递性地带入一些标准库头文件（如 <algorithm>），
-    # 掩盖缺失 include 的问题；GCC 不会，因此这个作业专门用来暴露
-    # 「在 MSVC 上能编、在 GCC 上编不过」的可移植性缺陷。
-    #
-    # 这个作业**不是**多余的：它在 CI 上真的抓到了一个 bug
-    # （tests/test_framework.h 缺 <algorithm>，MSVC 能过，GCC 编不过）。
-    name: GCC 兼容性构建
+    name: GCC compatibility build
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: 配置
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Configure
         run: >
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           -DBUILD_GUI=OFF -DBUILD_CLI=ON -DBUILD_SERVER=ON -DBUILD_TESTS=ON
           -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER=gcc
 
-      - name: 编译
+      - name: Build
         run: cmake --build build --config Release
 
-      - name: 运行单元测试
+      - name: Run tests
         run: ctest --test-dir build --output-on-failure -C Release
 
   gui:
-    # 图形界面需要 Qt 6，用 aqtinstall 拉取。
+    # The GUI needs Qt 6, pulled with aqtinstall.
     #
-    # **不需要绑定到 MSVC**：Qt 6.6.2 的 msvc2019_64 与 mingw_64 两套都能
-    # 构建本项目的 GUI 目标并跑通离屏冒烟测试（实测两套都是 ctest 3/3）。
-    # 这里用 linux 作业覆盖 mingw 之外的路径，windows 作业覆盖 MSVC。
-    name: 图形界面构建 (${{ matrix.os }})
+    # It does NOT have to be pinned to MSVC: Qt 6.6.2 works with both
+    # msvc2019_64 and mingw_64 on this project (measured locally: both
+    # build the GUI target and pass the offscreen smoke test, ctest
+    # 3/3). The linux job covers the MinGW-free path; the windows job
+    # covers MSVC.
+    name: GUI build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -93,7 +121,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 Qt
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Qt
         id: aqt
         uses: jurplel/install-qt-action@v3
         with:
@@ -101,16 +134,19 @@ jobs:
           modules: ''
           cache: true
 
-      - name: 配置
+      - name: Configure
         run: >
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           -DBUILD_GUI=ON -DBUILD_CLI=ON -DBUILD_SERVER=ON -DBUILD_TESTS=ON
           -DCMAKE_PREFIX_PATH=${{ steps.aqt.outputs.qt_root_dir }}/${{ steps.aqt.outputs.qt_arch }}
 
-      - name: 编译
+      - name: Build
         run: cmake --build build --config Release
 
-      - name: 界面冒烟测试
+      # The offscreen platform plugin is required: without it the
+      # smoke test exits with "Qt platform plugin failed to load"
+      # rather than reporting a test failure.
+      - name: GUI smoke test
         env:
           QT_QPA_PLATFORM: offscreen
         run: ctest --test-dir build --output-on-failure -C Release -R gui_smoke
