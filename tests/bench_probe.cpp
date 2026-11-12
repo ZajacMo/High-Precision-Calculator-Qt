@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "core/BigDecimal.h"
+#include "core/Format.h"
 
 namespace {
 
@@ -222,6 +223,23 @@ int main() {
             g_sink += r.toString().size();
         }, 10);
         std::printf("D,exp_1e-200,30,%.4f\n", ms);
+    }
+
+    // --- E. 进制转换 ---
+    //
+    // 展开代价是 O(位数 × 块数)。这一组数字很重要，因为界面上的
+    // 精度上限（100000 位）是**够得着**的 —— 「高精度」不等于「快」。
+    // 100000 位转二进制要 8 秒量级，300000 位要 1 分半量级。
+    for (int digits : {10000, 100000, 300000}) {
+        const std::string text = makeNumber(digits);
+        const hpc::BigDecimal value = hpc::BigDecimal::fromString(text);
+
+        const auto start = Clock::now();
+        const std::string binary = hpc::toBaseString(value, 2);
+        const double ms = milliseconds(Clock::now() - start);
+        g_sink += binary.size();
+
+        std::printf("E,to_base2,%d,%.4f\n", digits, ms);
     }
 
     return 0;
