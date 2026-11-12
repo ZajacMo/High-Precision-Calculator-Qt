@@ -188,12 +188,15 @@ def main():
     # 用哪个 cmake？
     #
     # 优先 CMAKE_COMMAND 环境变量；否则用 Qt 自带的那个
-    # （C:\Qt\Tools\CMake_64\bin\cmake.exe）。**不要**直接用 PATH 上的
-    # cmake —— 本机 PATH 上是 3.31.6，而 Qt 自带的是 3.27.7；实测 3.31.6
-    # 跑这个 harness 时 AUTOMOC 步骤会失败：
-    #   moc: Cannot create .../hpc_gui_autogen/.../moc_MainWindow.cpp.
-    #   Error: No such file or directory
-    # 换 Qt 自带的 cmake 就通过（配置 + 构建 + ctest 全过）。
+    # （C:\Qt\Tools\CMake_64\bin\cmake.exe）。
+    #
+    # 选 Qt 自带的那个是为了**跟 scripts/msvc-env.bat 保持一致** —— 那个
+    # 脚本把 Qt 的 bin 目录放在 PATH 最前面，所以项目平时的构建用的就是
+    # Qt 自带的 cmake（3.27.7）。校验计划里的块时用**同一个** cmake，
+    # 才算得是「计划里的块在真实构建环境下能跑」。
+    #
+    # （PATH 上另一个是 3.31.6。实测它也能跑通这个 harness —— 配置 +
+    # 构建 + ctest 连续 4 次全过，没有出现过 AUTOMOC 失败。）
     cmake = os.environ.get('CMAKE_COMMAND')
     if not cmake:
         qt_cmake = r'C:\Qt\Tools\CMake_64\bin\cmake.exe'
