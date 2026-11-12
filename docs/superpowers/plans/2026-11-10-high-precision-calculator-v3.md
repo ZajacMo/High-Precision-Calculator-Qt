@@ -7141,9 +7141,48 @@ if(BUILD_GUI)
     # gui_smoke.exe 都只有在 Qt 的 bin 目录恰好在 PATH 上时才跑得起来
     # —— 直接双击 hpc_gui.exe 会弹「找不到 Qt6Core.dll」。
     #
-    # windeployqt 由 Qt6CoreTools 提供（find_package(Qt6) 会顺带找到它）。
-    find_program(HPC_WINDEPLOYQT windeployqt)
-    if(HPC_WINDEPLOYQT)
+    # 部署工具必须是**正在用的这个 Qt** 的那份，不能按 PATH 找。
+    #
+    # find_program 按 PATH 解析，结果取决于「碰巧 PATH 上有什么」：本机上
+    # Anaconda 的 Qt 5.15 版 windeployqt 排在 PATH 最前面，而它**不认**
+    # --include-plugins（那是 Qt 6 的选项），于是部署以退出码 1 失败 ——
+    # 或者更糟：用 Qt 5 的工具给 Qt 6 的程序部署出一套不匹配的插件。
+    #
+    # $<TARGET_FILE:Qt6::windeployqt> 指向 find_package(Qt6) 找到的那份
+    # windeployqt（Qt6CoreTools 提供的导入目标），版本必然与链接的 Qt 一致。
+    #
+    # 部署只在 Windows 上做：Windows 要把 DLL 和平台插件拷到可执行文件旁边
+    # 才能独立运行；其它平台由系统 Qt 提供运行时。
+    set(HPC_QT_DEPLOY_TOOL "")
+    if(WIN32)
+        if(TARGET Qt6::windeployqt)
+            set(HPC_QT_DEPLOY_TOOL "$<TARGET_FILE:Qt6::windeployqt>")
+        else()
+            # Qt 没提供 windeployqt 目标（精简安装 / QT_NO_CREATE_TARGETS）。
+            # 退化路径**也只在正在用的这个 Qt 的 bin 目录里找** ——
+            # NO_DEFAULT_PATH 保证不会去 PATH 上捡别的 Qt 的工具。
+            #
+            # NO_CACHE：换了 Qt 之后这个值必须重新解析，不能被上一次配置
+            # 缓存下来的路径粘住。
+            find_program(HPC_QT_DEPLOY_TOOL windeployqt
+                HINTS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH NO_CACHE)
+        endif()
+        if(NOT HPC_QT_DEPLOY_TOOL)
+            # 找不到部署工具时**让配置直接失败**，而不是打个警告继续。
+            #
+            # 警告之后的后果是：构建「成功」，但产出的 hpc_gui.exe 与
+            # gui_smoke.exe 跑不起来 —— ctest 拿到的是退出码 127（找不到
+            # DLL），那不是一条像样的测试失败，只会把人引向错误的方向。
+            # 这正是这个目标要防的事，所以它在配置阶段就应当喊出来。
+            message(FATAL_ERROR
+                "找不到 windeployqt（Qt6::windeployqt 目标不存在，"
+                "${Qt6_DIR}/../../../bin 下也没有）。\n"
+                "在 Windows 上不部署 Qt 运行时，hpc_gui.exe 与 gui_smoke.exe "
+                "都跑不起来（ctest 会以退出码 127 失败，而不是报出一个像样的"
+                "测试失败）。\n"
+                "请改装带部署工具的 Qt，或用 -DBUILD_GUI=OFF 关掉这个可选目标。")
+        endif()
+
         # 两个可执行文件在**同一个目录**里（都是构建目录的根），所以它们
         # 共享同一套 Qt 运行时 —— windeployqt 只需要跑**一次**。
         #
@@ -7171,15 +7210,12 @@ if(BUILD_GUI)
         # add_dependencies 的方向组合起来会成环。写成显式的路径就没有
         # 隐式边，方向完全由 add_dependencies 说了算。
         add_custom_target(hpc_qt_deploy ALL
-            COMMAND "${HPC_WINDEPLOYQT}" --no-translations --no-system-d3d-compiler
+            COMMAND "${HPC_QT_DEPLOY_TOOL}" --no-translations --no-system-d3d-compiler
                     --no-opengl-sw --no-compiler-runtime
                     --include-plugins qoffscreen
                     "$<TARGET_FILE_DIR:hpc_gui>/hpc_gui.exe"
             COMMENT "部署 Qt 运行时到构建目录")
         add_dependencies(hpc_qt_deploy hpc_gui)
-    else()
-        message(WARNING
-            "找不到 windeployqt：hpc_gui.exe 需要 Qt 的 bin 目录在 PATH 上才能运行。")
     endif()
 
     if(BUILD_TESTS)
@@ -7195,7 +7231,7 @@ if(BUILD_GUI)
         add_custom_command(TARGET gui_smoke POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory
                     "${CMAKE_CURRENT_BINARY_DIR}/screenshots")
-        if(HPC_WINDEPLOYQT)
+        if(HPC_QT_DEPLOY_TOOL)
             # 同样部署：否则 ctest 启动 gui_smoke 时会因找不到 Qt6Core.dll
             # 直接失败（退出码 127），而**不是**报出一个像样的测试失败。
             #
@@ -7274,7 +7310,9 @@ private:
     void evaluate();
     // 把一次求值结果追加到历史列表。
     void appendHistory(const QString& expression, const QString& result);
-    // 显示一条错误。position >= 0 时还要在输入框里选中出错的字符。
+    // 显示一条错误。position >= 0 时还要在输入框里指出出错的字符 ——
+    // 那个字符**存在**就选中它；位置指向**串尾**（缺失的字符本该出现
+    // 的地方）就只把光标放到末尾，注解也如实这么说。
     void showError(const QString& message, int position);
     // 结果区下方的注解（截断标记说明、出错位置说明）。空文本时隐藏。
     void setNote(const QString& text);
@@ -7359,6 +7397,20 @@ int utf8OffsetToUtf16(const QString& text, int byteOffset) {
         utf16 += codeUnits;
     }
     return utf16;
+}
+
+// 该位置上的字符占几个 UTF-16 码元。
+//
+// BMP 字符占 1 个；非 BMP 字符（代理对）占 2 个。选区长度必须按**码点**
+// 算 —— 硬编码成 1 会在代理对上只选中高代理那半个字符：既不是用户看到的
+// 字符，复制出去也不是那个码点。
+int utf16LengthAt(const QString& text, int index) {
+    if (index < 0 || index >= text.size()) return 0;
+    const QChar first = text.at(index);
+    if (first.isHighSurrogate() && index + 1 < text.size() && text.at(index + 1).isLowSurrogate()) {
+        return 2;
+    }
+    return 1;
 }
 
 }  // namespace
@@ -7542,17 +7594,30 @@ void MainWindow::showError(const QString& message, int position) {
     output_->setPlainText(text);
 
     if (position >= 0) {
-        setNote(QStringLiteral("位置 %1 是出错字符在表达式里的字节下标，"
-                               "已在输入框中选中该字符。").arg(position));
         const QString source = expression_->text();
         const int index = utf8OffsetToUtf16(source, position);
-        // 先给焦点再设选区：反过来时 setFocus() 可能把选区清掉。
-        expression_->setFocus();
         if (index < source.size()) {
-            expression_->setSelection(index, 1);
+            // 位置指着**确实存在**的那个字符 —— 选中它。
+            //
+            // 选区长度按**码点**算而不是写死 1：非 BMP 字符（代理对）占
+            // 2 个 UTF-16 码元，写死 1 只会选中高代理那半个 —— 既不是
+            // 用户看到的字符，复制出去也不是那个码点。
+            setNote(QStringLiteral("位置 %1 是出错字符在表达式里的字节下标，"
+                                   "已在输入框中选中该字符。").arg(position));
+            // 先给焦点再设选区：反过来时 setFocus() 可能把选区清掉。
+            expression_->setFocus();
+            expression_->setSelection(index, utf16LengthAt(source, index));
         } else {
-            // 位置指向串尾（缺失的字符本该出现的地方）—— 没有字符可选，
-            // 把光标放到末尾。
+            // 位置指向串尾 —— 那里**没有字符**，出错的字符本该出现在
+            // 那个位置（内核的「表达式意外结束」「表达式为空」就是这种）。
+            // 没有字符可选，只能把光标放到末尾。
+            //
+            // 所以这里**不能**说「已选中该字符」：选区是空的，说了就是
+            // 告诉用户一件假话 —— 用户读完美目张望看不到任何高亮。
+            setNote(QStringLiteral("位置 %1 是出错字符在表达式里的字节下标；"
+                                   "该位置已经超出表达式末尾（那里本该出现这个"
+                                   "字符），已把光标放到表达式末尾。").arg(position));
+            expression_->setFocus();
             expression_->setCursorPosition(source.size());
         }
     } else {
@@ -7589,7 +7654,7 @@ int main(int argc, char** argv) {
 
 - [x] **Step 5: 写 `tests/gui_smoke.cpp`**
 
-见 `tests/gui_smoke.cpp`（29 项断言）。要点：
+见 `tests/gui_smoke.cpp`（43 项断言）。要点：
 
 - 按 `objectName` 定位控件，**不**用 `findChild<QLineEdit*>()` 找第一个 ——
   `findChild` 按对象树顺序返回，控件一多就找错。
@@ -7598,6 +7663,11 @@ int main(int argc, char** argv) {
 - 覆盖：按钮路径、回车路径、精度生效、换进制、"..." 截断标记、
   能有限表示时**不**带标记、错误消息 + 位置 + 选中出错字符、
   超越函数精度上限报错、纯算术在 2000 位仍合法、fmod 语义。
+- 错误位置指向**串尾**时（`1+`、`sqrt(`）：那里没有字符可选，界面只把
+  光标放到末尾 —— 注解**不能**说「已选中该字符」（说假话）。断言的是
+  **注解文本与实际行为是否一致**，而不只是「选区为空」。
+- 非 BMP 字符（代理对）被选中时，选区必须覆盖**整个**字符（2 个 UTF-16
+  码元），不能只选中高代理那半个。
 - 渲染出的图**要有内容**：全黑说明什么都没画上去（`hasContent` 检查）。
 - 每个可能抛异常的调用各自包在 try/catch 里 —— 本文件的 `main`
   **不**捕获异常，未捕获的异常会直接 abort 掉测试二进制。
@@ -7614,6 +7684,13 @@ int main(int argc, char** argv) {
 
 **注意**：`msvc-env.bat` 中的 `CMAKE_PREFIX_PATH` 已指向 `C:\Qt\6.6.2\msvc2019_64`。
 **不要**用 PATH 上的 `qmake` —— 那是 Anaconda 的 Qt 5.15，版本不对。
+
+> **windeployqt 也必须用「正在用的这个 Qt」的那份**，不能按 PATH 找 ——
+> PATH 上排第一的是 Anaconda 的 Qt 5.15 版，它**不认** `--include-plugins`
+> （那是 Qt 6 的选项），部署会以退出码 1 失败。`$<TARGET_FILE:Qt6::windeployqt>`
+> 指向 `find_package(Qt6)` 找到的那份，版本必然与链接的 Qt 一致。
+> 找不到部署工具时**配置阶段直接失败**（而不是打个警告继续）—— 否则构建
+> 「成功」但产物跑不起来，ctest 拿到的是退出码 127 而不是一条像样的测试失败。
 
 > **GUI 目标在本机是 MSVC-only**：Qt 6.6.2 是 MSVC 构建，GCC 下没有可用的
 > Qt。GCC 的验证覆盖**默认（GUI 关）配置**。
@@ -7641,7 +7718,7 @@ git commit -m "feat(ui): Qt 桌面界面与离屏冒烟测试"
   显示正确结果、历史区有记录；输入 `7/3` 时显示
   `错误：多余的字符（位置 15）`，且输入框里那个出错字符**被选中高亮**。
 - **部署后的产物自包含**：不把 Qt 的 bin 目录放进 `PATH`，直接跑
-  `./gui_smoke.exe` 仍然全部通过（29/29）—— Qt 的 DLL 与平台插件就在
+  `./gui_smoke.exe` 仍然全部通过（43/43）—— Qt 的 DLL 与平台插件就在
   可执行文件旁边。
 - **截图存在仓库里**：`docs/screenshots/qt_native_success.png`（真实原生
   窗口，成功路径）、`qt_native_window.png`（真实原生窗口，空状态）、
