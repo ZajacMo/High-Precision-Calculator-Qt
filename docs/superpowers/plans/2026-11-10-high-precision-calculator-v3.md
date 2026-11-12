@@ -5892,6 +5892,9 @@ git commit -m "feat(cli): 交互/单次/OJ 三模式命令行前端"
 - Create: `src/api/ApiRoutes.cpp`
 - Create: `src/server/main.cpp`
 - Create: `web/index.html`、`web/styles.css`、`web/app.js`
+- Create: `tests/tst_api.cpp`（API 层的单元测试，直接调 `Server::handle()`）
+- Create: `scripts/api_test.py`（端到端：拉起服务 → 逐个调用端点 → 校验响应）
+- Create: `scripts/screenshot.py`、`scripts/start-server.bat`
 - Modify: `CMakeLists.txt`
 
 **Interfaces:**
@@ -6045,6 +6048,29 @@ if(BUILD_SERVER)
         COMMENT "同步 Web 前端资源到构建目录")
     add_dependencies(hpc_server web_assets)
 endif()
+```
+
+API 层的单元测试单独注册一个目标（`tests/tst_api.cpp` 直接调
+`Server::handle()`，不经过网络）：
+
+```cmake
+    # API 层的单元测试：直接调 Server::handle()，不经过网络。
+    #
+    # 单独一个目标而不是塞进 hpc_tests：API 层要链 ApiRoutes.cpp 与
+    # ws2_32，核心测试不需要那些 —— 混在一起会让「核心零依赖」这条
+    # 约束在链接层面失守。
+    add_executable(hpc_api_tests
+        tests/tst_api.cpp
+        tests/tst_framework.cpp
+        src/api/ApiRoutes.cpp
+    )
+    target_link_libraries(hpc_api_tests PRIVATE hpc_core)
+    target_include_directories(hpc_api_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    hpc_set_warnings(hpc_api_tests)
+    if(WIN32)
+        target_link_libraries(hpc_api_tests PRIVATE ws2_32)
+    endif()
+    add_test(NAME hpc_api_tests COMMAND hpc_api_tests)
 ```
 
 - [x] **Step 3: 写 `src/api/ApiRoutes.h`**
@@ -6960,7 +6986,7 @@ button:hover { background: #3f7bea; }
 
 ```bash
 ./scripts/build-core.bat          # MSVC：核心 + CLI + 测试 + server
-./scripts/run-ctest.bat            # 1/1 通过
+./scripts/run-ctest.bat            # 2/2 通过（hpc_tests、hpc_api_tests）
 ```
 
 ```bash
