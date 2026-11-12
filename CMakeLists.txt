@@ -134,6 +134,16 @@ if(BUILD_TESTS)
     add_executable(expression_probe tests/expression_probe.cpp)
     target_link_libraries(expression_probe PRIVATE hpc_core)
     hpc_set_warnings(expression_probe)
+
+    # 性能基准探针：供 scripts/bench.py 运行，产出 docs/bignum-algorithms.md
+    # 里引用的那组数字。
+    #
+    # **不注册成 CTest 用例**：它的耗时随机器而异，放进 CI 只会制造 flaky
+    # 失败。CI 跑的是**正确性**测试；性能数字由维护者在自己的机器上复现。
+    # 这一点本身也是文档的一部分 —— 「可复现」意味着读者能看到怎么跑。
+    add_executable(bench_probe tests/bench_probe.cpp)
+    target_link_libraries(bench_probe PRIVATE hpc_core)
+    hpc_set_warnings(bench_probe)
 endif()
 
 # Qt 图形界面：**可选**目标。
