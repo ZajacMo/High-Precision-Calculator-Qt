@@ -1,13 +1,26 @@
+// Windows 的 minwindef.h 把 min/max 定义成宏，会把 std::min /
+// std::numeric_limits<>::max() 展开成乱七八糟的东西。
+// NOMINMAX 必须在包含任何 Windows 头文件**之前**定义。
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+
 #include "HttpServer.h"
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -46,8 +59,11 @@ std::string statusText(int status) {
         case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 408: return "Request Timeout";
         case 413: return "Payload Too Large";
+        case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
+        case 503: return "Service Unavailable";
         default: return "OK";
     }
 }
@@ -66,45 +82,116 @@ std::string mimeTypeFor(const std::string& path) {
     return "application/octet-stream";
 }
 
-// 等待监听的套接字上有连接排队。返回 true 表示可以 accept 了。
+// 统一的计时器。请求的各处时限都用它算差值。
+using Clock = std::chrono::steady_clock;
+
+// 等待套接字上某类事件就绪。
 //
-// 用带超时的 poll / WSAPoll 而不是直接阻塞在 accept() 里 ——
-// 这样 stop() 只需要把 m_running 置 false，serve() 线程最多等一个
-// poll 周期就会自己退出，不需要「从另一个线程关掉一个正在被 accept
-// 使用的句柄」那种有竞态的做法。
+// 返回 1 表示就绪，0 表示超时，-1 表示出错。
 //
-// 超时取 100 ms：足够短（停服务时最多多等 100 ms），也足够长
-// （不会在空闲时把 CPU 烧掉）。
-bool waitForConnection(SocketHandle listener) {
+// **为什么用带超时的 poll 而不是直接阻塞在 recv()/send() 里**：
+// 一个连上却什么都不说的客户端会让阻塞式的 recv() 永远不返回 ——
+// 单线程的服务就此挂死，后面的请求全部饿死（Task 8 评审实测）。
+// 带超时的 poll 让「等不到数据」变成一个**有界的等待**，超时就放弃
+// 这个连接，服务继续服务别的客户端。
+//
+// Windows 上用 WSAPoll，POSIX 上用 poll —— 与 accept 循环里已有的
+// 做法保持一致（同一套心智模型，不引入第二种机制）。
+int waitForSocket(SocketHandle socket, bool forWriting, int timeoutMillis) {
 #if defined(_WIN32)
     WSAPOLLFD descriptor{};
-    descriptor.fd = listener;
-    descriptor.events = POLLRDNORM;
-    // POLL_RDNORM 在 Windows 上对应「正常数据可读」—— 对监听套接字
-    // 来说就是「有连接排队」。
-    const int ready = WSAPoll(&descriptor, 1, 100);
-    return ready > 0 && (descriptor.revents & POLLRDNORM) != 0;
+    descriptor.fd = socket;
+    descriptor.events = forWriting ? POLLWRNORM : POLLRDNORM;
+    const int ready = WSAPoll(&descriptor, 1, timeoutMillis);
+    if (ready < 0) return -1;
+    return ready > 0 ? 1 : 0;
 #else
     pollfd descriptor{};
-    descriptor.fd = listener;
-    descriptor.events = POLLIN;
-    const int ready = ::poll(&descriptor, 1, 100);
-    return ready > 0 && (descriptor.revents & POLLIN) != 0;
+    descriptor.fd = socket;
+    descriptor.events = forWriting ? POLLOUT : POLLIN;
+    const int ready = ::poll(&descriptor, 1, timeoutMillis);
+    if (ready < 0) return -1;
+    return ready > 0 ? 1 : 0;
 #endif
 }
 
-// 读取一段数据。返回已读取的字节数，0 表示对端已关闭。
-int receiveSome(SocketHandle socket, std::string& buffer) {
-    char chunk[8192];
-    const int received = static_cast<int>(recv(socket, chunk, sizeof(chunk), 0));
-    if (received > 0) {
-        buffer.append(chunk, static_cast<size_t>(received));
-    }
-    return received;
+// 算「还能等多久」。
+//
+// 两个截止时刻取更早的那个：
+//   - overall：整个请求的总时限（挡住慢速滴字节的打法）；
+//   - idle：一次读操作之间允许的静默时长（挡住完全不发数据的客户端）。
+// 返回 0 表示已经到期。
+int sliceUntil(Clock::time_point overall, Clock::time_point idle) {
+    const Clock::time_point limit = std::min(overall, idle);
+    const Clock::time_point now = Clock::now();
+    if (now >= limit) return 0;
+    const long long millis =
+        std::chrono::duration_cast<std::chrono::milliseconds>(limit - now).count();
+    return static_cast<int>(millis > 1 ? millis : 1);
 }
 
-// 从原始数据中解析 Content-Length。
-size_t contentLengthOf(const std::string& headers) {
+#if !defined(_WIN32) && defined(MSG_NOSIGNAL)
+// 对端提前关闭时 send() 会触发 SIGPIPE，默认行为是**杀死整个进程**。
+// MSG_NOSIGNAL 让它变成一个返回 -1 的错误。
+constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+constexpr int kSendFlags = 0;
+#endif
+
+// 发送全部数据（处理部分发送）。
+//
+// 带写超时：客户端不读响应时，阻塞式的 send() 同样会挂住。
+bool sendAll(SocketHandle socket, const char* data, size_t size,
+             Clock::time_point deadline) {
+    size_t sent = 0;
+    while (sent < size) {
+        const int slice = sliceUntil(deadline, deadline);
+        if (slice <= 0) return false;
+        const int ready = waitForSocket(socket, true, slice);
+        if (ready < 0) return false;
+        if (ready == 0) continue;
+        const size_t remaining = size - sent;
+        const int chunk = static_cast<int>(remaining > (1u << 20) ? (1u << 20) : remaining);
+        const int written = send(socket, data + sent, chunk, kSendFlags);
+        if (written <= 0) return false;
+        sent += static_cast<size_t>(written);
+    }
+    return true;
+}
+
+// 构造一个最小的错误响应体。形状与 API 层的失败响应一致：
+// {"ok": false, "error": "..."}。
+std::string simpleErrorBody(const std::string& message) {
+    std::ostringstream out;
+    out << "{\"ok\":false,\"error\":\"" << message << "\"}";
+    return out.str();
+}
+
+// 发一个错误响应然后关闭连接。用于请求没被完整解析的场合
+// （此时无法走正常的路由分发）。
+void sendSimpleError(SocketHandle socket, int status, const std::string& message) {
+    const std::string body = simpleErrorBody(message);
+    std::ostringstream out;
+    out << "HTTP/1.1 " << status << " " << statusText(status) << "\r\n";
+    out << "Content-Type: application/json; charset=utf-8\r\n";
+    out << "Content-Length: " << body.size() << "\r\n";
+    out << "Connection: close\r\n";
+    out << "Cache-Control: no-store\r\n";
+    out << "Access-Control-Allow-Origin: *\r\n";
+    out << "\r\n";
+    out << body;
+    const std::string serialized = out.str();
+    const Clock::time_point deadline =
+        Clock::now() + std::chrono::milliseconds(Server::kWriteTimeoutMillis);
+    sendAll(socket, serialized.data(), serialized.size(), deadline);
+}
+
+// 从请求头块里解析 Content-Length。
+//
+// 返回 false 表示请求头里没有（可解析的）Content-Length。
+// 返回 true 时 value 可能是 SIZE_MAX（声明了一个荒谬的长度）——
+// 那种情况会被上限检查拒掉，所以饱和到 SIZE_MAX 是安全的。
+bool contentLengthOf(const std::string& headers, size_t& value) {
     const std::string lowered = [&headers] {
         std::string copy = headers;
         std::transform(copy.begin(), copy.end(), copy.begin(),
@@ -112,17 +199,35 @@ size_t contentLengthOf(const std::string& headers) {
         return copy;
     }();
     const size_t position = lowered.find("content-length:");
-    if (position == std::string::npos) return 0;
+    if (position == std::string::npos) return false;
     size_t start = position + 15;
     while (start < lowered.size() && std::isspace(static_cast<unsigned char>(lowered[start]))) {
         ++start;
     }
-    size_t value = 0;
+    size_t parsed = 0;
+    bool sawDigit = false;
     while (start < lowered.size() && std::isdigit(static_cast<unsigned char>(lowered[start]))) {
-        value = value * 10 + static_cast<size_t>(lowered[start] - '0');
+        sawDigit = true;
+        const size_t digit = static_cast<size_t>(lowered[start] - '0');
+        // 溢出检测：饱和到上限，而不是绕回一个小值。
+        if (parsed > (std::numeric_limits<size_t>::max() - digit) / 10) {
+            parsed = std::numeric_limits<size_t>::max();
+        } else {
+            parsed = parsed * 10 + digit;
+        }
         ++start;
     }
-    return value;
+    if (!sawDigit) return false;
+    value = parsed;
+    return true;
+}
+
+void closeSocket(SocketHandle socket) {
+#if defined(_WIN32)
+    closesocket(socket);
+#else
+    close(socket);
+#endif
 }
 
 }  // namespace
@@ -252,7 +357,10 @@ Response Response::text(const std::string& body, int status) {
     return response;
 }
 
-Server::Server() {
+// Server 的共享状态定义在头文件里（Server::State）。
+// 它的存在理由见头文件的注释。
+
+Server::Server() : m_state(std::make_shared<State>()) {
 #if defined(_WIN32)
     WSADATA data;
     WSAStartup(MAKEWORD(2, 2), &data);
@@ -265,16 +373,24 @@ Server::~Server() {
     WSACleanup();
 #endif
 }
+
 void Server::route(const std::string& path, Handler handler) {
-    m_routes[path] = std::move(handler);
+    std::lock_guard<std::mutex> guard(m_state->routeMutex);
+    m_state->routes[path] = std::move(handler);
 }
 
 void Server::serveStatic(const std::string& prefix, const std::string& directory) {
-    m_staticRoutes.emplace_back(prefix, directory);
+    std::lock_guard<std::mutex> guard(m_state->routeMutex);
+    m_state->staticRoutes.emplace_back(prefix, directory);
 }
 
-Response Server::handleStatic(const Request& request) const {
-    for (const auto& entry : m_staticRoutes) {
+Response Server::handleStatic(const State& state, const Request& request) {
+    std::vector<std::pair<std::string, std::string>> routes;
+    {
+        std::lock_guard<std::mutex> guard(state.routeMutex);
+        routes = state.staticRoutes;
+    }
+    for (const auto& entry : routes) {
         const std::string& prefix = entry.first;
         if (request.path.size() < prefix.size() ||
             request.path.compare(0, prefix.size(), prefix) != 0) {
@@ -303,18 +419,27 @@ Response Server::handleStatic(const Request& request) const {
     return Response::error(404, "未找到该资源。");
 }
 
-Response Server::handle(const Request& request) const {
-    const auto it = m_routes.find(request.path);
-    if (it != m_routes.end()) {
+Response Server::dispatch(const State& state, const Request& request) {
+    Handler handler;
+    {
+        std::lock_guard<std::mutex> guard(state.routeMutex);
+        const auto it = state.routes.find(request.path);
+        if (it != state.routes.end()) handler = it->second;
+    }
+    if (handler) {
         try {
-            return it->second(request);
+            return handler(request);
         } catch (const std::exception& error) {
             return Response::error(500, std::string("服务器内部错误：") + error.what());
         } catch (...) {
             return Response::error(500, "服务器内部错误。");
         }
     }
-    return handleStatic(request);
+    return handleStatic(state, request);
+}
+
+Response Server::handle(const Request& request) const {
+    return dispatch(*m_state, request);
 }
 
 bool Server::listen(const std::string& host, int port) {
@@ -329,30 +454,18 @@ bool Server::listen(const std::string& host, int port) {
     address.sin_family = AF_INET;
     address.sin_port = htons(static_cast<uint16_t>(port));
     if (inet_pton(AF_INET, host.c_str(), &address.sin_addr) != 1) {
-#if defined(_WIN32)
-        closesocket(listener);
-#else
-        close(listener);
-#endif
+        closeSocket(listener);
         return false;
     }
 
     if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
-#if defined(_WIN32)
-        closesocket(listener);
-#else
-        close(listener);
-#endif
+        closeSocket(listener);
         return false;
     }
 
     // 用 :: 限定，避免与本类的 listen 成员函数名冲突。
     if (::listen(listener, 16) != 0) {
-#if defined(_WIN32)
-        closesocket(listener);
-#else
-        close(listener);
-#endif
+        closeSocket(listener);
         return false;
     }
 
@@ -369,16 +482,238 @@ bool Server::listen(const std::string& host, int port) {
         m_boundPort = port;
     }
 
-    m_socket = static_cast<std::intptr_t>(listener);
-    m_socketClosed.store(false);
+    m_state->listener.store(static_cast<std::intptr_t>(listener));
+    m_state->socketClosed.store(false);
     // 在 listen 阶段就置位，避免 start() 之后主线程读到 running() == false 而提前退出。
-    m_running.store(true);
+    m_state->running.store(true);
     return true;
 }
 
+// 处理一个已建立的连接。
+//
+// 线程模型：accept 循环每接受一个连接就 detach 一个线程来处理它。
+//
+// **为什么每连接一个线程**：单线程下，一个「连上但不发数据」的客户端
+// 会把服务卡死在 recv() 里，后面所有请求都饿死。拆成每连接一个线程后，
+// 慢客户端只占住自己那个线程 —— 服务对别的客户端照常响应。
+//
+// **为什么线程 detach 而不是 join**：内核的运算**不可打断**
+//（一个 30 万位的进制转换要算 87 秒，中途没有取消点）。
+// 如果 stop() 要 join 这些线程，停服就会被一个长请求拖住 ——
+// 那正是要修的「Ctrl+C 停不下来」。detach 之后 stop() 只 join
+// accept 线程（那个线程只做 accept/poll，最多等 100 ms）。
+//
+// 共享状态放在 State 里，用 shared_ptr 持有：Server 析构后
+// 连接线程仍可安全地读完它要读的东西。
+void Server::runConnection(std::shared_ptr<State> state, std::intptr_t rawSocket) {
+    const SocketHandle clientSocket = static_cast<SocketHandle>(rawSocket);
+
+    // 作用域退出时把并发计数减回去 —— 下面有若干条提前返回的路径，
+    // 用 RAII 免得漏掉其中一条。
+    struct ActiveGuard {
+        std::shared_ptr<State> state;
+        ~ActiveGuard() {
+            {
+                std::lock_guard<std::mutex> guard(state->activeMutex);
+                state->activeConnections.fetch_sub(1);
+            }
+            state->activeChanged.notify_all();
+        }
+    } activeGuard{state};
+
+    // 两个时限：
+    //   overall —— 整个请求的总时限；
+    //   idle    —— 一次读之间允许的静默时长（停滞客户端就是死在这里）。
+    const Clock::time_point overallDeadline =
+        Clock::now() + std::chrono::milliseconds(kRequestTimeoutMillis);
+    Clock::time_point idleDeadline =
+        Clock::now() + std::chrono::milliseconds(kReadTimeoutMillis);
+
+    std::string buffer;
+    size_t headerEnd = std::string::npos;
+    bool headerTooLarge = false;
+    bool headerTimedOut = false;
+
+    // ---- 读请求头 ----
+    for (;;) {
+        const int slice = sliceUntil(overallDeadline, idleDeadline);
+        if (slice <= 0) {
+            // 客户端在时限内没把请求头发完 —— 认定它停滞了。
+            headerTimedOut = true;
+            break;
+        }
+        const int ready = waitForSocket(clientSocket, false, slice);
+        if (ready < 0) break;       // 套接字出错：直接关掉
+        if (ready == 0) continue;   // 这一片超时了：重算剩余时间再等
+        char chunk[8192];
+        const int received = static_cast<int>(recv(clientSocket, chunk, sizeof(chunk), 0));
+        if (received <= 0) break;  // 对端关闭
+        buffer.append(chunk, static_cast<size_t>(received));
+        // 有进展就重置「静默」计时器：客户端在慢慢发数据是允许的
+        // （总时限仍然兜底）。
+        idleDeadline = Clock::now() + std::chrono::milliseconds(kReadTimeoutMillis);
+        const size_t found = buffer.find("\r\n\r\n");
+        if (found != std::string::npos) {
+            headerEnd = found;
+            break;
+        }
+        if (buffer.size() > kMaxHeaderBytes) {
+            headerTooLarge = true;
+            break;
+        }
+    }
+
+    if (headerTooLarge) {
+        sendSimpleError(clientSocket, 431, "请求头过大。");
+        closeSocket(clientSocket);
+        return;
+    }
+    if (headerTimedOut) {
+        sendSimpleError(clientSocket, 408, "读取请求头超时。");
+        closeSocket(clientSocket);
+        return;
+    }
+    if (headerEnd == std::string::npos) {
+        // 对端关闭或出错：不必回复。
+        closeSocket(clientSocket);
+        return;
+    }
+
+    // ---- 解析请求行与请求头 ----
+    Request request;
+    const std::string headerBlock = buffer.substr(0, headerEnd);
+    const size_t bodyStart = headerEnd + 4;
+
+    std::istringstream headerStream(headerBlock);
+    std::string requestLine;
+    std::getline(headerStream, requestLine);
+    if (!requestLine.empty() && requestLine.back() == '\r') requestLine.pop_back();
+
+    std::istringstream lineStream(requestLine);
+    std::string target;
+    lineStream >> request.method >> target;
+
+    const size_t questionMark = target.find('?');
+    if (questionMark != std::string::npos) {
+        request.path = target.substr(0, questionMark);
+        request.query = target.substr(questionMark + 1);
+    } else {
+        request.path = target;
+    }
+    request.queryParams = parseQueryString(request.query);
+    request.queryParamsAll = parseQueryStringAll(request.query);
+
+    std::string headerLine;
+    while (std::getline(headerStream, headerLine)) {
+        if (!headerLine.empty() && headerLine.back() == '\r') headerLine.pop_back();
+        const size_t colon = headerLine.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = headerLine.substr(0, colon);
+        std::string value = headerLine.substr(colon + 1);
+        // 去掉键名两端空白与值的前导空白。
+        const size_t keyStart = key.find_first_not_of(" \t");
+        const size_t keyEnd = key.find_last_not_of(" \t");
+        key = (keyStart == std::string::npos) ? "" : key.substr(keyStart, keyEnd - keyStart + 1);
+        const size_t valueStart = value.find_first_not_of(" \t");
+        value = (valueStart == std::string::npos) ? "" : value.substr(valueStart);
+        // 键名统一转为小写，便于查询。
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        request.headers[key] = value;
+    }
+
+    // ---- 读请求体 ----
+    //
+    // 先看 Content-Length：声明一个荒谬的长度就立刻拒掉，
+    // 不然它能把连接一直占着（只靠读超时挡不住「声明 1 GB 然后
+    // 慢慢滴字节」的打法 —— 每次滴一点都算「有进展」）。
+    size_t expectedBody = 0;
+    const bool hasContentLength = contentLengthOf(headerBlock, expectedBody);
+    if (hasContentLength && expectedBody > kMaxRequestBodyBytes) {
+        sendSimpleError(clientSocket, 413,
+                        "请求体过大：Content-Length 超过 " +
+                            std::to_string(kMaxRequestBodyBytes) + " 字节上限。");
+        closeSocket(clientSocket);
+        return;
+    }
+
+    size_t bodyEnd = buffer.size();
+    if (hasContentLength) {
+        // 按 Content-Length 补齐请求体。
+        bool bodyTimedOut = false;
+        while (buffer.size() < bodyStart + expectedBody) {
+            const int slice = sliceUntil(overallDeadline, idleDeadline);
+            if (slice <= 0) {
+                bodyTimedOut = true;
+                break;
+            }
+            const int ready = waitForSocket(clientSocket, false, slice);
+            if (ready < 0) break;
+            if (ready == 0) continue;
+            char chunk[8192];
+            const int received = static_cast<int>(recv(clientSocket, chunk, sizeof(chunk), 0));
+            if (received <= 0) break;
+            buffer.append(chunk, static_cast<size_t>(received));
+            idleDeadline = Clock::now() + std::chrono::milliseconds(kReadTimeoutMillis);
+        }
+        if (bodyTimedOut) {
+            sendSimpleError(clientSocket, 408, "读取请求体超时。");
+            closeSocket(clientSocket);
+            return;
+        }
+        bodyEnd = std::min(bodyStart + expectedBody, buffer.size());
+    } else {
+        // 没有 Content-Length：把请求头之后已到达的字节当作请求体
+        // （与本项目原来的行为一致），但仍然受上限约束。
+        if (buffer.size() - bodyStart > kMaxRequestBodyBytes) {
+            sendSimpleError(clientSocket, 413, "请求体过大。");
+            closeSocket(clientSocket);
+            return;
+        }
+    }
+    request.body = buffer.substr(bodyStart, bodyEnd - bodyStart);
+
+    // ---- 处理并应答 ----
+    //
+    // 请求边界上查一次停止标志：服务已经在收尾了，就别再开始一次
+    // 动辄几十秒的计算（那会让停服多等那么久）。
+    //
+    // 这只挡得住**还没开始**的计算；已经在算的那一次是没有取消点
+    // 的（内核的运算不可打断），只能等它算完或随进程一起结束 ——
+    // 后者由 main.cpp 的宽限期 + _Exit() 负责。
+    if (!state->running.load()) {
+        sendSimpleError(clientSocket, 503, "服务正在停止。");
+        closeSocket(clientSocket);
+        return;
+    }
+
+    const Response response = dispatch(*state, request);
+
+    std::ostringstream out;
+    out << "HTTP/1.1 " << response.status << " " << statusText(response.status) << "\r\n";
+    out << "Content-Type: " << response.contentType << "\r\n";
+    out << "Content-Length: " << response.body.size() << "\r\n";
+    out << "Connection: close\r\n";
+    out << "Cache-Control: no-store\r\n";
+    // 允许同源的前端页面调用 API。
+    out << "Access-Control-Allow-Origin: *\r\n";
+    for (const auto& header : response.headers) {
+        out << header.first << ": " << header.second << "\r\n";
+    }
+    out << "\r\n";
+    out << response.body;
+
+    const std::string serialized = out.str();
+    const Clock::time_point writeDeadline =
+        Clock::now() + std::chrono::milliseconds(kWriteTimeoutMillis);
+    sendAll(clientSocket, serialized.data(), serialized.size(), writeDeadline);
+
+    closeSocket(clientSocket);
+}
+
 void Server::serve() {
-    if (m_socket < 0) return;
-    const SocketHandle listener = static_cast<SocketHandle>(m_socket);
+    const SocketHandle listener = static_cast<SocketHandle>(m_state->listener.load());
+    if (listener == kInvalidSocket) return;
 
     // 等待新连接时用**带超时的 poll**，而不是直接阻塞在 accept() 里。
     //
@@ -390,14 +725,15 @@ void Server::serve() {
     //     的竞态：close 之后 OS 可能把同一个句柄号分给别的套接字，
     //     而 accept() 还拿着那个号。
     //
-    // 带超时的 poll 两条路都绕开了：stop() 只需要把 m_running 置 false，
+    // 带超时的 poll 两条路都绕开了：stop() 只需要把 running 置 false，
     // serve() 最多等一个 poll 周期（100 ms）就会自己退出。
     // 句柄的关闭仍然只由 serve() 退出时做一次，没有竞态。
-    while (m_running.load()) {
+    while (m_state->running.load()) {
         // 等待监听的套接字可读（有连接排队）。
-        if (!waitForConnection(listener)) {
-            // 出错或超时：回到循环顶部重新查 m_running。
-            if (!m_running.load()) break;
+        const int ready = waitForSocket(listener, false, 100);
+        if (ready <= 0) {
+            // 出错或超时：回到循环顶部重新查 running。
+            if (!m_state->running.load()) break;
             continue;
         }
 
@@ -409,96 +745,36 @@ void Server::serve() {
 #endif
         SocketHandle clientSocket = accept(listener, reinterpret_cast<sockaddr*>(&client), &length);
         if (clientSocket == kInvalidSocket) {
-            if (!m_running.load()) break;
+            if (!m_state->running.load()) break;
             continue;
         }
 
-        // 先读到请求头结束，再按 Content-Length 补齐请求体。
-        // 不能一次性读到连接关闭——浏览器与 curl 都会等响应才关闭写端，会互相等待。
-        std::string raw;
-        size_t headerEnd = std::string::npos;
-        while (headerEnd == std::string::npos) {
-            if (receiveSome(clientSocket, raw) <= 0) break;
-            headerEnd = raw.find("\r\n\r\n");
-            if (raw.size() > 4u * 1024u * 1024u) break;  // 防止无界增长
+        // 并发上限：连接数满了就回 503 并关掉这个连接。
+        // 线程不是无限的，失控的客户端不能无限地拉起线程。
+        if (m_state->activeConnections.load() >= kMaxConcurrentConnections) {
+            sendSimpleError(clientSocket, 503, "服务忙：并发连接数已达上限。");
+            closeSocket(clientSocket);
+            continue;
         }
 
-        // 解析请求行与请求头。
-        Request request;
-        if (headerEnd != std::string::npos) {
-            const std::string headerBlock = raw.substr(0, headerEnd);
-            request.body = raw.substr(headerEnd + 4);
-
-            std::istringstream headerStream(headerBlock);
-            std::string requestLine;
-            std::getline(headerStream, requestLine);
-            if (!requestLine.empty() && requestLine.back() == '\r') requestLine.pop_back();
-
-            std::istringstream lineStream(requestLine);
-            std::string target;
-            lineStream >> request.method >> target;
-
-            const size_t questionMark = target.find('?');
-            if (questionMark != std::string::npos) {
-                request.path = target.substr(0, questionMark);
-                request.query = target.substr(questionMark + 1);
-            } else {
-                request.path = target;
-            }
-            request.queryParams = parseQueryString(request.query);
-            request.queryParamsAll = parseQueryStringAll(request.query);
-
-            std::string headerLine;
-            while (std::getline(headerStream, headerLine)) {
-                if (!headerLine.empty() && headerLine.back() == '\r') headerLine.pop_back();
-                const size_t colon = headerLine.find(':');
-                if (colon == std::string::npos) continue;
-                std::string key = headerLine.substr(0, colon);
-                std::string value = headerLine.substr(colon + 1);
-                // 去掉键名两端空白与值的前导空白。
-                const size_t keyStart = key.find_first_not_of(" \t");
-                const size_t keyEnd = key.find_last_not_of(" \t");
-                key = (keyStart == std::string::npos) ? "" : key.substr(keyStart, keyEnd - keyStart + 1);
-                const size_t valueStart = value.find_first_not_of(" \t");
-                value = (valueStart == std::string::npos) ? "" : value.substr(valueStart);
-                // 键名统一转为小写，便于查询。
-                std::transform(key.begin(), key.end(), key.begin(),
-                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                request.headers[key] = value;
-            }
-
-            // 按 Content-Length 补齐请求体。
-            const size_t expectedBody = contentLengthOf(headerBlock);
-            while (request.body.size() < expectedBody) {
-                if (receiveSome(clientSocket, raw) <= 0) break;
-                request.body = raw.substr(headerEnd + 4);
-            }
+        m_state->activeConnections.fetch_add(1);
+        // detach：这个线程可能比 Server 活得久（内核运算不可打断），
+        // join 会让 stop() 被一个长请求拖住 —— 那正是要修的缺陷。
+        // 线程只持有 shared_ptr<State>，Server 析构后它依然安全。
+        try {
+            std::thread worker([state = m_state,
+                                client = static_cast<std::intptr_t>(clientSocket)]() {
+                runConnection(state, client);
+            });
+            worker.detach();
+        } catch (const std::system_error&) {
+            // 线程拉不起来（系统资源耗尽）：回一个 503，把计数还回去。
+            // 不处理的话 activeConnections 会永远多 1，stop() 的等待
+            // 也会因此多等一个宽限期。
+            m_state->activeConnections.fetch_sub(1);
+            sendSimpleError(clientSocket, 503, "服务忙：无法建立连接线程。");
+            closeSocket(clientSocket);
         }
-
-        const Response response = handle(request);
-
-        std::ostringstream out;
-        out << "HTTP/1.1 " << response.status << " " << statusText(response.status) << "\r\n";
-        out << "Content-Type: " << response.contentType << "\r\n";
-        out << "Content-Length: " << response.body.size() << "\r\n";
-        out << "Connection: close\r\n";
-        out << "Cache-Control: no-store\r\n";
-        // 允许同源的前端页面调用 API。
-        out << "Access-Control-Allow-Origin: *\r\n";
-        for (const auto& header : response.headers) {
-            out << header.first << ": " << header.second << "\r\n";
-        }
-        out << "\r\n";
-        out << response.body;
-
-        const std::string serialized = out.str();
-        send(clientSocket, serialized.data(), static_cast<int>(serialized.size()), 0);
-
-#if defined(_WIN32)
-        closesocket(clientSocket);
-#else
-        close(clientSocket);
-#endif
     }
 
     // serve() 结束时关闭监听套接字。
@@ -506,15 +782,11 @@ void Server::serve() {
     // 但**只有 stop() 没有关过它**时才在这里关 —— stop() 为了唤醒
     // accept() 会自己 close 掉监听套接字（见 stop() 的注释）。如果
     // serve() 在这里再 close 一次，句柄就会被释放两次。
-    if (!m_socketClosed.exchange(true)) {
-#if defined(_WIN32)
-        closesocket(listener);
-#else
-        close(listener);
-#endif
+    if (!m_state->socketClosed.exchange(true)) {
+        closeSocket(listener);
     }
-    m_socket = -1;
-    m_running.store(false);
+    m_state->listener.store(-1);
+    m_state->running.store(false);
 }
 
 bool Server::start(const std::string& host, int port) {
@@ -524,11 +796,12 @@ bool Server::start(const std::string& host, int port) {
 }
 
 void Server::stop() {
-    m_running.store(false);
+    auto state = m_state;
+    state->running.store(false);
     // 只翻标志位，不动套接字。
     //
     // serve() 用**带超时的 poll** 等连接（见 serve() 的注释），最多
-    // 100 ms 就会自己看到 m_running == false 并退出，然后由 serve()
+    // 100 ms 就会自己看到 running == false 并退出，然后由 serve()
     // 关闭监听套接字并回收自己。
     //
     // 这样 stop() 不需要「从另一个线程关掉一个正在被 accept() 使用的
@@ -539,8 +812,18 @@ void Server::stop() {
     // **监听**套接字上的 accept() 无效 —— 那是挂死，不是唤醒。
     // 本项目改用带超时的 poll，从根上绕开了这个问题。）
     if (m_thread.joinable()) {
+        // accept 线程只做 accept/poll，最多等 100 ms 就退出 ——
+        // 所以这里的 join 是**有界**的。
         m_thread.join();
     }
+
+    // 还在计算的请求可能停不下来（内核的运算没有取消点）。
+    // 最多等一小段时间让它们自己收尾；超时就放手 ——
+    // 连接线程是 detach 的，且只持有 shared_ptr<State>，
+    // 它们不会碰到已经析构的 Server。
+    std::unique_lock<std::mutex> guard(state->activeMutex);
+    state->activeChanged.wait_for(guard, std::chrono::milliseconds(kStopGraceMillis),
+                                   [state] { return state->activeConnections.load() == 0; });
 }
 
 }  // namespace http

@@ -3,9 +3,13 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -55,8 +59,47 @@ struct Response {
 using Handler = std::function<Response(const Request&)>;
 
 // HTTP 服务。
+//
+// **并发模型**：accept 循环在一个线程上，每个连接再开一个线程处理。
+//
+// 为什么不是单线程：单线程下，只要有一个客户端连上却什么都不说，整
+// 个服务就卡在 recv() 里 —— 后面所有请求都饿死（Task 8 评审发现的
+// 「停滞客户端挂死服务端」）。改成每连接一个线程后，慢客户端最多只
+// 占住自己那个线程。
+//
+// 连接数有上限（kMaxConcurrentConnections），超过就回 503：线程不是
+// 无限的，失控的客户端不能无限地拉起线程。
+//
+// **共享状态**：路由表与静态目录放在 State 里，用 shared_ptr 持有 ——
+// 连接线程是 detach 出去的，Server 析构后它们可能还在跑，只能靠
+// shared_ptr 保证它们读到的东西还活着。
 class Server {
 public:
+    // 服务内部共享的状态。
+    //
+    // 单独拎出来的原因：连接线程是 **detach** 出去的，Server 析构之后
+    // 它们可能还在跑（内核的运算不可打断，见 main.cpp 的说明）。
+    // 让它们只持有一份 shared_ptr<State>，就不必再碰已经析构的 Server。
+    struct State {
+        std::map<std::string, Handler> routes;
+        std::vector<std::pair<std::string, std::string>> staticRoutes;
+
+        std::atomic<bool> running{false};
+        std::atomic<bool> socketClosed{false};
+        std::atomic<int> activeConnections{0};
+        // 监听套接字的句柄（平台相关）。listen() 建立，serve() 消费。
+        std::atomic<std::intptr_t> listener{-1};
+
+        // 保护路由表的读写。注册通常发生在 start() 之前，但
+        // 「边跑边注册」不该是数据竞争。
+        mutable std::mutex routeMutex;
+
+        // 保护 activeConnections 的「改 + 通知」这一对操作，
+        // 让 stop() 能用条件变量等它归零。
+        mutable std::mutex activeMutex;
+        std::condition_variable activeChanged;
+    };
+
     Server();
     ~Server();
 
@@ -79,6 +122,11 @@ public:
     bool start(const std::string& host = "127.0.0.1", int port = 8080);
 
     // 停止服务并等待后台线程结束。
+    //
+    // **有界**：正在计算的请求可能让连接线程停不下来（内核的运算不可
+    // 打断，见 main.cpp 的说明），所以这里最多等 kStopGraceMillis；
+    // 超时就放弃等待，剩下的连接线程 detach 掉 —— 它们只持有 State 的
+    // shared_ptr，不会再碰已经析构的 Server。
     void stop();
 
     // 处理单个请求（供测试直接调用，不经过网络）。
@@ -88,18 +136,38 @@ public:
     int boundPort() const { return m_boundPort; }
 
     // 服务是否正在运行。
-    bool running() const { return m_running.load(); }
+    bool running() const { return m_state->running.load(); }
+
+    // 当前还在处理中的连接数。stop() 返回后若仍大于 0，说明有请求
+    // 还在算 —— 调用方据此决定要不要直接结束进程。
+    int activeConnections() const { return m_state->activeConnections.load(); }
+
+    // ---- 上限与超时 ----
+    //
+    // 请求体上限 1 MiB。合法请求里最大的载荷是「几十万位的十进制数」
+    // （/api/convert 的 value 字段），几百 KB；1 MiB 留足了余量，
+    // 同时把单个连接占用的内存钉在一个有限的值上。
+    static constexpr std::size_t kMaxRequestBodyBytes = 1024u * 1024u;
+    // 请求头上限 64 KiB。
+    static constexpr std::size_t kMaxHeaderBytes = 64u * 1024u;
+    // 一次读操作允许的「无数据」时长（毫秒）。超过就认定客户端停滞。
+    static constexpr int kReadTimeoutMillis = 5000;
+    // 收到整个请求的总时限（毫秒）—— 挡住「声明巨大 Content-Length
+    // 再慢慢滴字节」的打法：只靠单次读的超时挡不住它。
+    static constexpr int kRequestTimeoutMillis = 15000;
+    // 写响应的时限（毫秒）。
+    static constexpr int kWriteTimeoutMillis = 10000;
+    // 并发连接数上限。
+    static constexpr int kMaxConcurrentConnections = 16;
+    // stop() 等待连接线程退出的时限（毫秒）。
+    static constexpr int kStopGraceMillis = 500;
 
 private:
-    Response handleStatic(const Request& request) const;
+    static Response handleStatic(const State& state, const Request& request);    static Response dispatch(const State& state, const Request& request);
+    static void runConnection(std::shared_ptr<State> state, std::intptr_t rawSocket);
 
-    std::map<std::string, Handler> m_routes;
-    std::vector<std::pair<std::string, std::string>> m_staticRoutes;
+    std::shared_ptr<State> m_state;
     int m_boundPort = 0;
-    std::intptr_t m_socket = -1;  // 平台相关的套接字句柄
-    std::atomic<bool> m_running{false};
-    // 监听套接字是否已经关闭，避免 stop() 与 serve() 重复释放。
-    std::atomic<bool> m_socketClosed{false};
     std::thread m_thread;
 };
 

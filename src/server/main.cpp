@@ -9,9 +9,14 @@
 // 服务起来后把 URL 打印出来就够了。`--no-browser` 仍然被接受（恒等操作），
 // 只是为了兼容按兄弟项目方式写的调用脚本。
 //
-// Ctrl+C 的处理：装一个控制台处理器，只翻转一个标志位，主循环看到它就退出，
-// 随后 Server 的析构函数调用 stop()，stop() 会 join 服务线程 —— 进程干净地
-// 结束，不留残留线程，也不依赖「被杀进程反正会死」这种运气。
+// Ctrl+C 的处理：装一个控制台处理器，只翻转一个标志位（**不阻塞** ——
+// 控制台处理器跑在 OS 另起的一个线程上，在那里 join 服务线程会与主
+// 线程的 stop() 打架）。主循环看到标志位就退出，随后 Server 的析构
+// 函数调用 stop()。
+//
+// stop() 之后如果还有请求在算（内核的运算是**不可打断**的：一个 30 万
+// 位的进制转换要算 87 秒，中途没有取消点），进程不能傻等 —— 给一段
+// 宽限期让它们收尾，超时就直接结束进程。
 //
 // getenv 在 MSVC 下会触发弃用警告，这里显式关闭该检查。
 // 那个宏必须定义在包含任何头文件之前 —— 所以它在这里，而不是在
@@ -23,6 +28,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -41,10 +47,15 @@
 
 namespace {
 
-// Ctrl+C 被按下时置位。主循环每 200 ms 查一次。
+// Ctrl+C 被按下时置位。主循环每 50 ms 查一次。
 std::atomic<bool> g_stopRequested{false};
 
 #if defined(_WIN32)
+// 控制台处理器跑在 OS 另起的一个线程上。
+//
+// 这里**只能**做「翻转标志位」这种不会阻塞的事：一旦在这里 join
+// 服务线程，就会与主线程里的 stop() 抢同一个线程 —— 谁先谁后都可能
+// 出问题（互相等）。让处理器立刻返回，真正的收尾交给主线程。
 BOOL WINAPI consoleHandler(DWORD signalType) {
     switch (signalType) {
         case CTRL_C_EVENT:
@@ -177,14 +188,40 @@ int main(int argc, char** argv) {
 
     // 等待服务线程结束或收到停止信号。
     //
-    // Server 的析构函数会调用 stop()，而 stop() 会 join 线程 ——
-    // 因此循环退出后不会有残留线程，进程可以干净地结束。
+    // 50 ms 一查：Ctrl+C 到进程退出之间不该有明显的延迟。
     while (server.running() && !g_stopRequested.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    // 显式停一次：把监听套接字关掉、唤醒并 join 服务线程。
+    // 显式停一次：翻掉 running 标志、唤醒并 join 服务线程。
+    //
+    // stop() 是**有界**的：accept 线程最多等 100 ms，在途请求最多再等
+    // 500 ms。所以这里不会因为一个停滞的客户端或一个长计算而卡住。
     server.stop();
     std::cout << "服务已停止。" << std::endl;
+
+    // 在途请求可能还在算 —— 内核的运算没有取消点，等不到它自然结束。
+    //
+    // 给一小段宽限期让它们把响应写完；超时就直接结束进程。
+    // 这正是「Ctrl+C 必须能立刻停服」的要求：宁可丢掉一个还没算完的
+    // 响应，也不能让进程赖着不走。
+    //
+    // 宽限期取 300 ms：够一次内存里的写操作完成，又不至于让
+    // 「Ctrl+C 停不下来」的感觉回来。停滞的客户端也会在这段时间里
+    // 被读超时踢掉（见 HttpServer 的 kReadTimeoutMillis）。
+    const auto graceDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    while (server.activeConnections() > 0 &&
+           std::chrono::steady_clock::now() < graceDeadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    if (server.activeConnections() > 0) {
+        std::cout << "仍有 " << server.activeConnections()
+                  << " 个请求在计算（内核运算不可打断），直接结束进程。" << std::endl;
+        std::fflush(nullptr);
+        // 连接线程是 detach 的，还没算完的那次计算就让它随进程一起消失。
+        std::_Exit(0);
+    }
+
     return 0;
 }
