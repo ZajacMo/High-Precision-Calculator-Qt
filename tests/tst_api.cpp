@@ -15,6 +15,16 @@
 #include <string>
 #include <thread>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include "api/ApiRoutes.h"
 #include "core/HttpServer.h"
 #include "core/Json.h"
@@ -24,6 +34,44 @@ namespace {
 using hpc::http::Request;
 using hpc::http::Response;
 using hpc::http::Server;
+
+// 建一个到 127.0.0.1 的 TCP 连接，但不发送任何数据 ——
+// 模拟「停滞客户端」。返回的套接字由调用方关闭。
+int connectWithoutSending(int port) {
+#if defined(_WIN32)
+    const SOCKET handle = socket(AF_INET, SOCK_STREAM, 0);
+    if (handle == INVALID_SOCKET) return -1;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(static_cast<uint16_t>(port));
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(handle, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        closesocket(handle);
+        return -1;
+    }
+    return static_cast<int>(handle);
+#else
+    const int handle = socket(AF_INET, SOCK_STREAM, 0);
+    if (handle < 0) return -1;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(static_cast<uint16_t>(port));
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(handle, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        close(handle);
+        return -1;
+    }
+    return handle;
+#endif
+}
+
+void closeRawSocket(int handle) {
+#if defined(_WIN32)
+    closesocket(static_cast<SOCKET>(handle));
+#else
+    close(handle);
+#endif
+}
 
 // 构造一个 POST 请求。
 Request makeRequest(const std::string& path, const std::string& body) {
@@ -246,6 +294,38 @@ TEST(api, stopReturnsWhenServeThreadIsWaitingForConnections) {
     // 停服务最多等 poll 周期（100 ms），加上调度余量。
     CHECK(milliseconds < 2000);
     CHECK(!server.running());
+}
+
+TEST(api, stopReturnsWhenAStalledClientIsConnected) {
+    // **回归用例**：一个连上却什么都不发的客户端，不能让 stop() 卡住。
+    //
+    // 原实现的 serve() 在读请求头时直接阻塞在 recv() 里（没有超时），
+    // 单线程下这个停滞客户端就把服务彻底卡死 ——
+    // stop() 的 join() 永远不返回（评审实测：60 秒超时才被杀掉）。
+    //
+    // 现在每个连接有自己的线程，且每次读都有超时，所以
+    // stop() 最多等「accept 线程一个 poll 周期」+「连接线程一个宽限期」。
+    Server server;
+    server.route("/x", [](const Request&) { return Response::text("ok"); });
+    CHECK(server.start("127.0.0.1", 0));
+
+    const int stalled = connectWithoutSending(server.boundPort());
+    CHECK(stalled >= 0);
+    // 让 accept 线程真的接受这个连接。
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    const auto before = std::chrono::steady_clock::now();
+    server.stop();
+    const auto elapsed = std::chrono::steady_clock::now() - before;
+
+    const long long milliseconds =
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    std::printf("       有停滞客户端时 stop() 用了 %lld ms\n", milliseconds);
+    // 停服最多等 poll 周期（100 ms）+ 宽限期（500 ms）+ 调度余量。
+    CHECK(milliseconds < 2000);
+    CHECK(!server.running());
+
+    if (stalled >= 0) closeRawSocket(stalled);
 }
 
 
