@@ -1,9 +1,14 @@
 # 高精度计算器 v3.0 —— 统一重构设计规格
 
 日期：2026-11-10
-状态：已获用户批准，待实施
-仓库：`cpp/QtProject/calculator`（远程 `ZajacMo/Qt-High-Precision-Calculator`）
-分支：`unified`（从 `console`/`main` 同一提交 `eebe3ba` 切出）
+状态：已获用户批准，**已实施**（实施细节见
+[`../../architecture.md`](../../architecture.md) 与
+[`../../bignum-algorithms.md`](../../bignum-algorithms.md)）
+仓库：`cpp/QtProject/calculator`（远程 `ZajacMo/High-Precision-Calculator-Qt`）
+基线：从 `console`/`main` 同一提交 `eebe3ba` 切出
+
+> **关于分支**：本文不写死具体分支名 —— 重构期间工作在独立工作树上，
+> 合并后会落在哪个分支名上会变。写死一个名字等于给文档设了个必然过时的期限。
 
 ---
 
@@ -46,16 +51,17 @@ cpp/QtProject/calculator/
 │   ├── BigDecimal.{h,cpp}      高精度十进制数（base-10⁹ 分块）
 │   ├── Expression.{h,cpp}      表达式解析与求值
 │   ├── Format.{h,cpp}         进制格式化、位运算
-│   ├── Rounding.{h,cpp}        舍入策略
-│   └── Json.{h,cpp}            最小 JSON 读写
+│   ├── Rounding.h             舍入模式与 Context（纯 enum + 常量，无 .cpp）
+│   ├── Json.{h,cpp}            最小 JSON 读写
+│   └── HttpServer.{h,cpp}      跨平台 HTTP/1.1 服务端
 ├── src/cli/         命令行前端（交互 / 批量 / OJ 三合一）
 ├── src/api/         REST 路由
 ├── src/server/      内置 HTTP 服务
 ├── src/ui/          Qt 桌面界面（可选目标，默认 OFF）
 ├── web/             原生 HTML/CSS/JS 前端（无 npm、无构建步骤）
 ├── legacy/          三代原始实现存档（见 §7）
-├── tests/           单元测试
-├── scripts/         构建 / 差分测试 / 截图脚本
+├── tests/           单元测试、差分探针、界面冒烟测试
+├── scripts/         构建 / 差分测试 / 基准测试脚本
 └── docs/            架构与算法研究笔记
 ```
 
@@ -121,24 +127,33 @@ struct Context {
 
 ### 2.3 为什么用 base-10⁹ 分块
 
-实测数据（MinGW g++ 11.2 `-O2`，本机）：
+实测数据（**当前实现**，MSVC 14.44 `/O2` 与 MinGW g++ 11.2 `/O2`，本机）：
 
 | 位数 | 单数字位乘法 | base-10⁹ 分块乘法 | 倍数 |
 |---|---|---|---|
-| 100 | 0.03 ms | 0.00 ms | 19× |
-| 1000 | 2.46 ms | 0.02 ms | 108× |
-| 10000 | 231 ms | 1.92 ms | 120× |
+| 100 | 0.018 / 0.013 ms | 0.0018 / 0.0018 ms | 9.9× / 7.3× |
+| 1000 | 1.89 / 1.42 ms | 0.039 / 0.032 ms | 48.5× / 44.9× |
+| 10000 | 189.67 / 154.75 ms | 2.83 / 2.03 ms | 67.1× / 76.1× |
 
-差距随位数放大（皆为 O(n²)，但常数差约 100×）。在 20–50 位这类常规场景两者都是
-微秒级、无实际差异；到 800–1600 位时分块方案是压倒性的。分块方案在小数场景不吃亏、
-在大数场景不落后，是唯一在所有场景都不落下风的选项。
+（左 = MSVC，右 = MinGW。数字由 `scripts/bench.py` 产出，可重跑复现。）
+
+> **这组数字与原型阶段测到的不同**（原型是 19× / 108× / 120×）。
+> 原型的口径把「十进制字符串 → 块」的解析算进了分块版，而单数字位版是
+> 直接构造数组 —— 那是**测量口径不一致**，不是算法差异。当前实现只计
+> 乘法本身，解析在计时之外。
+
+差距随位数放大（皆为 O(n²)，但常数差约 10× 到 76×）。在 20–50 位这类常规
+场景两者都是微秒级、无实际差异；到 800–1600 位时分块方案是压倒性的。
+分块方案在小数场景不吃亏、在大数场景不落后，是唯一在所有场景都不落下风的选项。
 
 **代价**：核心算法复杂度上升，`docs/bignum-algorithms.md` 的研究笔记需额外说明
 块对齐与进位边界。这是接受的代价——它换来的是「所有场景最优」。
 
 ### 2.4 已验证的算法
 
-除法实现已在原型中完成并**对着 Python `decimal` 验证 507/507 用例通过**：
+除法实现**对着 Python `fractions.Fraction` 做精确有理数差分验证**
+（最终 484/484 用例通过；`Fraction` 而非 `decimal`，因为 `decimal` 的除法
+只支持 ROUND_HALF_EVEN，且用 `decimal` 会有中间精度损失与双重舍入问题）：
 
 - **主实现**：逐块长除法 + 二分试商。实现简单、可审计、易验证。
 - **进阶项**：Knuth Algorithm D（归一化 + 试商估计 + 加回修正），作为
@@ -266,16 +281,19 @@ ctest 3/3）—— 所以 GUI 测试**不必**绑定到 Windows/MSVC 作业。�
 「PATH 上没有 Qt、也没有编译器运行库」时仍能跑通冒烟测试。
 
 **可复用资产**（照搬兄弟项目）：`msvc-env.bat`、`build-core.bat`、`api_test.py`、
-`screenshot.py`、`console.py`、`.github/workflows/build.yml`。
+`screenshot.py`、`.github/workflows/build.yml`。
+（兄弟项目的 `console.py` **没有**被复用 —— 本仓库没有这个脚本。）
 
 **CI 矩阵**：`ubuntu/macos/windows` 三平台构建核心+CLI+测试；
 `ubuntu/windows` 额外用 `aqtinstall` 拉 Qt 6.6.2 构建 GUI 并跑离屏冒烟测试。
+另有一个显式用 `g++` 的作业 —— 它在 CI 上真的抓到过一个 bug
+（`tests/test_framework.h` 缺 `<algorithm>`，MSVC 能过，GCC 编不过）。
 
 ---
 
 ## 5. 目录迁移
 
-现有文件在 `unified` 分支上的处置：
+现有文件在重构分支上的处置：
 
 | 现有 | 去向 |
 |---|---|
@@ -302,18 +320,38 @@ ctest 3/3）—— 所以 GUI 测试**不必**绑定到 Windows/MSVC 作业。�
 （HalfEven/HalfUp/Down/Up/Ceil/Floor）、除零、比较、进制转换往返、位运算、
 表达式解析与错误位置。
 
-### 6.2 Python `decimal` 差分测试
+### 6.2 Python 差分测试
 
-**独立基准**——这是正确性的硬证据。`scripts/difftest.py`：
+**独立基准**——这是正确性的硬证据。**九个**差分套件：
+
+| 脚本 | 覆盖 | 参考实现 |
+|---|---|---|
+| `verify_div.py` | 除法 | `fractions.Fraction` 做**精确有理数**运算再手工按指定模式舍入 |
+| `verify_func.py` | sqrt / exp / ln / log10 / pow | Python `decimal` |
+| `verify_mod.py` | 取余 / 取整 | Python `decimal` |
+| `verify_format.py` | 进制转换与位运算 | 精确构造的期望值 |
+| `verify_format_len.py` | 进制展开长度与终止性 | `fractions.Fraction` 精确算出展开长度 |
+| `verify_expression.py` | 表达式解析与求值 | Python `decimal` |
+| `verify_cli.py` | 命令行前端 | 逐条钉死的期望输出 |
+| `verify_cli_oj.py` | OJ 协议 | 与 legacy 逐例对比 + 与正确算术对比 |
+| `api_test.py` / `api_stall_test.py` | HTTP 端到端 | 钉死的期望值 |
+
+共同点：
 
 - 随机用例 + 边界用例（0、1、-1、极大/极小数、除数为 0、超精度）
-- 以 Python 标准库 `decimal` 为期望值
-- 覆盖 `+ - * / sqrt pow exp ln` 与舍入模式
+- **参考实现与被测实现没有任何共享代码** —— 这才是差分测试有意义的前提
 - 固定随机种子，结果可复现
+
+> **为什么除法那一套不用 `decimal`**：`decimal` 的除法只支持 ROUND_HALF_EVEN，
+> 且用它做参考会引入中间精度损失与双重舍入。`fractions.Fraction` 能给出
+> **精确**的有理数，再按指定模式手工舍入 —— 没有中间误差。
 
 ### 6.3 CI 集成
 
-`difftest.py` 作为 CTest 用例注册（需 Python 3；缺失时跳过而非失败）。
+八个差分套件与两个端到端套件都**注册成 CTest 用例**（共 12 条）
+（需 Python 3；缺失时整体跳过而非失败）。
+
+`scripts/run_differential.py` 是编排器：逐个跑这八个差分套件并汇总退出码。
 
 ### 6.4 GUI 冒烟测试
 
@@ -332,13 +370,20 @@ ctest 3/3）—— 所以 GUI 测试**不必**绑定到 Windows/MSVC 作业。�
 
 - **`architecture.md`** — 分层、数据流、接口边界、如何扩展
 - **`bignum-algorithms.md`** — 核心算法研究笔记：base-10⁹ 分块布局、进位/借位、
-  长除法推导、Knuth D 对照实现与基准数据、开方（牛顿迭代）、exp/ln（级数）、
-  精度与舍入的语义
+  长除法推导、**Knuth D 的对照说明（作为后续方向，仓库里未实现，故无实测数据）**、
+  开方（牛顿迭代）、exp/ln（级数）、精度与舍入的语义，
+  以及每个设计决策**背后的理由**与踩过的坑
 - **`legacy/COMPARISON.md`** — 三代实现逐项对比（API 命名、算法、缺陷、谱系证据）
 - **`legacy/README.md`** — 各代来源、代际判定依据（md5 比对）、已知缺陷清单
 
 顶层 `README.md` / `README_CN.md` 重写：项目定位、快速开始、示例、架构指引、
 「研究价值」说明。
+
+**一条贯穿全部文档的原则**：**文中出现的每个数字都必须来自实测，且能被读者
+复现。** 性能数字由 `scripts/bench.py` 产出（`python scripts/bench.py --build build
+--rebuild`），测试规模由 ctest 产出。原三代实现最大的问题不是「算错了」，
+而是「**没人拿独立基准验证过它到底算对了没有**」—— 如果新文档里又塞进
+拍脑袋的数字，那只是把老毛病搬了个地方。
 
 ---
 
@@ -380,3 +425,17 @@ ctest 3/3）—— 所以 GUI 测试**不必**绑定到 Windows/MSVC 作业。�
 10. CI + 脚本 + 文档
 
 每步都必须可编译、可测试通过；任一步的差分测试不绿则不进入下一步。
+
+**实施结果**：十步全部完成。当前状态（实测）：
+
+| 项 | 结果 |
+|---|---|
+| 构建配置 | 4 种全部零警告：默认 MSVC / Qt MSVC / **Qt MinGW** / GCC 默认 |
+| CTest | 12 条用例全绿（`ctest --test-dir build --output-on-failure`）|
+| 差分套件 | 26,019 个用例全绿 |
+| 端到端 | `api_test.py` 125 项、`api_stall_test.py` 16 项，全绿 |
+| 计划↔源码 | 284 个共有函数**逐字一致**（`scripts/check_plan_cpp_blocks.py`）|
+
+「Qt MinGW 也能构建」这一条是对本规格 §4 的**修正**：原写法称「GUI 是 MSVC-only」，
+那是未经实测的断言 —— 本机 Qt 6.6.2 的 `msvc2019_64` 与 `mingw_64` 两套都能
+构建 GUI 目标并跑通离屏冒烟测试（实测 ctest 3/3）。
