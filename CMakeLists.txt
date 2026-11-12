@@ -199,11 +199,21 @@ if(BUILD_GUI)
         # 能**直接定位 redist 目录里的那几个 DLL**（实测能找到 8 个），
         # 而 windeployqt 做不到。
         if(MSVC)
+            # MSVC 的运行库由 CMake 自己拷（见上）。
             set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
             include(InstallRequiredSystemLibraries)
             set(HPC_QT_CRT_LIBS ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS})
+            #
+            # 显式加 --no-compiler-runtime：windeployqt 的 MSVC 版默认会
+            # 去找 Visual Studio 安装目录来定位 redist，找不到就打一条
+            # 「Cannot find Visual Studio installation directory,
+            # VCINSTALLDIR is not set.」的警告（实测）—— 而我们已经用
+            # CMake 自己拷好了那几个 DLL，windeployqt 那条路**根本没用**。
+            # 显式关掉它，构建日志就是干净的。
+            set(HPC_QT_DEPLOY_RUNTIME_FLAG "--no-compiler-runtime")
         else()
-            # MinGW：windeployqt 自己会拷那三个运行库 DLL。
+            # MinGW：windeployqt 自己会拷那三个运行库 DLL
+            #（libgcc_s_seh-1.dll / libstdc++-6.dll / libwinpthread-1.dll）。
             set(HPC_QT_DEPLOY_RUNTIME_FLAG "--compiler-runtime")
         endif()
 
