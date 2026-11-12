@@ -178,8 +178,40 @@ if(BUILD_GUI)
     # 部署只在 Windows 上做：Windows 要把 DLL 和平台插件拷到可执行文件旁边
     # 才能独立运行；其它平台由系统 Qt 提供运行时。
     set(HPC_QT_DEPLOY_TOOL "")
+    set(HPC_QT_DEPLOY_RUNTIME_FLAG "")
+    set(HPC_QT_CRT_LIBS "")
     if(WIN32)
-        if(TARGET Qt6::windeployqt)
+        # **编译器运行时**要不要一起部署？
+        #
+        # 不部署的后果：没有装 VC++ 运行库（或 MinGW 运行库）的机器上，
+        # 连 exe 都**起不来** —— 缺 vcruntime140.dll / libgcc_s_seh-1.dll
+        # 之类，加载器直接失败。实测：MinGW 产物在「PATH 上没有 MinGW
+        # 运行库」时以**退出码 127** 死掉，正是这个原因。
+        #
+        # windeployqt 的 --compiler-runtime 开关：
+        #   - MinGW 版：把 libgcc_s_seh-1.dll / libstdc++-6.dll /
+        #     libwinpthread-1.dll 拷过来（实测有效）。
+        #   - MSVC 版：找 Visual Studio 安装目录来定位 redist —— 找不到
+        #     就**只拷一个 vc_redist.x64.exe 安装包**（实测）。那是个
+        #     安装程序，不是运行库本身，拷过来也不能让 exe 直接跑。
+        #
+        # 所以 MSVC 的运行库由 CMake 自己拷：InstallRequiredSystemLibraries
+        # 能**直接定位 redist 目录里的那几个 DLL**（实测能找到 8 个），
+        # 而 windeployqt 做不到。
+        if(MSVC)
+            set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
+            include(InstallRequiredSystemLibraries)
+            set(HPC_QT_CRT_LIBS ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS})
+        else()
+            # MinGW：windeployqt 自己会拷那三个运行库 DLL。
+            set(HPC_QT_DEPLOY_RUNTIME_FLAG "--compiler-runtime")
+        endif()
+
+        # 逃生口：特殊 Qt 布局（部署工具不在 Qt6::windeployqt 指向的位置，
+        # 也不在 Qt6_DIR/../../../bin 下）时，显式指定路径。
+        if(HPC_WINDEPLOYQT)
+            set(HPC_QT_DEPLOY_TOOL "${HPC_WINDEPLOYQT}")
+        elseif(TARGET Qt6::windeployqt)
             set(HPC_QT_DEPLOY_TOOL "$<TARGET_FILE:Qt6::windeployqt>")
         else()
             # Qt 没提供 windeployqt 目标（精简安装 / QT_NO_CREATE_TARGETS）。
@@ -192,19 +224,29 @@ if(BUILD_GUI)
                 HINTS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH NO_CACHE)
         endif()
         if(NOT HPC_QT_DEPLOY_TOOL)
-            # 找不到部署工具时**让配置直接失败**，而不是打个警告继续。
+            # 找不到部署工具时：BUILD_TESTS=ON 就**让配置直接失败**，
+            # BUILD_TESTS=OFF 只警告。
             #
-            # 警告之后的后果是：构建「成功」，但产出的 hpc_gui.exe 与
-            # gui_smoke.exe 跑不起来 —— ctest 拿到的是退出码 127（找不到
-            # DLL），那不是一条像样的测试失败，只会把人引向错误的方向。
-            # 这正是这个目标要防的事，所以它在配置阶段就应当喊出来。
-            message(FATAL_ERROR
-                "找不到 windeployqt（Qt6::windeployqt 目标不存在，"
-                "${Qt6_DIR}/../../../bin 下也没有）。\n"
-                "在 Windows 上不部署 Qt 运行时，hpc_gui.exe 与 gui_smoke.exe "
-                "都跑不起来（ctest 会以退出码 127 失败，而不是报出一个像样的"
-                "测试失败）。\n"
-                "请改装带部署工具的 Qt，或用 -DBUILD_GUI=OFF 关掉这个可选目标。")
+            # 理由：开了测试时，ctest 的 gui_smoke 条目会以**退出码 127**
+            # 死掉（找不到 DLL）—— 那不是一条像样的测试失败，只会把人引
+            # 向错误的方向（去查测试代码，而问题在部署）。configure 阶段
+            # 的响亮错误比 CI 里不透明的退出码好。
+            #
+            # 没开测试时不存在 ctest 条目，产物能不能跑取决于用户怎么用
+            # 它 —— 警告一句就够了，不必拦下整个构建。
+            if(BUILD_TESTS)
+                message(FATAL_ERROR
+                    "找不到 windeployqt（Qt6::windeployqt 目标不存在，"
+                    "${Qt6_DIR}/../../../bin 下也没有）。\n"
+                    "在 Windows 上不部署 Qt 运行时，hpc_gui.exe 与 gui_smoke.exe "
+                    "都跑不起来（ctest 会以退出码 127 失败，而不是报出一个像样的"
+                    "测试失败）。\n"
+                    "请改装带部署工具的 Qt，或用 -DBUILD_GUI=OFF 关掉这个可选目标。")
+            else()
+                message(WARNING
+                    "找不到 windeployqt：hpc_gui.exe 需要 Qt 的 bin 目录在 PATH "
+                    "上才能运行。")
+            endif()
         endif()
 
         # 两个可执行文件在**同一个目录**里（都是构建目录的根），所以它们
@@ -215,31 +257,42 @@ if(BUILD_GUI)
         # 文件 —— 实测会报「Cannot create ... qwebp.dll for output」
         # 并让构建失败（间歇性，取决于调度）。
         #
-        # 所以部署挂在一个**自定义目标**上，两个可执行文件都依赖它。
+        # 所以部署挂在**一个**地方：hpc_gui 的 POST_BUILD。
         #
-        # 部署的**目标文件**写死成 $<TARGET_FILE_DIR:hpc_gui>/hpc_gui.exe，
-        # 而不是 $<TARGET_FILE:hpc_gui> —— 后者会把 hpc_gui 变成部署目标的
-        # 依赖，而 hpc_gui 又依赖部署目标，形成**依赖环**（CMake 直接报错）。
-        # 两者指向同一个文件（Ninja 单配置生成器下可执行文件就在目标目录里），
-        # 但前者没有依赖关系。
+        # 为什么不是自定义目标 + add_dependencies：那样 hpc_gui 就得
+        # 「依赖」部署目标，而部署目标又得「依赖」hpc_gui（要先有 exe
+        # 才能部署）—— 方向反了就是依赖环，CMake 直接报错。
+        # POST_BUILD 没有这个问题：它是**挂在目标自己身上的**命令，
+        # 目标建好之后才跑，genex 里写 $<TARGET_FILE:hpc_gui> 也不会
+        # 产生额外的依赖边。
         #
-        # 部署目标**依赖** hpc_gui（所以 hpc_gui.exe 先建好，部署才有东西
-        # 可部署），而 hpc_gui **不**依赖部署目标 —— 方向反了就是依赖环，
-        # CMake 会直接报「strongly connected component」。
+        # 为什么用 POST_BUILD 而不是 ALL 自定义目标：ALL 意味着「每次
+        # 构建都跑」—— 哪怕构建的是 --target hpc_tests（核心测试，与 Qt
+        # 一点关系都没有）。windeployqt 每次要拷几十个 DLL、跑一秒多，
+        # 纯属白费。POST_BUILD 只在 hpc_gui **真的被链接**时才跑。
         #
-        # 部署命令里用 $<TARGET_FILE_DIR:hpc_gui>/hpc_gui.exe 而不是
-        # $<TARGET_FILE:hpc_gui>：两者指向同一个文件（Ninja 单配置生成器下
-        # 可执行文件就在目标目录里），但后者会**隐式**加一条
-        # 「部署目标依赖 hpc_gui」的边 —— 那条边本身没错，错的是它与
-        # add_dependencies 的方向组合起来会成环。写成显式的路径就没有
-        # 隐式边，方向完全由 add_dependencies 说了算。
-        add_custom_target(hpc_qt_deploy ALL
+        # gui_smoke 依赖 hpc_gui，于是「构建 gui_smoke」会先建 hpc_gui
+        # （顺带部署好运行时），再跑冒烟测试 —— 运行时一定就位。
+        #
+        # 部署命令里用 $<TARGET_FILE:hpc_gui>（而不是硬编码
+        # $<TARGET_FILE_DIR:hpc_gui>/hpc_gui.exe）：POST_BUILD 下目标已
+        # 建好，两种写法指向同一个文件，而前者更直白。
+        add_custom_command(TARGET hpc_gui POST_BUILD
             COMMAND "${HPC_QT_DEPLOY_TOOL}" --no-translations --no-system-d3d-compiler
-                    --no-opengl-sw --no-compiler-runtime
+                    --no-opengl-sw ${HPC_QT_DEPLOY_RUNTIME_FLAG}
                     --include-plugins qoffscreen
-                    "$<TARGET_FILE_DIR:hpc_gui>/hpc_gui.exe"
+                    "$<TARGET_FILE:hpc_gui>"
             COMMENT "部署 Qt 运行时到构建目录")
-        add_dependencies(hpc_qt_deploy hpc_gui)
+
+        # MSVC 的运行库：windeployqt 只会拷一个 vc_redist.x64.exe 安装包
+        #（不是运行库本身），所以那几个 DLL 由 CMake 直接拷过来。
+        foreach(_hpc_crt IN LISTS HPC_QT_CRT_LIBS)
+            get_filename_component(_hpc_crt_name "${_hpc_crt}" NAME)
+            add_custom_command(TARGET hpc_gui POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_hpc_crt}"
+                        "$<TARGET_FILE_DIR:hpc_gui>/${_hpc_crt_name}")
+        endforeach()
     endif()
 
     if(BUILD_TESTS)
@@ -255,18 +308,18 @@ if(BUILD_GUI)
         add_custom_command(TARGET gui_smoke POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory
                     "${CMAKE_CURRENT_BINARY_DIR}/screenshots")
-        if(HPC_QT_DEPLOY_TOOL)
-            # 同样部署：否则 ctest 启动 gui_smoke 时会因找不到 Qt6Core.dll
-            # 直接失败（退出码 127），而**不是**报出一个像样的测试失败。
-            #
-            # --include-plugins qoffscreen 是**必需**的：windeployqt 默认只
-            # 部署 qwindows 平台插件，而冒烟测试跑在 QT_QPA_PLATFORM=offscreen
-            # 下 —— 少了 qoffscreen.dll，测试会「Qt 平台插件加载失败」地退出。
-            #
-            # 部署由 hpc_qt_deploy 统一做（两个可执行文件共用同一套运行时），
-            # 这里只建立依赖关系。
-            add_dependencies(gui_smoke hpc_qt_deploy)
-        endif()
+        # gui_smoke 与 hpc_gui 在**同一个目录**里，共享同一套 Qt 运行时。
+        #
+        # 部署挂在 hpc_gui 的 POST_BUILD 上，所以 gui_smoke **依赖**
+        # hpc_gui：构建 gui_smoke 会先建 hpc_gui（顺带部署好运行时），
+        # 运行时一定就位。否则 ctest 启动 gui_smoke 时会因找不到
+        # Qt6Core.dll 直接失败（退出码 127），而**不是**报出一个像样的
+        # 测试失败。
+        #
+        # --include-plugins qoffscreen 是**必需**的：windeployqt 默认只
+        # 部署 qwindows 平台插件，而冒烟测试跑在 QT_QPA_PLATFORM=offscreen
+        # 下 —— 少了 qoffscreen.dll，测试会「Qt 平台插件加载失败」地退出。
+        add_dependencies(gui_smoke hpc_gui)
         add_test(NAME gui_smoke
                  COMMAND gui_smoke ${CMAKE_CURRENT_BINARY_DIR}/screenshots)
         set_tests_properties(gui_smoke PROPERTIES
