@@ -1,0 +1,116 @@
+name: 构建与测试
+
+on:
+  push:
+    branches: [main, unified]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core:
+    # 内核、命令行与 Web 服务只需要 C++17 编译器，不依赖任何第三方库，
+    # 因此可以在任意平台上构建。
+    name: 核心算法与单元测试 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: 配置
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_GUI=OFF -DBUILD_CLI=ON -DBUILD_SERVER=ON -DBUILD_TESTS=ON
+
+      - name: 编译
+        run: cmake --build build --config Release
+
+      - name: 运行单元测试
+        run: ctest --test-dir build --output-on-failure -C Release
+
+      - name: 差分测试（Python decimal / Fraction 为独立基准）
+        run: python scripts/run_differential.py --build build
+
+      - name: API 端到端测试
+        shell: bash
+        run: |
+          # 启动服务 → 跑端到端用例 → 关闭服务。
+          # api_test.py 自己会拉起服务（找不到就在跑时启动），所以这里
+          # 不用手工 start/kill —— 手工管进程反而更容易在 CI 上留下
+          # 一个孤儿服务占着端口。
+          python scripts/api_test.py 8099
+
+      - name: 停滞客户端回归测试
+        shell: bash
+        run: python scripts/api_stall_test.py 8097
+
+  gcc:
+    # 显式用 GCC 构建。MSVC 会传递性地带入一些标准库头文件（如 <algorithm>），
+    # 掩盖缺失 include 的问题；GCC 不会，因此这个作业专门用来暴露
+    # 「在 MSVC 上能编、在 GCC 上编不过」的可移植性缺陷。
+    #
+    # 这个作业**不是**多余的：它在 CI 上真的抓到了一个 bug
+    # （tests/test_framework.h 缺 <algorithm>，MSVC 能过，GCC 编不过）。
+    name: GCC 兼容性构建
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 配置
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_GUI=OFF -DBUILD_CLI=ON -DBUILD_SERVER=ON -DBUILD_TESTS=ON
+          -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER=gcc
+
+      - name: 编译
+        run: cmake --build build --config Release
+
+      - name: 运行单元测试
+        run: ctest --test-dir build --output-on-failure -C Release
+
+  gui:
+    # 图形界面需要 Qt 6，用 aqtinstall 拉取。
+    #
+    # **不需要绑定到 MSVC**：Qt 6.6.2 的 msvc2019_64 与 mingw_64 两套都能
+    # 构建本项目的 GUI 目标并跑通离屏冒烟测试（实测两套都是 ctest 3/3）。
+    # 这里用 linux 作业覆盖 mingw 之外的路径，windows 作业覆盖 MSVC。
+    name: 图形界面构建 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Qt
+        id: aqt
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: '6.6.2'
+          modules: ''
+          cache: true
+
+      - name: 配置
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_GUI=ON -DBUILD_CLI=ON -DBUILD_SERVER=ON -DBUILD_TESTS=ON
+          -DCMAKE_PREFIX_PATH=${{ steps.aqt.outputs.qt_root_dir }}/${{ steps.aqt.outputs.qt_arch }}
+
+      - name: 编译
+        run: cmake --build build --config Release
+
+      - name: 界面冒烟测试
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --test-dir build --output-on-failure -C Release -R gui_smoke
