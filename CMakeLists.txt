@@ -165,9 +165,48 @@ if(BUILD_GUI)
     # gui_smoke.exe 都只有在 Qt 的 bin 目录恰好在 PATH 上时才跑得起来
     # —— 直接双击 hpc_gui.exe 会弹「找不到 Qt6Core.dll」。
     #
-    # windeployqt 由 Qt6CoreTools 提供（find_package(Qt6) 会顺带找到它）。
-    find_program(HPC_WINDEPLOYQT windeployqt)
-    if(HPC_WINDEPLOYQT)
+    # 部署工具必须是**正在用的这个 Qt** 的那份，不能按 PATH 找。
+    #
+    # find_program 按 PATH 解析，结果取决于「碰巧 PATH 上有什么」：本机上
+    # Anaconda 的 Qt 5.15 版 windeployqt 排在 PATH 最前面，而它**不认**
+    # --include-plugins（那是 Qt 6 的选项），于是部署以退出码 1 失败 ——
+    # 或者更糟：用 Qt 5 的工具给 Qt 6 的程序部署出一套不匹配的插件。
+    #
+    # $<TARGET_FILE:Qt6::windeployqt> 指向 find_package(Qt6) 找到的那份
+    # windeployqt（Qt6CoreTools 提供的导入目标），版本必然与链接的 Qt 一致。
+    #
+    # 部署只在 Windows 上做：Windows 要把 DLL 和平台插件拷到可执行文件旁边
+    # 才能独立运行；其它平台由系统 Qt 提供运行时。
+    set(HPC_QT_DEPLOY_TOOL "")
+    if(WIN32)
+        if(TARGET Qt6::windeployqt)
+            set(HPC_QT_DEPLOY_TOOL "$<TARGET_FILE:Qt6::windeployqt>")
+        else()
+            # Qt 没提供 windeployqt 目标（精简安装 / QT_NO_CREATE_TARGETS）。
+            # 退化路径**也只在正在用的这个 Qt 的 bin 目录里找** ——
+            # NO_DEFAULT_PATH 保证不会去 PATH 上捡别的 Qt 的工具。
+            #
+            # NO_CACHE：换了 Qt 之后这个值必须重新解析，不能被上一次配置
+            # 缓存下来的路径粘住。
+            find_program(HPC_QT_DEPLOY_TOOL windeployqt
+                HINTS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH NO_CACHE)
+        endif()
+        if(NOT HPC_QT_DEPLOY_TOOL)
+            # 找不到部署工具时**让配置直接失败**，而不是打个警告继续。
+            #
+            # 警告之后的后果是：构建「成功」，但产出的 hpc_gui.exe 与
+            # gui_smoke.exe 跑不起来 —— ctest 拿到的是退出码 127（找不到
+            # DLL），那不是一条像样的测试失败，只会把人引向错误的方向。
+            # 这正是这个目标要防的事，所以它在配置阶段就应当喊出来。
+            message(FATAL_ERROR
+                "找不到 windeployqt（Qt6::windeployqt 目标不存在，"
+                "${Qt6_DIR}/../../../bin 下也没有）。\n"
+                "在 Windows 上不部署 Qt 运行时，hpc_gui.exe 与 gui_smoke.exe "
+                "都跑不起来（ctest 会以退出码 127 失败，而不是报出一个像样的"
+                "测试失败）。\n"
+                "请改装带部署工具的 Qt，或用 -DBUILD_GUI=OFF 关掉这个可选目标。")
+        endif()
+
         # 两个可执行文件在**同一个目录**里（都是构建目录的根），所以它们
         # 共享同一套 Qt 运行时 —— windeployqt 只需要跑**一次**。
         #
@@ -195,15 +234,12 @@ if(BUILD_GUI)
         # add_dependencies 的方向组合起来会成环。写成显式的路径就没有
         # 隐式边，方向完全由 add_dependencies 说了算。
         add_custom_target(hpc_qt_deploy ALL
-            COMMAND "${HPC_WINDEPLOYQT}" --no-translations --no-system-d3d-compiler
+            COMMAND "${HPC_QT_DEPLOY_TOOL}" --no-translations --no-system-d3d-compiler
                     --no-opengl-sw --no-compiler-runtime
                     --include-plugins qoffscreen
                     "$<TARGET_FILE_DIR:hpc_gui>/hpc_gui.exe"
             COMMENT "部署 Qt 运行时到构建目录")
         add_dependencies(hpc_qt_deploy hpc_gui)
-    else()
-        message(WARNING
-            "找不到 windeployqt：hpc_gui.exe 需要 Qt 的 bin 目录在 PATH 上才能运行。")
     endif()
 
     if(BUILD_TESTS)
@@ -219,7 +255,7 @@ if(BUILD_GUI)
         add_custom_command(TARGET gui_smoke POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory
                     "${CMAKE_CURRENT_BINARY_DIR}/screenshots")
-        if(HPC_WINDEPLOYQT)
+        if(HPC_QT_DEPLOY_TOOL)
             # 同样部署：否则 ctest 启动 gui_smoke 时会因找不到 Qt6Core.dll
             # 直接失败（退出码 127），而**不是**报出一个像样的测试失败。
             #

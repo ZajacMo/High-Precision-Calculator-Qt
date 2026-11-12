@@ -64,6 +64,20 @@ int utf8OffsetToUtf16(const QString& text, int byteOffset) {
     return utf16;
 }
 
+// 该位置上的字符占几个 UTF-16 码元。
+//
+// BMP 字符占 1 个；非 BMP 字符（代理对）占 2 个。选区长度必须按**码点**
+// 算 —— 硬编码成 1 会在代理对上只选中高代理那半个字符：既不是用户看到的
+// 字符，复制出去也不是那个码点。
+int utf16LengthAt(const QString& text, int index) {
+    if (index < 0 || index >= text.size()) return 0;
+    const QChar first = text.at(index);
+    if (first.isHighSurrogate() && index + 1 < text.size() && text.at(index + 1).isLowSurrogate()) {
+        return 2;
+    }
+    return 1;
+}
+
 }  // namespace
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
@@ -245,17 +259,30 @@ void MainWindow::showError(const QString& message, int position) {
     output_->setPlainText(text);
 
     if (position >= 0) {
-        setNote(QStringLiteral("位置 %1 是出错字符在表达式里的字节下标，"
-                               "已在输入框中选中该字符。").arg(position));
         const QString source = expression_->text();
         const int index = utf8OffsetToUtf16(source, position);
-        // 先给焦点再设选区：反过来时 setFocus() 可能把选区清掉。
-        expression_->setFocus();
         if (index < source.size()) {
-            expression_->setSelection(index, 1);
+            // 位置指着**确实存在**的那个字符 —— 选中它。
+            //
+            // 选区长度按**码点**算而不是写死 1：非 BMP 字符（代理对）占
+            // 2 个 UTF-16 码元，写死 1 只会选中高代理那半个 —— 既不是
+            // 用户看到的字符，复制出去也不是那个码点。
+            setNote(QStringLiteral("位置 %1 是出错字符在表达式里的字节下标，"
+                                   "已在输入框中选中该字符。").arg(position));
+            // 先给焦点再设选区：反过来时 setFocus() 可能把选区清掉。
+            expression_->setFocus();
+            expression_->setSelection(index, utf16LengthAt(source, index));
         } else {
-            // 位置指向串尾（缺失的字符本该出现的地方）—— 没有字符可选，
-            // 把光标放到末尾。
+            // 位置指向串尾 —— 那里**没有字符**，出错的字符本该出现在
+            // 那个位置（内核的「表达式意外结束」「表达式为空」就是这种）。
+            // 没有字符可选，只能把光标放到末尾。
+            //
+            // 所以这里**不能**说「已选中该字符」：选区是空的，说了就是
+            // 告诉用户一件假话 —— 用户读完美目张望看不到任何高亮。
+            setNote(QStringLiteral("位置 %1 是出错字符在表达式里的字节下标；"
+                                   "该位置已经超出表达式末尾（那里本该出现这个"
+                                   "字符），已把光标放到表达式末尾。").arg(position));
+            expression_->setFocus();
             expression_->setCursorPosition(source.size());
         }
     } else {

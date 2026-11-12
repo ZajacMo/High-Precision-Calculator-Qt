@@ -42,7 +42,9 @@ private:
     void evaluate();
     // 把一次求值结果追加到历史列表。
     void appendHistory(const QString& expression, const QString& result);
-    // 显示一条错误。position >= 0 时还要在输入框里选中出错的字符。
+    // 显示一条错误。position >= 0 时还要在输入框里指出出错的字符 ——
+    // 那个字符**存在**就选中它；位置指向**串尾**（缺失的字符本该出现
+    // 的地方）就只把光标放到末尾，注解也如实这么说。
     void showError(const QString& message, int position);
     // 结果区下方的注解（截断标记说明、出错位置说明）。空文本时隐藏。
     void setNote(const QString& text);
