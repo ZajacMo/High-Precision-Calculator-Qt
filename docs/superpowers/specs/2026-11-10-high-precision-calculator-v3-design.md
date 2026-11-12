@@ -247,9 +247,23 @@ option(BUILD_SERVER "构建 Web 服务端"            ON)
 **本机工具链**：MSVC 2022 BuildTools `14.44.35207` + Windows SDK `10.0.26100.0`
 + Qt 6.6.2 `msvc2019_64` + CMake `C:\Qt\Tools\CMake_64` + Ninja `C:\Qt\Tools\Ninja`。
 
+**Qt 有两套**：除 `msvc2019_64` 外，本机还有完整的 `C:\Qt\6.6.2\mingw_64`
+（MinGW g++ 11.2）。GUI 目标在**两套下都能构建并跑通离屏冒烟测试**（实测
+ctest 3/3）—— 所以 GUI 测试**不必**绑定到 Windows/MSVC 作业。唯一要小心的
+是 **Qt 必须与编译器配套**：`msvc2019_64` 配 MSVC，`mingw_64` 配 MinGW。
+
 **已知坑**（来自兄弟项目记忆）：`scripts/msvc-env.bat` 必须同时加入 Windows SDK 的
 `bin\<ver>\x64`，否则 `rc.exe`/`mt.exe` 缺失导致 CMake try-compile 失败。
 该脚本直接复用，不重新踩坑。
+
+**Windows 产物的运行库要求**：GUI 目标在 Windows 上是动态链接的，部署时
+**必须把编译器运行库一起带上**，否则目标机器上 exe **连启动都做不到**
+（加载器找不到 `vcruntime140.dll` / `libgcc_s_seh-1.dll`，以**退出码 127**
+死掉 —— 一条没有任何信息的失败）。做法按工具链分：MinGW 用 windeployqt 的
+`--compiler-runtime`；MSVC 由 CMake 的 `InstallRequiredSystemLibraries`
+直接拷贝 redist 里的 DLL（windeployqt 在 MSVC 下只会拷一个
+`vc_redist.x64.exe` **安装包**，那不是运行库本身）。实测两套产物在
+「PATH 上没有 Qt、也没有编译器运行库」时仍能跑通冒烟测试。
 
 **可复用资产**（照搬兄弟项目）：`msvc-env.bat`、`build-core.bat`、`api_test.py`、
 `screenshot.py`、`console.py`、`.github/workflows/build.yml`。
