@@ -223,6 +223,18 @@ numbers are reproduced by whoever reads them.
   two's complement semantics (matching Python's `int`).
 - **Errors carry a position.** Syntax errors report the offending character
   index, and the GUI selects that character.
+- **`%` is `fmod` semantics, not Python's `%`.** The sign follows the
+  dividend (like C: `-7 % 3 == -1`), and a fractional dividend keeps its
+  fraction (`5.5 % 2 == 1.5`, not `1`).
+- **The transcendental precision ceiling is a *compute* limit, not an
+  interface limit.** `kMaxTranscendentalPrecision = 1000` applies only when a
+  transcendental function is actually used. Pure arithmetic at 100000 digits
+  is legal — `1/7` at 100000 digits computes fine.
+- **Base conversion is slow for huge values.** Converting a 100000-digit
+  integer to base 2 takes about 8 seconds; 300000 digits takes about 77
+  seconds. That ceiling is reachable from the GUI's own `max="100000"`,
+  so it is a known limit rather than a theoretical one. See
+  [`docs/bignum-algorithms.md`](docs/bignum-algorithms.md).
 
 See [`docs/architecture.md`](docs/architecture.md) for the full picture and
 [`docs/bignum-algorithms.md`](docs/bignum-algorithms.md) for the algorithms.
