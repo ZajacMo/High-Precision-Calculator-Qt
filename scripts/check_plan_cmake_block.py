@@ -185,7 +185,19 @@ def main():
             shutil.rmtree(dst)
         shutil.copytree(os.path.join(REPO, name), dst)
 
-    cmake = os.environ.get('CMAKE_COMMAND', 'cmake')
+    # 用哪个 cmake？
+    #
+    # 优先 CMAKE_COMMAND 环境变量；否则用 Qt 自带的那个
+    # （C:\Qt\Tools\CMake_64\bin\cmake.exe）。**不要**直接用 PATH 上的
+    # cmake —— 本机 PATH 上是 3.31.6，而 Qt 自带的是 3.27.7；实测 3.31.6
+    # 跑这个 harness 时 AUTOMOC 步骤会失败：
+    #   moc: Cannot create .../hpc_gui_autogen/.../moc_MainWindow.cpp.
+    #   Error: No such file or directory
+    # 换 Qt 自带的 cmake 就通过（配置 + 构建 + ctest 全过）。
+    cmake = os.environ.get('CMAKE_COMMAND')
+    if not cmake:
+        qt_cmake = r'C:\Qt\Tools\CMake_64\bin\cmake.exe'
+        cmake = qt_cmake if os.path.exists(qt_cmake) else 'cmake'
     build_dir = os.path.join(WORK, 'b')
     steps = [
         ([cmake, '-S', WORK, '-B', build_dir, '-G', 'Ninja',
