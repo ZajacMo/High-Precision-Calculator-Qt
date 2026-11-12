@@ -10,10 +10,12 @@
 2. 原实现的 Ctrl+C 只翻转标志位，主循环要等当前请求算完才看得到 ——
    一个 30 万位的进制转换（实测 87 秒）就能让 Ctrl+C 迟迟退不出来。
 
-本脚本覆盖四条：
+本脚本覆盖五条：
 
   A. 停滞客户端存在时，另一个正常客户端仍能在有界时间内拿到响应；
   B. 超大的 Content-Length 被明确拒绝（413），而不是把连接一直占着；
+  B2. **慢速滴字节**的客户端被「整条连接的总时限」踢掉 ——
+     逐次读超时挡不住它（每次单独的读都很快返回，静默计时器不触发）；
   C. 有停滞客户端时，Ctrl+C 仍能在有界时间内让进程退出；
   D. 有长请求在算时，Ctrl+C 仍能在有界时间内让进程退出。
 
@@ -237,6 +239,72 @@ def testOversizedContentLengthIsRejected(port):
           f"status={status} elapsed={elapsed:.2f}s")
 
 
+def testSlowTrickleClientIsDropped(port):
+    """B2. 慢速滴字节的客户端必须被**整条连接的总时限**踢掉。
+
+    这是评审明确点名的那条：**逐次读超时挡不住慢速滴字节**。
+    一个每 2 秒滴 1 个字节的客户端，每次单独的读都很快返回，
+    静默计时器（kReadTimeoutMillis = 5 秒）一直不触发 ——
+    只有「这条连接总共能活多久」的上限（kConnectionTimeoutMillis = 15 秒）
+    才能断开它。
+
+    所以这个用例的判定标准是：**服务在总时限附近主动断开这个连接**。
+    """
+    print("\n[B2] 慢速滴字节的客户端被总时限踢掉")
+    connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+    # recv 的超时必须**短于**滴字节的间隔，否则测试脚本自己会卡在
+    # recv 里、停止滴字节 —— 那样测的就不是「慢速滴字节」而是
+    # 「中途停下来了」（那是逐次读超时能挡住的场景）。
+    connection.settimeout(0.5)
+    started = time.time()
+    try:
+        # 发一个**不完整**的请求头，然后每 2 秒滴 1 个字节。
+        # 滴的间隔（2 秒）远小于逐次读超时（5 秒），所以逐次读超时
+        # 永远不会触发 —— 只有总时限会。
+        connection.sendall(b"POST /api/evaluate HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+        deadline = started + 40.0
+        closed = False
+        while time.time() < deadline:
+            time.sleep(2.0)
+            try:
+                connection.sendall(b"X")
+            except OSError:
+                # 服务把连接关了 —— 这正是要的行为。
+                closed = True
+                break
+            try:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    # 对端关闭（FIN）。
+                    closed = True
+                    break
+                # 服务回了一个响应（可能是 408）。记下来，
+                # 但**不算**「被踢掉」——总时限到了才应该断。
+            except socket.timeout:
+                # 还没数据 —— 正常，继续滴。
+                continue
+            except OSError:
+                closed = True
+                break
+
+        elapsed = time.time() - started
+        check(closed, "慢速滴字节的客户端被服务端主动断开",
+              f"{elapsed:.1f}s 后断开" if closed else "40 秒内连接一直没被关掉")
+        # 总时限是 15 秒；连接必须在那之后不久就被断开。
+        # 下界取 10 秒：必须**晚于**逐次读超时（5 秒）——
+        # 如果 5 秒不到就断了，说明是逐次读超时挡住的，
+        # 那就证明不了「总时限」这一条真的起了作用。
+        check(10.0 <= elapsed < 30.0, "慢滴客户端在总时限附近被断开（而非逐次读超时）",
+              f"{elapsed:.1f}s")
+    finally:
+        connection.close()
+
+    # 服务本身要照常工作。
+    status, body, elapsed, timed_out = getWithBudget(port, "/api/health", 5.0)
+    check(not timed_out and status == 200, "踢掉慢滴客户端后服务仍然正常",
+          f"status={status} elapsed={elapsed:.2f}s")
+
+
 def testCtrlCWithStalledClient(port):
     """C. 有停滞客户端时，Ctrl+C 仍能在有界时间内让进程退出。"""
     print("\n[C] 有停滞客户端时 Ctrl+C 能及时退出")
@@ -323,6 +391,7 @@ def main():
     try:
         testStalledClientDoesNotStarveOthers(PORT)
         testOversizedContentLengthIsRejected(PORT)
+        testSlowTrickleClientIsDropped(PORT)
     finally:
         killServer()
 
