@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """端到端 API 测试：拉起服务 → 逐个调用 /api/* 端点 → 校验响应。
 
-用法：python scripts/api_test.py [端口]
-默认端口 8099。若该端口已有服务在跑，则直接复用。
+用法：python scripts/api_test.py [端口] [hpc_server 可执行文件路径]
+默认端口 8099，默认从构建目录里找 hpc_server。
+
+第二个参数是**服务可执行文件的路径**。CTest 把它作为参数传进来
+（$<TARGET_FILE:hpc_server>）—— 不传的话脚本只能靠当前工作目录
+去猜「build/hpc_server.exe」，而 ctest 的工作目录是**构建目录**，
+不是仓库根，那份猜法在 ctest 下必然落空。
 
 **编码**：服务端的错误消息是**中文**（内核的异常消息是中文）。
 因此响应体不是纯 ASCII —— 本脚本**显式**用 utf-8 解码，
@@ -37,6 +42,9 @@ for stream in (sys.stdout, sys.stderr):
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8099
 BASE = f"http://127.0.0.1:{PORT}"
 
+# 命令行给的服务器路径（第 3 个参数）。没给就靠下面的候选列表猜。
+SERVER_OVERRIDE = sys.argv[2] if len(sys.argv) > 2 else None
+
 failures = []
 checks = 0
 server_process = None
@@ -58,11 +66,14 @@ def startServer():
         print("检测到已在运行的服务，直接复用。")
         return None
 
-    # 优先用构建目录里的可执行文件。
+    # 优先用命令行给的服务可执行文件，其次才是在构建目录里找。
     #
     # 注意：Windows 上 subprocess 拒绝**带正斜杠的相对路径**作为可执行文件
     # （即使该文件确实存在），所以这里统一用绝对路径 + 反斜杠。
-    candidates = [
+    candidates = []
+    if SERVER_OVERRIDE:
+        candidates.append(SERVER_OVERRIDE)
+    candidates += [
         os.path.join("build", "hpc_server.exe"),
         os.path.join("build-gcc", "hpc_server.exe"),
         os.path.join("build", "hpc_server"),

@@ -19,8 +19,13 @@
   C. 有停滞客户端时，Ctrl+C 仍能在有界时间内让进程退出；
   D. 有长请求在算时，Ctrl+C 仍能在有界时间内让进程退出。
 
-用法：python scripts/api_stall_test.py [端口]
-默认端口 8097。C 与 D 各自另起一个服务（用同一个端口的下一个），
+用法：python scripts/api_stall_test.py [端口] [hpc_server 可执行文件路径]
+默认端口 8097。第二个参数是**服务可执行文件的路径** —— CTest 把它作为
+参数传进来（$<TARGET_FILE:hpc_server>）。不传的话脚本只能靠当前工作
+目录去猜「build/hpc_server.exe」，而 ctest 的工作目录是**构建目录**，
+不是仓库根，那份猜法在 ctest 下必然落空。
+
+C 与 D 各自另起一个服务（用同一个端口的下一个），
 免得前一个用例停掉服务后影响后一个。
 
 **编码**：服务端的错误消息是中文，响应体不是纯 ASCII。本脚本显式
@@ -47,6 +52,9 @@ for stream in (sys.stdout, sys.stderr):
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8097
 
+# 命令行给的服务可执行文件路径（CTest 会传）。没给就靠候选列表猜。
+SERVER_OVERRIDE = sys.argv[2] if len(sys.argv) > 2 else None
+
 # 有界的等待上限。
 #
 # 这些数字是「够宽松但不会掩盖挂死」的量级：修复前 A 用例会卡到
@@ -72,8 +80,16 @@ def check(condition, label, detail=""):
 
 
 def findExecutable():
-    """找到 hpc_server 可执行文件。"""
-    candidates = [
+    """找到 hpc_server 可执行文件。
+
+    优先用命令行给的那个（CTest 传的是 $<TARGET_FILE:hpc_server>），
+    其次才是在构建目录里找 —— ctest 的工作目录是**构建目录**，不是
+    仓库根，所以「猜 build/hpc_server.exe」那条路在 ctest 下不成立。
+    """
+    candidates = []
+    if SERVER_OVERRIDE:
+        candidates.append(SERVER_OVERRIDE)
+    candidates += [
         os.path.join("build", "hpc_server.exe"),
         os.path.join("build-gcc", "hpc_server.exe"),
         os.path.join("build", "hpc_server"),

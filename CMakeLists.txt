@@ -144,6 +144,80 @@ if(BUILD_TESTS)
     add_executable(bench_probe tests/bench_probe.cpp)
     target_link_libraries(bench_probe PRIVATE hpc_core)
     hpc_set_warnings(bench_probe)
+
+    # --- 差分测试注册成 CTest 用例 ---------------------------------------
+    #
+    # 为什么要注册：差分测试是本项目**正确性的主要判据** —— 单元测试
+    # 钉的是「我们以为的行为」，差分测试比的是「与一个独立参考实现的
+    # 差」。把它们挂在 ctest 下面，「ctest 跑一遍」就等于「全部验证
+    # 跑一遍」，不需要谁记得再手敲八个脚本。
+    #
+    # 参考实现（Python 的 decimal / fractions）与被测实现（C++ 内核）
+    # **没有任何共享代码** —— 这才是差分测试有意义的前提。
+    #
+    # 每个套件怎么找到自己的探针，**不一样**，所以逐个写而不是套模板：
+    #
+    #   verify_div.py        <路径>   除法探针
+    #   verify_func.py       <路径>   超越函数探针（可选第二参数：精度）
+    #   verify_mod.py        <路径>   取余/取整探针
+    #   verify_format.py     <路径>   进制/位运算探针
+    #   verify_format_len.py <路径>   同一个探针，比的是展开长度与终止性
+    #   verify_expression.py <路径>   表达式探针
+    #   verify_cli.py        <路径>   命令行前端
+    #   verify_cli_oj.py     <路径>   命令行前端（OJ 协议）
+    #
+    # verify_cli_oj.py 的第 1 部分需要 legacy 可执行文件做基准，CI 上
+    # 没有 → 那部分会跳过并打印原因，脚本仍然 exit 0。
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        set(_hpc_scripts "${CMAKE_CURRENT_SOURCE_DIR}/scripts")
+
+        # 差分套件：探针路径用 $<TARGET_FILE:...> 传绝对路径。
+        #
+        # 为什么必须绝对路径：Windows 上 subprocess 对「相对路径 + 正斜杠」
+        # 的可执行文件会直接拒绝（即使那个文件确实存在）—— 这个坑踩过
+        # 两次。绝对路径没有这个问题。
+        foreach(_pair
+                "diff_div;verify_div.py;div_probe"
+                "diff_func;verify_func.py;func_probe"
+                "diff_mod;verify_mod.py;mod_probe"
+                "diff_format;verify_format.py;format_probe"
+                "diff_format_len;verify_format_len.py;format_probe"
+                "diff_expression;verify_expression.py;expression_probe"
+                "diff_cli;verify_cli.py;hpc_cli"
+                "diff_cli_oj;verify_cli_oj.py;hpc_cli")
+            list(GET _pair 0 _name)
+            list(GET _pair 1 _script)
+            list(GET _pair 2 _target)
+            add_test(NAME ${_name}
+                     COMMAND ${Python3_EXECUTABLE}
+                             "${_hpc_scripts}/${_script}"
+                             $<TARGET_FILE:${_target}>)
+            # 超时给得宽松：verify_format_len.py 要跑十万次随机分数 ×
+            # 35 个进制，慢机器上几分钟是正常的。
+            set_tests_properties(${_name} PROPERTIES TIMEOUT 900)
+        endforeach()
+
+        # API 端到端测试：拉起服务 → 逐个调用端点 → 校验响应。
+        #
+        # 脚本自己会拉起服务（端口上已有服务就复用），所以这里传的是
+        # **可执行文件的绝对路径** + 端口。
+        if(BUILD_SERVER)
+            add_test(NAME api_e2e
+                     COMMAND ${Python3_EXECUTABLE}
+                             "${_hpc_scripts}/api_test.py" 8099
+                             $<TARGET_FILE:hpc_server>)
+            set_tests_properties(api_e2e PROPERTIES TIMEOUT 600)
+
+            # 停滞客户端回归：服务不能被「连上却什么都不说」的客户端饿死，
+            # Ctrl+C 必须能及时停服。
+            add_test(NAME api_stall
+                     COMMAND ${Python3_EXECUTABLE}
+                             "${_hpc_scripts}/api_stall_test.py" 8097
+                             $<TARGET_FILE:hpc_server>)
+            set_tests_properties(api_stall PROPERTIES TIMEOUT 600)
+        endif()
+    endif()
 endif()
 
 # Qt 图形界面：**可选**目标。
