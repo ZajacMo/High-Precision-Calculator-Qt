@@ -14,8 +14,18 @@ namespace {
 // 把 double 序列化为 JSON 数字。非有限值输出 null（JSON 无 NaN/Infinity）。
 std::string numberToString(double value) {
     if (!std::isfinite(value)) return "null";
-    if (value == static_cast<double>(static_cast<std::int64_t>(value)) &&
-        std::fabs(value) < 9.0e15) {
+    // **先判范围，再转型**。
+    //
+    // 顺序反了就是未定义行为：`static_cast<std::int64_t>(1e300)` 超出了
+    // int64 的可表示范围，C++ 标准规定这种转型是 UB —— MSVC 与 GCC
+    // 在这里的实际结果并不一致（有的返回 INT64_MIN，有的给饱和值），
+    // 同一个输入在不同编译器上会得到不同的 JSON。
+    //
+    // 9.0e15 < 2^53（约 9.007e15），所以这个区间内的 double 都能被
+    // int64 精确表示，转型安全；转回 double 后再比较相等，就得到了
+    // 「这个数是整数」的判断。
+    if (std::fabs(value) < 9.0e15 &&
+        value == static_cast<double>(static_cast<std::int64_t>(value))) {
         return std::to_string(static_cast<std::int64_t>(value));
     }
     std::ostringstream out;
