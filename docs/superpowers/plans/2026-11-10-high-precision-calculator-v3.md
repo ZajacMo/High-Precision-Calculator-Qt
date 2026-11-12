@@ -41,7 +41,9 @@ cpp/QtProject/calculator/
 │   ├── BigDecimal.h/.cpp       核心数值类型（base-10⁹ 分块）
 │   ├── Rounding.h              Context 与舍入模式（头文件即可）
 │   ├── Format.h/.cpp           进制转换与位运算
-│   └── Expression.h/.cpp       表达式解析与求值
+│   ├── Expression.h/.cpp       表达式解析与求值
+│   ├── Json.h/.cpp             最小 JSON 读写
+│   └── HttpServer.h/.cpp       跨平台 HTTP/1.1 服务端
 ├── src/cli/main.cpp            命令行前端（交互/单次/OJ 三模式）
 ├── src/api/ApiRoutes.h/.cpp    REST 路由
 ├── src/server/main.cpp         内置 HTTP 服务
@@ -55,15 +57,26 @@ cpp/QtProject/calculator/
 │   ├── tst_bigdecimal.cpp      核心数值类型测试
 │   ├── tst_transcendental.cpp  超越函数测试
 │   ├── tst_format.cpp          进制与位运算测试
-│   └── tst_expression.cpp      表达式测试
+│   ├── tst_expression.cpp      表达式测试
+│   ├── tst_api.cpp             API 层测试
+│   ├── {div,mod,func,format,expression}_probe.cpp   差分测试探针
+│   ├── bench_probe.cpp         性能基准探针
+│   └── gui_smoke.cpp           界面离屏冒烟测试
 ├── scripts/
 │   ├── msvc-env.bat            MSVC/Qt 环境
 │   ├── build-core.bat          构建核心+CLI+测试
 │   ├── run-ctest.bat           运行测试
-│   ├── difftest.py             Python decimal 差分测试
+│   ├── run_differential.py     差分测试的编排器（逐个报告、汇总退出码）
+│   ├── verify_div.py           除法差分（参考实现：fractions.Fraction 精确有理数）
+│   ├── verify_func.py          超越函数差分
+│   ├── verify_mod.py           取余/取整差分
+│   ├── verify_format.py        进制与位运算差分
+│   ├── verify_format_len.py    进制展开长度与终止性差分
+│   ├── verify_expression.py    表达式差分
 │   ├── verify_cli.py           命令行前端的端到端测试（三模式 + 参数边界）
 │   ├── verify_cli_oj.py        OJ 协议：与 legacy 逐例对比 + 与正确算术对比
 │   ├── api_test.py             端到端 API 测试
+│   ├── bench.py                性能基准（产出文档里的实测数字）
 │   └── screenshot.py           headless Edge 截图
 ├── docs/
 │   ├── architecture.md
@@ -10012,10 +10025,24 @@ git commit -m "feat(ui): Qt 桌面界面与离屏冒烟测试"
 ---
 ### Task 10: CI、脚本与文档
 
+> **本节的实现与初稿有出入，以实现为准。** 差分测试脚本没有合并成
+> 一个 `difftest.py`（那是初稿的想法），而是**八个套件各自独立**、
+> 各自有独立的参考实现与独立的覆盖目标；合并成一个脚本反而会让
+> 「哪个套件挂了」变得难分辨。取而代之的是
+> `scripts/run_differential.py` —— 它**编排**那八个套件，逐个报告、
+> 汇总退出码，而不是把它们合并。
+>
+> 同理，差分测试没有单独注册成一条名为 `difftest` 的用例，而是
+> **八个套件各注册一条**（`diff_div` / `diff_func` / `diff_mod` /
+> `diff_format` / `diff_format_len` / `diff_expression` / `diff_cli` /
+> `diff_cli_oj`），加上两条端到端（`api_e2e` / `api_stall`）——
+> 十二条用例一起挂在 ctest 下面。
+
 **Files:**
 - Create: `.github/workflows/build.yml`
 - Create: `scripts/run-ctest.bat`（Task 1 已建最小版本，本任务补齐/覆盖）
-- Create: `scripts/difftest.py`
+- Create: `scripts/run_differential.py`
+- Create: `scripts/check_plan_cpp_blocks.py`
 - Create: `docs/architecture.md`
 - Create: `docs/bignum-algorithms.md`
 - Create: `README.md`（新写。注意：Task 1 已把原 `README.md`/`README_CN.md` 移到
@@ -10026,7 +10053,7 @@ git commit -m "feat(ui): Qt 桌面界面与离屏冒烟测试"
 - Consumes: 全部前置任务
 - Produces: 完整 CI 流水线与文档
 
-- [ ] **Step 1: 写 `scripts/run-ctest.bat`**
+- [x] **Step 1: 写 `scripts/run-ctest.bat`**
 
 ```bat
 @echo off
@@ -10035,146 +10062,108 @@ setlocal
 call "%~dp0msvc-env.bat" ctest --test-dir "%~dp0..\build" --output-on-failure -C Release || exit /b 1
 ```
 
-- [ ] **Step 2: 写 `scripts/difftest.py`**
+- [x] **Step 2: 写差分测试的编排脚本 `scripts/run_differential.py`**
 
-把 Task 3/4 的 `verify_div.py` 与 `verify_func.py` 合并为一个脚本：
+初稿写的是把 `verify_div.py` 与 `verify_func.py` 合并成一个
+`scripts/difftest.py`。**没有这么做**，理由：
 
-```python
-#!/usr/bin/env python3
-"""差分测试：用 Python 标准库 decimal 作为独立基准，校验 C++ 核心。
+八个套件各自的覆盖目标不同（除法 / 超越函数 / 取余 / 进制 /
+进制展开长度 / 表达式 / 命令行 / OJ 协议），参考实现也各不相同
+（`fractions.Fraction` 的精确有理数、`decimal`、直接构造期望串）。
+合并成一个脚本会带来两个坏处：
 
-用法：python scripts/difftest.py [--div-probe <路径>] [--func-probe <路径>]
-默认 build/div_probe 与 build/func_probe。
-"""
-import argparse
-import random
-import subprocess
-import sys
-from decimal import Decimal, getcontext, ROUND_HALF_EVEN
+1. 「哪个套件挂了」在合并后的输出里很难一眼看出来；
+2. 各套件想换参考实现时，要在一个文件里改八处。
 
-getcontext().prec = 300
-PREC = 20
-QUANT = Decimal(1).scaleb(-PREC)
+所以保留八个套件不变，另写一个**编排**脚本
+`scripts/run_differential.py`：它按清单逐个跑，逐个报告，
+汇总退出码。CI 用它，开发者也用它。
 
+它的清单（探针 → 套件）：
 
-def fmt(value: Decimal) -> str:
-    quantized = value.quantize(QUANT, rounding=ROUND_HALF_EVEN)
-    text = format(quantized, 'f')
-    if '.' in text:
-        text = text.rstrip('0').rstrip('.')
-    return text or '0'
-
-
-def run_probe(probe: str, lines):
-    result = subprocess.run([probe], input='\n'.join(lines), capture_output=True, text=True)
-    return result.stdout.split()
-
-
-def check_divisions(seed=7, count=400):
-    random.seed(seed)
-    cases = []
-    for _ in range(count):
-        a = ''.join(random.choice('0123456789') for _ in range(random.randint(1, 60)))
-        b = ''.join(random.choice('0123456789') for _ in range(random.randint(1, 30)))
-        if b.strip('0') == '':
-            b = '7'
-        if a.strip('0') == '':
-            a = '0'
-        cases.append((a, b))
-    cases += [('1', '3'), ('10', '3'), ('1000', '7'), ('1', '2'), ('99999', '3')]
-
-    outputs = run_probe('./build/div_probe', [f'{a} {b}' for a, b in cases])
-    failures = 0
-    for (a, b), got in zip(cases, outputs):
-        expected = fmt(Decimal(a) / Decimal(b))
-        if got != expected:
-            failures += 1
-            if failures <= 5:
-                print(f"MISMATCH div {a} / {b}\n  got      {got}\n  expected {expected}")
-    return len(cases) - failures, len(cases)
-
-
-def check_functions(seed=11, count=120):
-    random.seed(seed)
-    cases = []
-    for _ in range(count):
-        cases.append(('sqrt', f"{random.uniform(0.01, 10000):.6f}", '0'))
-        cases.append(('exp', f"{random.uniform(-10, 10):.6f}", '0'))
-        cases.append(('ln', f"{random.uniform(0.001, 1000):.6f}", '0'))
-        cases.append(('pow', f"{random.uniform(0.1, 100):.6f}", f"{random.uniform(0.1, 5):.6f}"))
-    cases += [('sqrt', '2', '0'), ('sqrt', '4', '0'), ('exp', '0', '0'), ('exp', '1', '0'),
-              ('ln', '1', '0'), ('ln', '2', '0'), ('ln', '10', '0'), ('pow', '2', '10')]
-
-    outputs = run_probe('./build/func_probe', [f'{o} {a} {b}' for o, a, b in cases])
-    failures = 0
-    for (op, a, b), got in zip(cases, outputs):
-        da, db = Decimal(a), Decimal(b)
-        if op == 'sqrt':
-            expected = da.sqrt()
-        elif op == 'exp':
-            expected = da.exp()
-        elif op == 'ln':
-            expected = da.ln()
-        else:
-            expected = da ** db
-        expected_text = fmt(expected)
-        if got != expected_text:
-            failures += 1
-            if failures <= 8:
-                print(f"MISMATCH {op} {a} {b}\n  got      {got}\n  expected {expected_text}")
-    return len(cases) - failures, len(cases)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--div-probe', default='./build/div_probe')
-    parser.add_argument('--func-probe', default='./build/func_probe')
-    arguments = parser.parse_args()
-
-    total_failures = 0
-    for name, function in (('除法', check_divisions), ('超越函数', check_functions)):
-        passed, total = function()
-        total_failures += total - passed
-        print(f"{name}差分测试：{passed}/{total} 通过")
-
-    return 1 if total_failures else 0
-
-
-if __name__ == '__main__':
-    sys.exit(main())
+```
+verify_div.py          除法        → div_probe
+verify_func.py         超越函数    → func_probe
+verify_mod.py          取余/取整   → mod_probe
+verify_format.py       进制/位运算 → format_probe
+verify_format_len.py   进制展开长度/终止性 → format_probe
+verify_expression.py   表达式      → expression_probe
+verify_cli.py          命令行前端  → hpc_cli
+verify_cli_oj.py       OJ 协议     → hpc_cli
 ```
 
-- [ ] **Step 3: 在 `CMakeLists.txt` 注册差分测试**
+`api_test.py` 与 `api_stall_test.py` **不在**这个清单里 ——
+它们要拉起服务、占端口，混在这批里会让失败原因难分辨；
+在 ctest 里它们是独立的两条用例。
+
+**如实说明覆盖范围**：`verify_cli_oj.py` 的第 1 部分（与 legacy
+逐例对比）需要 legacy 可执行文件，CI 上没有 → 那一部分**跳过**
+并打印原因，脚本仍然 exit 0。所以 CI 覆盖的是它的第 2/3/4 部分。
+
+- [x] **Step 3: 在 `CMakeLists.txt` 注册差分测试**
+
+初稿写的是注册一条 `difftest` 用例。实际注册的是**十二条**：
+八个差分套件各一条，加上两条端到端。
 
 ```cmake
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
-        add_test(NAME difftest
-                 COMMAND ${Python3_EXECUTABLE}
-                         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/difftest.py"
-                         --div-probe $<TARGET_FILE:div_probe>
-                         --func-probe $<TARGET_FILE:func_probe>)
-        set_tests_properties(difftest PROPERTIES TIMEOUT 300)
+        set(_hpc_scripts "${CMAKE_CURRENT_SOURCE_DIR}/scripts")
+        foreach(_pair
+                "diff_div;verify_div.py;div_probe"
+                "diff_func;verify_func.py;func_probe"
+                "diff_mod;verify_mod.py;mod_probe"
+                "diff_format;verify_format.py;format_probe"
+                "diff_format_len;verify_format_len.py;format_probe"
+                "diff_expression;verify_expression.py;expression_probe"
+                "diff_cli;verify_cli.py;hpc_cli"
+                "diff_cli_oj;verify_cli_oj.py;hpc_cli")
+            list(GET _pair 0 _name)
+            list(GET _pair 1 _script)
+            list(GET _pair 2 _target)
+            add_test(NAME ${_name}
+                     COMMAND ${Python3_EXECUTABLE}
+                             "${_hpc_scripts}/${_script}"
+                             $<TARGET_FILE:${_target}>)
+            set_tests_properties(${_name} PROPERTIES TIMEOUT 900)
+        endforeach()
+        # ...api_e2e / api_stall 见提交的 CMakeLists.txt
     endif()
 ```
 
-- [ ] **Step 4: 写 `.github/workflows/build.yml`**
+探针路径必须用 `$<TARGET_FILE:...>` 传**绝对路径**：Windows 上
+`subprocess` 拒绝「相对路径 + 正斜杠」的可执行文件。
 
-照抄兄弟项目 `Comprehensive-Calculation-Tool/.github/workflows/build.yml`，改为本项目的目标名
-（`hpc_core` / `hpc_cli` / `hpc_server` / `hpc_tests` / `gui_smoke`），
-并在 core 作业中追加差分测试步骤：
+两条 api 用例的**端口不能重叠**：`api_stall_test.py` 会用
+`PORT`、`PORT+1`、`PORT+2` 三个端口，所以它的基准端口取 8090
+（占 8090/8091/8092），而 `api_e2e` 用 8099 —— 撞上的后果不是
+「测试失败」而是「**测的不是自己的东西**」。
 
-```yaml
-      - name: 运行差分测试
-        run: python3 scripts/difftest.py
-```
+- [x] **Step 4: 写 `.github/workflows/build.yml`**
 
-- [ ] **Step 5: 写 `docs/architecture.md`**
+照抄兄弟项目 `Comprehensive-Calculation-Tool/.github/workflows/build.yml`，
+改为本项目的目标名。三个作业：
+
+- **core**：`ubuntu-latest` / `windows-latest` / `macos-latest`，
+  `BUILD_GUI=OFF`，跑 ctest（十二条用例，含全部差分套件）。
+- **gcc**：显式用 GCC 构建。这个作业不是多余的 ——
+  MSVC 会传递性地带入一些标准库头文件（如 `<algorithm>`），
+  掩盖缺失 include 的问题；GCC 不会。
+- **gui**：`jurplel/install-qt-action` 拉 Qt 6.6.2，`BUILD_GUI=ON`，
+  跑离屏冒烟测试。**不必绑定到 MSVC** —— 本机 Qt 6.6.2 的
+  msvc2019_64 与 mingw_64 两套都能构建 GUI 目标并跑通冒烟测试。
+
+工作流文件是**纯 ASCII**：CI runner 按 UTF-8 解析，但纯 ASCII 可以
+避免「本地编辑器按系统代码页写出一个字节」的编码惊喜 ——
+那种情况下 YAML 解析器会拒绝整个文件，而报错指向的那一行看起来
+完全正常。
+
+- [x] **Step 5: 写 `docs/architecture.md`**
 
 内容：分层图（core → cli/api/ui）、数据流、接口边界（核心不依赖任何前端）、
 精度语义（Context 的传播路径）、如何新增一个前端、如何新增一种运算。
 
-- [ ] **Step 6: 写 `docs/bignum-algorithms.md`**
+- [x] **Step 6: 写 `docs/bignum-algorithms.md`**
 
 内容：base-10⁹ 分块布局与内存对齐、十进制字符串与块的转换、
 进位/借位、对齐小数位、长除法推导（余数左移 + 二分试商）、
@@ -10204,28 +10193,62 @@ Knuth Algorithm D 的对照说明与基准数据、舍入模式语义表、
 并说明「运行时 base 参数使内层取模/除法退化为硬件除法，慢约 39%」，
 这是把 base-10 固定在核心、多进制只在表示层处理的理由。
 
-- [ ] **Step 7: 重写 `README.md` 与 `README_CN.md`**
+这组数字由 `scripts/bench.py` + `tests/bench_probe.cpp` 产出，
+可重跑复现；文中写明了三条测量口径（只计运算本身、取多次最小值、
+base 取自 `volatile` 挡住常量折叠）。
+
+**另外补两处初稿没提、但对复用者最要紧的事实**：
+
+- `toBaseString` 对**超大值很慢**：100000 位的整数转二进制要 8.9 秒，
+  300000 位要 87 秒。这是从界面上那个 `max="100000"` **够得着的**，
+  所以必须写进文档，不能让人以为「高精度就等于快」。
+- 超越函数的工作精度上限（`kMaxTranscendentalPrecision = 1000`）是
+  **算力上限，不是接口契约上限**：它只在真的用到超越函数时生效，
+  纯加减乘除在 100000 位以内都合法。
+
+- [x] **Step 7: 重写 `README.md` 与 `README_CN.md`**
 
 内容：项目定位（任意精度十进制计算内核）、特性、目录结构、
 快速开始（构建、运行三种前端）、示例输出、算法文档链接、legacy 说明、许可证。
 
-- [ ] **Step 8: 全量验证**
+两份 README 都以 `0.1 + 0.2` 开场：这里是 `0.3`，IEEE 754 双精度给
+`0.30000000000000004`。内核是 base-10 的，加减乘完全精确 ——
+这是「为什么不用 double」最直接的答案。
+
+- [x] **Step 8: 写 `scripts/check_plan_cpp_blocks.py`（计划与源码的比对）**
+
+初稿没有这一步 —— 但计划里嵌的 C++ 代码块**从来没被编译过**，
+Task 2/3 的初稿还带着后来的评审修复之前的版本
+（`normalize` 的逐个剥离、`divide` 的「多算几位再猜」、
+`modulo` 的「先求商再相减」、`fromString` 不支持科学计数法）。
+
+这个脚本把计划里的每个 ```cpp 围栏与已提交的 `src/`、`tests/`
+逐个**函数定义**比对（去掉注释与空白后逐字比），并把结果变成一个
+可以 CI 跑的退出码。
+
+比对规则踩过两个坑，都写进脚本的注释里：
+
+- **调用点长得像定义**（`fromString(a)`）。只认「行首的声明 +
+  紧跟参数列表的函数体开括号」，且 `)` 与 `{` 之间只允许 cv 限定符
+  与构造函数初始化列表。
+- **`main` 在每个可执行文件里都有一个**。只按名字匹配会拿错文件比 ——
+  所以先按围栏所属 Step 的标题/散文把围栏绑到具体文件。
+
+现状：**284 个共有函数，0 处不一致**。
+
+- [x] **Step 9: 全量验证**
 
 ```bash
 ./scripts/msvc-env.bat cmake -S . -B build -G Ninja -DBUILD_GUI=ON -DBUILD_TESTS=ON -DBUILD_SERVER=ON
 ./scripts/msvc-env.bat cmake --build build
 ./scripts/run-ctest.bat
-python scripts/difftest.py
+python scripts/run_differential.py --build build
 ```
 
-预期：3 个测试全绿（`hpc_tests`、`gui_smoke`、`difftest`），差分测试全通过。
+预期：**12 条 ctest 用例全绿**（2 条单元测试 + 8 条差分 + 2 条端到端），
+外加 GUI 构建下的 `gui_smoke`（13 条）。
 
-- [ ] **Step 9: 提交**
-
-```bash
-git add -A
-git commit -m "docs: 架构与算法研究笔记、CI 流水线与差分测试脚本"
-```
+- [x] **Step 10: 提交**
 
 ---
 
