@@ -393,11 +393,106 @@ struct Context {
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "core/Rounding.h"
 
 namespace hpc {
+
+// --- 运算上限 ---
+//
+// 这些上限是**公开契约**：调用方（尤其是前端）需要知道自己能请求多大的
+// 精度，否则只能靠试错发现某个值会抛异常。
+//
+// 分成两层，因为两类运算的代价模型完全不同：
+
+// 除法与舍入的精度上限。
+//
+// 除法要按位做长除法，代价随精度线性增长（再乘上被除数的位数）。
+// 实测 p=100000 时单次除法要几十秒 —— 已经很慢，但能算完。
+inline constexpr int kMaxPrecision = 100000;
+
+// 超越函数的精度上限。
+//
+// 与 kMaxPrecision 不同：超越函数的工作精度是**平方级**的。
+// 实测（本机 GCC -O2，最坏情况是 pow(2, 0.5)）：
+//
+//   p=200  →    413 ms
+//   p=400  →   3.4 s
+//   p=800  →    22 s
+//   p=1600 →   151 s
+//   p=1000（exp）→  23 s
+//
+// 也就是说 kMaxPrecision = 100000 对超越函数而言远远不够 ——
+// 它们在 p=1600 时就已经要两分半，p=99990 更是永远算不完。
+//
+// 所以超越函数单独用一个上限，取 1000：最坏情况约 40 秒，
+// 属于「可接受的慢」而不是「永远算不完」。
+//
+// 这是**产品决策**而非数学限制 —— 真正需要更高精度的调用方
+// 应该分批求值（例如先用 1000 位求出前导部分再细化）。
+//
+// **注**：上表的实测数据是**优化前**的。超越函数曾经是三次方复杂度
+// （级数每项一次全精度除法，而通用除法用二分试商是 O(块数²)），
+// 优化后「除以小整数」与「舍入」都走线性路径，整体降到接近平方级：
+//
+//   p=50  →  exp(1)  0.9 ms    ln(2)  0.2 ms
+//   p=100 →  exp(1)  1.3 ms    ln(2)  0.5 ms
+//   p=200 →  exp(1)  3.1 ms    ln(2)  1.2 ms
+//   p=400 →  exp(1)  9.5 ms    ln(2)  4.8 ms
+//   p=800 →  exp(1)   39 ms    ln(2)   19 ms
+//   p=1000 → exp(1)   65 ms    ln(2)   35 ms
+//
+// 上限**保持 1000 不变** —— 它是公开契约，改动要与调用方协调；
+// 但现在这个上限是「保守」而非「不得不然」，可以另行讨论是否提高。
+inline constexpr int kMaxTranscendentalPrecision = 1000;
+
+// 整数幂的指数上限。
+inline constexpr long long kMaxIntegerPower = 100000;
+
+// 整数幂结果的位数上限（防止 10^100000 这类天文数字）。
+//
+// 上限按**结果的十进制位数**估算，整数位与小数位都算在内。
+//
+// 估算式：结果位数 <= power × (底数的有效位数 + 底数的小数位数)。
+//
+// 底数 |b| 有 s 位有效数字、t 位小数时，|b| ∈ [10^(s-1-t), 10^(s-t))，
+// 于是 |b^power| 的位数不超过 power × (s + t)：
+//   - 值 >= 1 时：整数位 <= power × (s - t) <= power × (s + t)
+//   - 值 <  1 时：小数位 <= power × (t - s + 1) <= power × (s + t)
+//
+// 所以这个估算**总是 >= 实际位数**（最多高估 3 倍），上限因此是硬约束。
+//
+// 只看底数的整数位数会完全漏掉小数底数：0.001 的整数位数是 -2，
+// 那个「整数位数 > 0」的判据会把整个护栏跳过，而结果的**小数位数**
+// 恰恰是按 power 线性增长的 —— 0.001^100000 需要 30 万位小数。
+//
+// 实测（本机 GCC -O2，precision=20）：
+//
+//   pow(2, 100000)              511 ms     结果 3 万位
+//   pow(3, 100000)             1325 ms     结果 4.8 万位
+//   pow(10, 100000)            8041 ms     结果 10 万位
+//   pow(0.001, 100000)        67598 ms     结果 30 万位小数
+//
+// 30 万位已经要一分多钟，所以上限取 30 万：
+// 估算 <= 30 万 ⟹ 实际位数 <= 30 万 ⟹ 单次不超过一分多钟。
+inline constexpr int kMaxPowerResultDigits = 300000;
+
+// 科学计数法的指数上限（|exponent| 的**精确**上限）。
+//
+// 指数为正时结果是 10^exponent 量级的整数，为负时是极小的分数。
+// 两个方向都要有上限，否则 "1e999999999" 会把内存吃光。
+//
+// 上限取 10^6：正指数产生 100 万位整数（约 450 KB），负指数产生
+// 100 万位小数 —— 都是「能算但没必要」的量级，再大就没有实用价值。
+//
+// 检查必须**在把当前位折进 magnitude 之后**做：先检查再折的话，
+// 最后一位会把 magnitude 顶到 10 × 上限，实际接受的上限就是 10 倍。
+inline constexpr long long kMaxExponentMagnitude = 1000000;
+
+// 小端 base-10^9 分块序列：blocks[0] 是最低位块，blocks.back() 是最高位块。
+using Blk = std::vector<std::uint32_t>;
 
 class BigDecimal {
 public:
@@ -418,6 +513,24 @@ public:
     BigDecimal operator-(const BigDecimal& other) const;
     BigDecimal operator*(const BigDecimal& other) const;
 
+    // 不精确运算：必须显式给出精度。
+    // 除数为零时抛出 std::domain_error。
+    // context.precision > kMaxPrecision 时抛 std::invalid_argument。
+    static BigDecimal divide(const BigDecimal& lhs, const BigDecimal& rhs, const Context& context);
+
+    // 取余：lhs - trunc(lhs/rhs) * rhs。结果符号跟随被除数（与 C 的 % 一致）。
+    // 除数为零时抛出 std::domain_error。
+    //
+    // 取余是**精确**运算（整数长除法），不接受 Context，因此不受
+    // kMaxPrecision 约束。
+    static BigDecimal modulo(const BigDecimal& lhs, const BigDecimal& rhs);
+
+    // 取整：按 context.precision 位有效数字取整（floor 向 -∞，ceil 向 +∞，
+    // round 为银行家舍入 HalfEven）。
+    static BigDecimal floor(const BigDecimal& value, const Context& context);
+    static BigDecimal ceil(const BigDecimal& value, const Context& context);
+    static BigDecimal round(const BigDecimal& value, const Context& context);
+
     // 比较：<0 表示本对象小于 other，0 表示相等，>0 表示大于。
     int compare(const BigDecimal& other) const;
     bool equals(const BigDecimal& other) const;
@@ -427,12 +540,162 @@ public:
     bool isZero() const;
     int sign() const { return sign_; }
 
+    // 是否为整数（没有小数位）。
+    bool isInteger() const { return scale_ == 0; }
+
+    // 十进制小数位的个数。
+    //
+    // 注意与 Context::precision 区分：precision 是**有效数字位**，
+    // scale 是**小数位**（十进制小数点后的位数），两者不是一个概念。
+    int scale() const { return scale_; }
+
+    // 精确地向零截断到整数（丢弃小数部分，不做舍入）。
+    //
+    // -1.5 -> -1，1.5 -> 1。与 floor 的区别：floor 向 -∞ 取整，
+    // -1.5 的 floor 是 -2。位运算与进制转换的整数部分都用这个语义。
+    BigDecimal truncateToInteger() const;
+
+    // 整数的**绝对值**的 base-10^9 小端块（digits_[0] 是最低位块）。
+    //
+    // 非整数时抛 std::domain_error —— 位运算这类「精确整数运算」的入口。
+    // 符号不在这里：符号由 sign() 单独给出。
+    const std::vector<std::uint32_t>& integerBlocks() const;
+
+    // **分子**（绝对值）的 base-10^9 小端块。
+    //
+    // 值 = ±numerator * 10^(-scale)。整数时与 integerBlocks() 相同。
+    //
+    // 与 integerBlocks() 的区别：这里**不要求**值是整数 —— 小数值的分子
+    // 同样有意义（进制转换要靠它判断该值能否在目标进制下有限表示）。
+    const std::vector<std::uint32_t>& numeratorBlocks() const { return digits_; }
+
+    // --- 超越函数 ---
+    //
+    // 这些函数本质上不精确，必须显式给出精度：结果按 context.precision
+    // 位有效数字舍入，舍入方式取 context.mode。
+    //
+    // 定义域之外抛 std::domain_error：
+    //   sqrt：负数
+    //   ln / log10：非正数
+    //   pow：负底数的非整数次幂、零的负数次幂、零的零次幂
+    //
+    // 结果规模超出可计算范围时抛 std::overflow_error（exp 的参数过大、
+    // pow 的整数指数过大、pow 的结果位数过大）。
+    //
+    // 精度超出上限时抛 std::invalid_argument：
+    //
+    //   - sqrt / exp / ln / log10 与 pow 的**非整数指数**分支：
+    //     context.precision > kMaxTranscendentalPrecision。
+    //     这五个入口的工作精度是平方级的（见 kMaxTranscendentalPrecision
+    //     的实测数据），p=1600 时 pow(2, 0.5) 要跑 151 s，p=99990 更是
+    //     永远算不完 —— 而且失败方式**不一致**（有的精度下内层的 divide
+    //     恰好抛异常，有的精度下则一路挂起）。统一的 std::invalid_argument
+    //     让调用方拿到确定的行为。
+    //
+    //   - divide / roundToPrecision / floor / ceil / round：
+    //     context.precision > kMaxPrecision。除法的代价随精度线性增长，
+    //     p=100000 时单次要几十秒 —— 能算完，但已经不值得。
+    //
+    // 注意两者的区别：**pow 的整数指数分支不受
+    // kMaxTranscendentalPrecision 约束** —— 整数次幂走的是精确的快速幂，
+    // 代价由 kMaxIntegerPower（指数）与 kMaxPowerResultDigits（结果位数）
+    // 单独约束，与超越函数的工作精度毫无关系。pow(10, 100000) 在
+    // precision=2000 下完全合法。
+
+    // 平方根。
+    static BigDecimal sqrt(const BigDecimal& value, const Context& context);
+
+    // 幂。整数指数走精确的快速幂；非整数指数用 exp(b·ln a)。
+    static BigDecimal pow(const BigDecimal& base, const BigDecimal& exponent,
+                          const Context& context);
+
+    // 自然指数 e^x。
+    static BigDecimal exp(const BigDecimal& value, const Context& context);
+
+    // 自然对数 ln(x)。
+    static BigDecimal ln(const BigDecimal& value, const Context& context);
+
+    // 常用对数 log10(x)。
+    static BigDecimal log10(const BigDecimal& value, const Context& context);
+
 private:
     // 规范化：去除前导零块，去掉多余的尾随零。
     void normalize();
 
     // 对齐两个数的小数位，返回对齐后共同的 scale。
     static int alignScale(BigDecimal& lhs, BigDecimal& rhs);
+
+    // 舍入到 context.precision 位有效数字。
+    static BigDecimal roundToPrecision(const BigDecimal& value, const Context& context);
+
+    // --- 超越函数的内部工具 ---
+
+    // 值的十进制指数 e：10^e <= |value| < 10^(e+1)。零值按 0 处理。
+    int decimalExponent() const;
+
+    // 精确地做 value * 10^exponent（指数可正可负，不引入舍入）。
+    static BigDecimal shiftByPowerOfTen(const BigDecimal& value, int exponent);
+
+    // 精确地乘以 2（十进制下 2 是有限的，除以 2 用乘 5 再移小数点）。
+    static BigDecimal multiplyByTwo(const BigDecimal& value);
+
+    // 精确地除以 2。
+    static BigDecimal divideByTwo(const BigDecimal& value);
+
+    // 向下取整到整数（scale 归零）。
+    static BigDecimal floorToInteger(const BigDecimal& value);
+
+    // scale 为 0 的整数值转成 long long；超出范围时抛 std::overflow_error。
+    static long long toInteger(const BigDecimal& value);
+
+    // 精确的整数幂 base^power（power >= 1）；结果位数超限时抛 std::overflow_error。
+    static BigDecimal integerPower(const BigDecimal& base, long long power);
+
+    // atanh 级数：z + z^3/3 + z^5/5 + ...（|z| <= 1/3 时收敛很快）。
+    static BigDecimal atanhSeries(const BigDecimal& z, const Context& work);
+
+    // exp(g) 的泰勒级数（0 <= g < ln(10) 时收敛很快）。
+    static BigDecimal expSeries(const BigDecimal& g, const Context& work);
+
+    // 除以一个小整数（级数里的 2k+1 与 n! 的因子都是这种形状）。
+    //
+    // 语义与 divide(value, BigDecimal(divisor), context) **完全一致**
+    // （同样的舍入模式、同样的精度处理），但走的是线性时间的路径：
+    // 除数是「单块整数 × 10 的幂」，可以一步长除法算出来，
+    // 不必用通用路径的「二分试商」逐位试商（那是 O(块数²)）。
+    //
+    // divisor >= 10^9 时回退到通用路径（那时除数已经不止一块了）。
+    static BigDecimal divideBySmallInt(const BigDecimal& value, std::uint64_t divisor,
+                                       const Context& context);
+
+    // 把 value 分解成 mantissa * 10^exponent * 2^halvings，
+    // 其中 mantissa ∈ [1, 2)，exponent 与 halvings 由输出参数给出。
+    //
+    // 移位与折半都是精确操作，不引入任何舍入。
+    static BigDecimal decomposeForLog(const BigDecimal& value, int& exponent, int& halvings);
+
+    // ln(2) 与 ln(10)：按 work 精度**实时计算**（硬编码常量在高精度下不够用）。
+    // ln2 由调用方传入 —— 一次运算里 ln(2) 会被用到好几处。
+    static BigDecimal ln2Constant(const Context& work);
+    static BigDecimal ln10Constant(const BigDecimal& ln2, const Context& work);
+
+    // 超越函数的内部实现：work 是工作精度（含保护位），final 是最终舍入上下文。
+    static BigDecimal expInternal(const BigDecimal& value, const Context& work,
+                                  const Context& final);
+    static BigDecimal lnInternal(const BigDecimal& value, const Context& work);
+    static BigDecimal log10Internal(const BigDecimal& value, const Context& work,
+                                    const Context& final);
+
+    // 逐块长除法 + 二分试商。返回 {商, 余数}。
+    static std::pair<Blk, Blk> divideBlk(const Blk& dividend, const Blk& divisor);
+
+    // 把精确分数 numerator/denominator 舍入到 precision 位有效数字。
+    // 返回 {舍入后的整数, 小数位数}，即 值 = 整数 * 10^(-小数位数)。
+    //
+    // 舍入判定基于长除法的**精确余数**，因此能区分「正好一半」与
+    // 「超过一半」—— 银行家舍入的偶数分支才可靠。
+    static std::pair<Blk, int> roundQuotient(const Blk& numerator, const Blk& denominator,
+                                             int precision, RoundingMode mode, bool negative);
 
     int sign_ = 0;                      // -1 / 0 / +1
     std::vector<std::uint32_t> digits_; // 小端 base-10^9 分块
@@ -451,8 +714,11 @@ private:
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <cstdio>
+#include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace hpc {
 namespace {
@@ -460,7 +726,12 @@ namespace {
 constexpr std::uint64_t kBase = 1000000000ULL;   // 10^9
 constexpr int kBlockDigits = 9;
 
-using Blk = std::vector<std::uint32_t>;
+// 允许的最大有效数字位数。超过这个量级的运算量已大到不实用，
+// 通常说明调用方用了一个写死的巨大精度，而不是按量的级计算。
+//
+// kMaxPrecision / kMaxTranscendentalPrecision / kMaxIntegerPower /
+// kMaxPowerResultDigits / kMaxExponentMagnitude 都是**公开契约**
+// （声明在 BigDecimal.h），前端要靠它们判断能请求多大的精度。
 
 // 去除高位的零块，但至少保留一个块表示 0。
 Blk trimBlk(Blk value) {
@@ -468,6 +739,10 @@ Blk trimBlk(Blk value) {
     if (value.empty()) value.push_back(0);
     return value;
 }
+
+// 10 的小幂表（10^0 .. 10^8）。
+constexpr std::uint32_t kPow10[kBlockDigits] = {
+    1u, 10u, 100u, 1000u, 10000u, 100000u, 1000000u, 10000000u, 100000000u};
 
 // 把小端 base-10^9 块序列原地除以 10（去掉一个十进制尾随零）。
 // 小端表示下，最高位在末尾，所以进位要从高位往低位传。
@@ -527,6 +802,7 @@ Blk mulBlk(const Blk& a, const Blk& b) {
             carry = cur / kBase;
         }
         std::size_t k = i + b.size();
+        // 进位最多只会再向后延伸一块：真实乘积 < 10^(9*(a.size()+b.size()))。
         while (carry) {
             std::uint64_t cur = result[k] + carry;
             result[k] = static_cast<std::uint32_t>(cur % kBase);
@@ -553,7 +829,7 @@ Blk blocksFromDecimal(std::string_view text) {
     return trimBlk(std::move(blocks));
 }
 
-// 把小端 base-10^9 块转成十进制字符串（不含小数点）。
+// 把小端 base-10^9 块转成十进制数字串（不含小数点，无前导零）。
 std::string blockDigitsToString(const Blk& blocks) {
     std::string digits = std::to_string(blocks.back());
     char buffer[16];
@@ -575,6 +851,275 @@ std::string decimalFromBlocks(const Blk& blocks, int scale) {
     return digits;
 }
 
+// 数字串的十进制位数（块序列表示的整数位数）。
+int decimalDigitCount(const Blk& blocks) {
+    const int top = static_cast<int>(std::to_string(blocks.back()).size());
+    return top + static_cast<int>(blocks.size() - 1) * kBlockDigits;
+}
+
+// 10^exponent 的块表示（小端）。exponent >= 0。
+Blk powOfTenBlocks(int exponent) {
+    Blk blocks(static_cast<std::size_t>(exponent / kBlockDigits), 0);
+    blocks.push_back(kPow10[exponent % kBlockDigits]);
+    return blocks;
+}
+
+// 块序列乘以 10^places（places 为十进制位数）。
+// 小端表示下整体左移若干块 = 在**最低位一侧**补零。
+Blk shiftLeftDecimal(Blk blocks, int places) {
+    if (places <= 0) return blocks;
+    const int rest = places % kBlockDigits;
+    const int whole = places / kBlockDigits;
+    if (rest > 0) blocks = mulBlk(blocks, Blk{kPow10[rest]});
+    // 小端：索引 0 是最低位块，乘以 10^9 相当于在索引 0 处插入一个零块。
+    if (whole > 0) blocks.insert(blocks.begin(), static_cast<std::size_t>(whole), 0);
+    return blocks;
+}
+
+// 块序列是否表示 0。
+bool isZeroBlk(const Blk& blocks) {
+    return blocks.size() == 1 && blocks[0] == 0;
+}
+
+// 被丢弃部分相对「半个 ulp」的位置。
+enum class DiscardTail {
+    Zero,            // 没有丢弃任何非零内容
+    LessThanHalf,    // 丢弃部分非零，但小于半个 ulp
+    ExactlyHalf,     // 恰好半个 ulp
+    GreaterThanHalf, // 大于半个 ulp
+};
+
+// 是否需要在**绝对值方向**上加一（即远离零进位）。
+//
+// lastKeptDigit 是保留部分的末位（银行家舍入要看它的奇偶）。
+// negative 表示原值为负：Ceil/Floor 的方向与符号相关。
+bool roundsUpInMagnitude(RoundingMode mode, DiscardTail tail, int lastKeptDigit,
+                         bool negative) {
+    switch (mode) {
+        case RoundingMode::Down:
+            return false;                          // 向零截断
+        case RoundingMode::Up:
+            return tail != DiscardTail::Zero;       // 远离零
+        case RoundingMode::Ceil:
+            return tail != DiscardTail::Zero && !negative;   // 向 +∞
+        case RoundingMode::Floor:
+            return tail != DiscardTail::Zero && negative;     // 向 -∞
+        case RoundingMode::HalfUp:
+            return tail == DiscardTail::ExactlyHalf ||
+                   tail == DiscardTail::GreaterThanHalf;
+        case RoundingMode::HalfEven:
+            return tail == DiscardTail::GreaterThanHalf ||
+                   (tail == DiscardTail::ExactlyHalf && (lastKeptDigit % 2 == 1));
+    }
+    return false;
+}
+
+// 块序列乘以 2。
+Blk doubleBlk(Blk blocks) {
+    std::uint64_t carry = 0;
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        const std::uint64_t current = static_cast<std::uint64_t>(blocks[i]) * 2 + carry;
+        blocks[i] = static_cast<std::uint32_t>(current % kBase);
+        carry = current / kBase;
+    }
+    if (carry) blocks.push_back(static_cast<std::uint32_t>(carry));
+    return blocks;
+}
+
+// 块序列加一（小端：进位从最低位块向**最高位块**传播，即索引增大的方向）。
+void incrementBlk(Blk& blocks) {
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        if (blocks[i] < kBase - 1) {
+            ++blocks[i];
+            return;
+        }
+        blocks[i] = 0;
+    }
+    blocks.push_back(1);
+}
+
+// 比较 N/D 与 10^exponent，返回 <0 / 0 / >0。
+int compareQuotientToPowerOfTen(const Blk& numerator, const Blk& denominator, int exponent) {
+    if (exponent >= 0) {
+        return compareBlk(numerator, shiftLeftDecimal(denominator, exponent));
+    }
+    return compareBlk(shiftLeftDecimal(numerator, -exponent), denominator);
+}
+
+// 求商的十进制指数 e：满足 10^e <= N/D < 10^(e+1)。
+//
+// 商可能**恰好**是 10 的幂（如 0.001 = 10^-3），因此两个边界都要检查。
+int quotientExponent(const Blk& numerator, const Blk& denominator) {
+    int e = decimalDigitCount(numerator) - decimalDigitCount(denominator) - 1;
+    while (compareQuotientToPowerOfTen(numerator, denominator, e + 1) >= 0) ++e;
+    while (compareQuotientToPowerOfTen(numerator, denominator, e) < 0) --e;
+    return e;
+}
+
+// --- 超越函数级数用的线性时间工具 ---
+//
+// 通用路径（divideBlk + 二分试商）每次除法是 O(块数²)：每来一个块就要
+// 二分试商约 30 次，每次试商又是一次 O(块数) 的乘法。超越函数的级数每一项
+// 都要做一次除法，级数又有 Θ(precision) 项，于是总体变成三次方。
+//
+// 但级数里的除数有两个特殊形状：**单块的小整数**与 **10 的整数次幂**。
+// 这两种都能用 O(块数) 的线性扫描算出来。
+
+// 单块长除法：把块序列除以一个单块整数（0 < divisor < 10^9）。
+//
+// 每块只要一次 64 位除法：current = 余数 * 10^9 + 块 < 10^18，装得下。
+// 返回 {商, 余数}，余数 < divisor。
+std::pair<Blk, std::uint32_t> divideBlkBySingle(const Blk& dividend, std::uint32_t divisor) {
+    Blk quotient(dividend.size(), 0);
+    std::uint64_t remainder = 0;
+    for (std::size_t i = dividend.size(); i-- > 0;) {
+        const std::uint64_t current = remainder * kBase + dividend[i];
+        quotient[i] = static_cast<std::uint32_t>(current / divisor);
+        remainder = current % divisor;
+    }
+    quotient = trimBlk(std::move(quotient));
+    return {std::move(quotient), static_cast<std::uint32_t>(remainder)};
+}
+
+// 把块序列右移 rest 个十进制位（1 <= rest <= 8），即丢掉最低的 rest 位。
+//
+// 小端表示下，最低位块是 digits_[0]，所以「第 i 块右移 rest 位」的结果要
+// 从**更高**的一块借位：新的第 i 块 = 上一块（更高位）的低 rest 位拼上
+// 自己的高 9-rest 位。
+Blk shiftRightDecimalDigits(const Blk& blocks, int rest) {
+    if (rest <= 0) return blocks;
+    const std::size_t size = blocks.size();
+    Blk shifted(size, 0);
+    for (std::size_t i = 0; i < size; ++i) {
+        const std::uint32_t low = blocks[i] / kPow10[rest];
+        const std::uint32_t high =
+            (i + 1 < size) ? static_cast<std::uint32_t>(blocks[i + 1] % kPow10[rest]) : 0u;
+        shifted[i] = high * kPow10[kBlockDigits - rest] + low;
+    }
+    return trimBlk(std::move(shifted));
+}
+
+// 把块序列除以 10^places（十进制位），返回 {商, 余数}。
+//
+// 商 = floor(N / 10^places)，余数 = N mod 10^places（都以块序列表示）。
+//
+// places 不必是 9 的倍数：先把低 whole 个整块丢掉，再整体右移 rest 位。
+// 公式是 floor(N / 10^(9w+r)) = floor(floor(N / 10^(9w)) / 10^r)。
+std::pair<Blk, Blk> divideBlkByPowerOfTen(const Blk& blocks, int places) {
+    if (places <= 0) return {trimBlk(blocks), Blk{0}};
+    const int whole = places / kBlockDigits;
+    const int rest = places % kBlockDigits;
+    const int size = static_cast<int>(blocks.size());
+
+    if (whole >= size) {
+        // 整个数都不到 10^places：商为 0，余数就是它自己。
+        return {Blk{0}, trimBlk(blocks)};
+    }
+
+    // 余数 = 低 whole 个整块 + (第 whole 块的低 rest 位) * 10^(9*whole)。
+    Blk remainder;
+    remainder.reserve(static_cast<std::size_t>(whole) + 1);
+    for (int i = 0; i < whole; ++i) remainder.push_back(blocks[i]);
+    if (rest > 0) {
+        remainder.push_back(static_cast<std::uint32_t>(blocks[whole] % kPow10[rest]));
+    }
+    remainder = trimBlk(std::move(remainder));
+
+    // 商 = floor(N / 10^(9*whole)) 再右移 rest 位。
+    Blk quotient(blocks.begin() + whole, blocks.end());
+    if (rest > 0) quotient = shiftRightDecimalDigits(std::move(quotient), rest);
+    quotient = trimBlk(std::move(quotient));
+
+    return {std::move(quotient), std::move(remainder)};
+}
+
+// 比较 2*value 与 10^places。返回 <0 / 0 / >0。
+//
+// value 只需是「不足 10^places 的非负整数」，调用方保证这一点。
+int compareDoubleToPowerOfTen(const Blk& value, int places) {
+    const Blk doubled = doubleBlk(value);
+    const Blk threshold = powOfTenBlocks(places);
+    return compareBlk(doubled, threshold);
+}
+
+// 把精确分数 N / (d * 10^s) 舍入到 precision 位有效数字。
+//
+// 与 roundQuotient(N, d * 10^s, ...) **完全等价**（同样的舍入模式、同样的
+// 尾数判定、同样的结果位数），但除法走线性路径：除数是「单块整数 d × 10
+// 的幂」，可以分两段做长除法 —— 先除 10^m，再除 d —— 每段都是 O(块数)。
+//
+// 两段除法与一步除法等价，靠的是恒等式
+//     floor(floor(X / a) / b) = floor(X / (a·b))
+// 余数也随之分解：X = q·(d·10^m) + r，而 r = r2·10^m + r1，
+// 其中 r1 = X mod 10^m、r2 = (X div 10^m) mod d。
+//
+// d 必须 < 10^9（单块）。
+std::pair<Blk, int> roundQuotientSmall(const Blk& numerator, std::uint32_t d, int s,
+                                       int precision, RoundingMode mode, bool negative) {
+    const Blk denominator = shiftLeftDecimal(Blk{d}, s);
+    const int exponent = quotientExponent(numerator, denominator);
+
+    const int shift = precision - 1 - exponent;
+    Blk scaledNumerator;
+    int m;                       // 约化后的除数是 d * 10^m
+    if (shift >= 0) {
+        scaledNumerator = shiftLeftDecimal(numerator, shift);
+        m = s;
+    } else {
+        scaledNumerator = numerator;
+        m = s - shift;
+    }
+
+    // 两段长除法。
+    const auto first = divideBlkByPowerOfTen(scaledNumerator, m);
+    const auto second = divideBlkBySingle(first.first, d);
+    Blk quotient = second.first;
+    const std::uint32_t r2 = second.second;    // (scaledNumerator div 10^m) mod d
+    const Blk& r1 = first.second;              // scaledNumerator mod 10^m
+
+    // 尾数判定：余数 R = r2·10^m + r1，比较 2R 与 d·10^m。
+    //
+    // 因为 0 <= 2·r1 < 2·10^m，比较 2R = 2·r2·10^m + 2·r1 与 d·10^m
+    // 可以按 2·r2 与 d 的大小分档：
+    //   2·r2 > d   → 一定更大
+    //   2·r2 == d  → 由 r1 是否为零决定「正好一半」还是「更大」
+    //   2·r2 == d-1 → 归结为比较 2·r1 与 10^m
+    //   2·r2 < d-1 → 一定更小
+    DiscardTail tail;
+    if (r2 == 0 && isZeroBlk(r1)) {
+        tail = DiscardTail::Zero;
+    } else {
+        const std::uint64_t twiceR2 = 2 * static_cast<std::uint64_t>(r2);
+        if (twiceR2 > d) {
+            tail = DiscardTail::GreaterThanHalf;
+        } else if (twiceR2 == d) {
+            tail = isZeroBlk(r1) ? DiscardTail::ExactlyHalf : DiscardTail::GreaterThanHalf;
+        } else if (twiceR2 + 1 == d) {
+            const int cmp = compareDoubleToPowerOfTen(r1, m);
+            tail = cmp > 0 ? DiscardTail::GreaterThanHalf
+                 : cmp == 0 ? DiscardTail::ExactlyHalf
+                            : DiscardTail::LessThanHalf;
+        } else {
+            tail = DiscardTail::LessThanHalf;
+        }
+    }
+
+    // 末位数字：商的个位。blockDigitsToString 的末位就是 blocks[0] % 10，
+    // 不必为它拼一次字符串。
+    const int lastKeptDigit = static_cast<int>(quotient[0] % 10);
+    if (roundsUpInMagnitude(mode, tail, lastKeptDigit, negative)) {
+        incrementBlk(quotient);
+    }
+
+    // 值 = 商 * 10^(exponent+1-precision)，改写成 整数 * 10^(-小数位数)。
+    int scale = precision - 1 - exponent;
+    if (scale < 0) {
+        quotient = shiftLeftDecimal(std::move(quotient), -scale);
+        scale = 0;
+    }
+    return {std::move(quotient), scale};
+}
+
 }  // namespace
 
 BigDecimal::BigDecimal() : digits_{0} {}
@@ -582,6 +1127,7 @@ BigDecimal::BigDecimal() : digits_{0} {}
 BigDecimal::BigDecimal(std::int64_t value) {
     if (value == 0) { sign_ = 0; digits_ = {0}; scale_ = 0; return; }
     sign_ = value < 0 ? -1 : 1;
+    // 先取 -(value+1) 再加 1，避免 INT64_MIN 取负溢出。
     std::uint64_t magnitude = value < 0
         ? static_cast<std::uint64_t>(-(value + 1)) + 1
         : static_cast<std::uint64_t>(value);
@@ -608,6 +1154,67 @@ BigDecimal BigDecimal::fromString(std::string_view text) {
         ++index;
     }
 
+    // 科学计数法：把指数部分分离出来。
+    //
+    // 指数之前的尾数用与原来完全相同的规则解析（可选小数点、前导零），
+    // 因此**已有输入的行为不变**：不含 'e'/'E' 的串走的是同一条路径。
+    //
+    // 'e' 只有在**前面已经出现过数字**时才是指数标记；否则（"abe" 这类
+    // 输入）它只是尾数里的一个非法字符 —— 交给下面的尾数解析去报错，
+    // 错误信息才准确（"非法字符 'e'" 而不是"指数部分非法"）。
+    //
+    // 指数本身必须是一个十进制整数（可带正负号），否则抛 invalid_argument。
+    int exponent = 0;
+    bool hasExponent = false;
+
+    // 先找到指数标记的位置：第一个「前面有数字」的 'e'/'E'。
+    std::size_t exponentMark = text.size();
+    bool seenDigitBefore = false;
+    for (std::size_t i = index; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c == 'e' || c == 'E') {
+            if (seenDigitBefore) {
+                exponentMark = i;
+                break;
+            }
+            continue;   // 尾数里的非法字符，交给尾数解析报错
+        }
+        if (std::isdigit(static_cast<unsigned char>(c))) seenDigitBefore = true;
+    }
+
+    if (exponentMark != text.size()) {
+        std::size_t cursor = exponentMark + 1;
+        bool exponentNegative = false;
+        if (cursor < text.size() && (text[cursor] == '+' || text[cursor] == '-')) {
+            exponentNegative = (text[cursor] == '-');
+            ++cursor;
+        }
+        if (cursor >= text.size() || !std::isdigit(static_cast<unsigned char>(text[cursor]))) {
+            throw std::invalid_argument("BigDecimal: 指数部分非法");
+        }
+        long long magnitude = 0;
+        while (cursor < text.size() && std::isdigit(static_cast<unsigned char>(text[cursor]))) {
+            // 上限保护：避免 "1e99999999999" 之类的输入把内存吃光。
+            //
+            // 检查放在**折进当前位之后**：先检查再折的话，最后一位会把
+            // magnitude 顶到 10 × 上限，实际接受的上限就是 10 倍
+            // （1e1000009 会被接受，而文档写的是 1e6）。
+            const long long digit = text[cursor] - '0';
+            if (magnitude > (kMaxExponentMagnitude - digit) / 10) {
+                throw std::invalid_argument("BigDecimal: 指数过大");
+            }
+            magnitude = magnitude * 10 + digit;
+            ++cursor;
+        }
+        // 指数后面不允许再有别的字符（"1e5e6" 必须报错而不是丢掉 "e6"）。
+        if (cursor != text.size()) {
+            throw std::invalid_argument("BigDecimal: 指数后面有多余的字符");
+        }
+        exponent = static_cast<int>(exponentNegative ? -magnitude : magnitude);
+        hasExponent = true;
+        text = text.substr(0, exponentMark);
+    }
+
     std::string integral;
     std::string fractional;
     bool seenDot = false;
@@ -632,6 +1239,19 @@ BigDecimal BigDecimal::fromString(std::string_view text) {
     if (combined.empty()) combined = "0";
     result.digits_ = blocksFromDecimal(combined);
     result.normalize();
+
+    // 应用指数：value * 10^exponent。
+    //
+    // 移位是**精确**操作（十进制下 10 的整数次幂就是移小数点），
+    // 因此 1e20、2.5e-3 都能被精确表示，不引入任何舍入。
+    if (hasExponent) {
+        if (exponent > 0) {
+            result.digits_ = shiftLeftDecimal(result.digits_, exponent);
+        } else if (exponent < 0) {
+            result.scale_ += -exponent;
+        }
+        result.normalize();
+    }
     return result;
 }
 
@@ -641,11 +1261,34 @@ void BigDecimal::normalize() {
     //
     // 注意：digits_ 是**小端**存储，digits_[0] 是最低位块，
     // 尾随零位于 digits_[0] 而不是 digits_.back()。
-    // 逐次除以 10 直到最低位块不再是 10 的倍数。
+    //
+    // 性能：尾随零可能成千上万（高精度除法的商形如 0.5000…0）。
+    // 逐个剥离是 O(零个数 × 块数) 的二次方开销，因此先整块剥离
+    // （每次去掉 9 个零），块内不足 9 个时再逐个处理。
     while (scale_ > 0 && (digits_.size() > 1 || digits_[0] != 0)) {
-        if (digits_[0] % 10 != 0) break;
-        divideBy10(digits_);
-        --scale_;
+        // 整块剥离：最低位块为 0，说明它 9 个十进制位全为零。
+        //
+        // 性能：尾随零可能成千上万（高精度除法的商形如 0.5000…0）。
+        // 逐块剥离每次都要移动整个数组，退化成 O(块数²)；因此先数出
+        // 能剥多少块，再**一次性** erase，避免重复搬移。
+        std::size_t zeroBlocks = 0;
+        while (zeroBlocks + 1 < digits_.size() && digits_[zeroBlocks] == 0) ++zeroBlocks;
+        const std::size_t affordable = static_cast<std::size_t>(scale_ / kBlockDigits);
+        const std::size_t strip = zeroBlocks < affordable ? zeroBlocks : affordable;
+        if (strip > 0) {
+            digits_.erase(digits_.begin(), digits_.begin() + static_cast<std::ptrdiff_t>(strip));
+            scale_ -= static_cast<int>(strip) * kBlockDigits;
+            continue;
+        }
+        // 块内零：最低位块非零，但它的末尾可能有零（最多 8 个）。
+        int zeros = 0;
+        std::uint32_t probe = digits_[0];
+        while (probe % 10 == 0 && zeros < kBlockDigits) { ++zeros; probe /= 10; }
+        if (zeros == 0) break;
+        const int removed = zeros < scale_ ? zeros : scale_;
+        for (int i = 0; i < removed; ++i) divideBy10(digits_);
+        scale_ -= removed;
+        break;
     }
     digits_ = trimBlk(std::move(digits_));
     if (digits_.size() == 1 && digits_[0] == 0) {
@@ -749,6 +1392,938 @@ std::string BigDecimal::toString() const {
 
 bool BigDecimal::isZero() const { return sign_ == 0; }
 
+const std::vector<std::uint32_t>& BigDecimal::integerBlocks() const {
+    if (scale_ != 0) throw std::domain_error("BigDecimal: 该运算只支持整数");
+    return digits_;
+}
+
+BigDecimal BigDecimal::truncateToInteger() const {
+    if (scale_ == 0) return *this;
+
+    // 向零截断 = 取绝对值后丢掉最低的 scale 个十进制位。
+    //
+    // 性能：逐位 divideBy10 是 O(scale × 块数) 的二次方开销 ——
+    // 高精度除法的结果 scale 可达上万位（块数千个），逐位除会退化。
+    // 因此分两步：
+    //   1) 丢掉最低 scale/9 个**整块**（一次 erase，O(块数)）；
+    //   2) 剩下的 scale%9 位用 divideBy10 逐位去掉（最多 8 次，O(块数)）。
+    // 合计 O(块数)，与 scale 的大小基本无关。
+    BigDecimal magnitude = abs(*this);
+
+    const int wholeBlocks = scale_ / kBlockDigits;
+    const int rest = scale_ % kBlockDigits;
+
+    // 第一步：丢掉最低的整块。
+    //
+    // 正确性：值 = 低位部分 + 高位部分 × 10^(9w)，而低位部分 < 10^(9w)，
+    // 因此 floor(值 / 10^(9w)) 恰好等于高位部分。
+    const std::size_t drop = std::min(static_cast<std::size_t>(wholeBlocks),
+                                      magnitude.digits_.size());
+    Blk kept(magnitude.digits_.begin() + static_cast<std::ptrdiff_t>(drop),
+             magnitude.digits_.end());
+    if (kept.empty()) kept.push_back(0);
+
+    // 第二步：再丢掉 rest 个十进制位（rest < 9）。
+    //
+    // 注意**不能**只把最低块除以 10^rest：块边界与十进制位边界不对齐时
+    // （例如 9999999999 = 9×10^9 + 999999999），除以 10^5 会让**所有**块
+    // 一起右移 5 位，而不只是最低块。因此这里用整块级的长除法逐位除。
+    for (int i = 0; i < rest; ++i) {
+        divideBy10(kept);
+    }
+
+    BigDecimal result;
+    result.digits_ = std::move(kept);
+    result.scale_ = 0;
+    result.sign_ = sign_;
+    result.normalize();
+
+    // 符号跟随原值：向零截断，-1.5 -> -1（不是 floor 的 -2）。
+    return result;
+}
+
+// --- 除法、舍入与取整 ---
+
+// 逐块长除法 + 二分试商。
+// 返回 {商, 余数}，均为小端 base-10^9 块。
+std::pair<Blk, Blk> BigDecimal::divideBlk(const Blk& dividend, const Blk& divisor) {
+    Blk remainder{0};
+    Blk quotient;               // 先按最高位在前累积，最后反转
+    quotient.reserve(dividend.size());
+
+    for (std::size_t i = dividend.size(); i-- > 0;) {
+        // remainder = remainder * 10^9 + dividend[i]
+        std::uint64_t carry = dividend[i];
+        for (std::size_t k = 0; k < remainder.size(); ++k) {
+            const std::uint64_t cur = static_cast<std::uint64_t>(remainder[k]) * kBase + carry;
+            remainder[k] = static_cast<std::uint32_t>(cur % kBase);
+            carry = cur / kBase;
+        }
+        // 进位必须追加到**最高位**（小端表示的末尾），不能 insert 到开头。
+        if (carry) remainder.push_back(static_cast<std::uint32_t>(carry));
+        remainder = trimBlk(std::move(remainder));
+
+        // 二分试商：找出最大的 q 使得 divisor * q <= remainder。
+        std::uint64_t low = 0, high = kBase - 1, digit = 0;
+        while (low <= high) {
+            const std::uint64_t mid = low + (high - low) / 2;
+            const Blk trial = mulBlk(divisor, Blk{static_cast<std::uint32_t>(mid)});
+            if (compareBlk(trial, remainder) <= 0) {
+                digit = mid;
+                low = mid + 1;
+            } else {
+                if (mid == 0) break;
+                high = mid - 1;
+            }
+        }
+        if (digit) {
+            const Blk trial = mulBlk(divisor, Blk{static_cast<std::uint32_t>(digit)});
+            subBlk(remainder, trial);
+        }
+        quotient.push_back(static_cast<std::uint32_t>(digit));
+    }
+
+    // 商在累积时是**最高位在前**，必须反转成小端。
+    std::reverse(quotient.begin(), quotient.end());
+    quotient = trimBlk(std::move(quotient));
+    return {std::move(quotient), std::move(remainder)};
+}
+
+// 把精确分数 N/D 舍入到 p 位有效数字。
+//
+// 这是舍入的唯一入口：除法与 roundToPrecision 都走这里。
+//
+// 关键点：用**长除法得到的精确余数**判断被丢弃部分与半个 ulp 的关系，
+// 而不是"多算几位再猜"。因此「正好一半」（银行家舍入要走偶数分支）
+// 与「超过一半」永远能被正确区分 —— 这正是 brief 里固定保护位数做法做不到的。
+//
+// negative 表示原值为负：Ceil/Floor 的进位方向与符号相关。
+std::pair<Blk, int> BigDecimal::roundQuotient(const Blk& numerator, const Blk& denominator,
+                                               int precision, RoundingMode mode, bool negative) {
+    const int exponent = quotientExponent(numerator, denominator);
+    // 需要把商放大到 10^(precision-1-exponent) 才能取到 precision 位有效数字。
+    const int shift = precision - 1 - exponent;
+
+    Blk scaledNumerator;
+    Blk scaledDenominator;
+    if (shift >= 0) {
+        scaledNumerator = shiftLeftDecimal(numerator, shift);
+        scaledDenominator = denominator;
+    } else {
+        scaledNumerator = numerator;
+        scaledDenominator = shiftLeftDecimal(denominator, -shift);
+    }
+
+    const auto divided = divideBlk(scaledNumerator, scaledDenominator);
+    Blk quotient = divided.first;
+    const Blk& remainder = divided.second;
+
+    // 余数 / 除数 与 0.5 的关系。
+    DiscardTail tail;
+    if (isZeroBlk(remainder)) {
+        tail = DiscardTail::Zero;
+    } else {
+        const int cmp = compareBlk(doubleBlk(remainder), scaledDenominator);
+        tail = cmp > 0 ? DiscardTail::GreaterThanHalf
+             : cmp == 0 ? DiscardTail::ExactlyHalf
+                        : DiscardTail::LessThanHalf;
+    }
+
+    const std::string quotientDigits = blockDigitsToString(quotient);
+    const int lastKeptDigit = quotientDigits.back() - '0';
+    if (roundsUpInMagnitude(mode, tail, lastKeptDigit, negative)) {
+        incrementBlk(quotient);
+    }
+
+    // 值 = 商 * 10^(exponent+1-precision)，改写成 整数 * 10^(-小数位数)。
+    int scale = precision - 1 - exponent;
+    if (scale < 0) {
+        quotient = shiftLeftDecimal(std::move(quotient), -scale);
+        scale = 0;
+    }
+    return {std::move(quotient), scale};
+}
+
+BigDecimal BigDecimal::divide(const BigDecimal& lhs, const BigDecimal& rhs,
+                               const Context& context) {
+    if (rhs.sign_ == 0) throw std::domain_error("BigDecimal: 除数为零");
+    if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    // 上限：precision 直接决定运算量，写死一个巨大值（例如 1000000）会让
+    // 单次除法做十万位运算，实测以分钟计。真正的需求应按量的级给精度，
+    // 而不是靠一个荒谬的上限来"保险"。
+    if (context.precision > kMaxPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出上限");
+    }
+    if (lhs.sign_ == 0) return BigDecimal();
+
+    // 被除数与除数先对齐到共同的小数位：
+    // (L·10^-a) / (R·10^-b) = (L·10^(k-a)) / (R·10^(k-b))，其中 k = max(a, b)。
+    const int commonScale = std::max(lhs.scale_, rhs.scale_);
+    const Blk numerator = shiftLeftDecimal(lhs.digits_, commonScale - lhs.scale_);
+    const Blk denominator = shiftLeftDecimal(rhs.digits_, commonScale - rhs.scale_);
+
+    const auto rounded = roundQuotient(numerator, denominator, context.precision,
+                                       context.mode, lhs.sign_ * rhs.sign_ < 0);
+
+    BigDecimal result;
+    result.digits_ = rounded.first;
+    result.scale_ = rounded.second;
+    result.sign_ = lhs.sign_ * rhs.sign_;
+    result.normalize();
+    return result;
+}
+
+// 舍入到 context.precision 位有效数字。
+//
+// 走"把精确分数交给 roundQuotientSmall"的路径：舍入判定基于长除法得到的
+// **精确余数**，而不是"多算几位再猜"。因此「正好一半」与「超过一半」
+// 永远能被正确区分 —— 银行家舍入的偶数分支才可靠。
+//
+// 结构安全：全程只用块数组，不做任何"向前回退一格"的链式操作，
+// 因此单块/单元素结构天然安全（legacy 缺陷 #5 与 #10 的共同根因）。
+BigDecimal BigDecimal::roundToPrecision(const BigDecimal& value, const Context& context) {
+    if (value.sign_ == 0) return value;
+    if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    // 上限：precision 直接决定运算量，写死一个巨大值（例如 1000000）会让
+    // 单次除法做十万位运算，实测以分钟计。真正的需求应按量的级给精度，
+    // 而不是靠一个荒谬的上限来"保险"。
+    if (context.precision > kMaxPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出上限");
+    }
+
+    // 把精确值表示成分数：numerator/denominator = value。
+    // value = digits * 10^-scale，所以分母是 10^scale，分子是 digits。
+    //
+    // 除数是 **10 的整数次幂**（d = 1, s = scale），走线性路径：
+    // roundQuotientSmall 与 roundQuotient 在这个形状上的结果**完全一致**
+    // （同一个 exponent、同一套尾数判定、同一个结果位数），
+    // 但除法从 O(块数²) 降到 O(块数)。
+    //
+    // 这一步是超越函数提速的关键：级数每一项都要 roundToPrecision，
+    // 而通用路径的「二分试商」让整体变成三次方。
+    const auto rounded = roundQuotientSmall(value.digits_, 1, value.scale_,
+                                            context.precision, context.mode, value.sign_ < 0);
+
+    BigDecimal result;
+    result.digits_ = rounded.first;
+    result.scale_ = rounded.second;
+    result.sign_ = value.sign_;
+    result.normalize();
+    return result;
+}
+
+BigDecimal BigDecimal::floor(const BigDecimal& value, const Context& context) {
+    return roundToPrecision(value, Context{context.precision, RoundingMode::Floor});
+}
+
+// 除以一个小整数。
+//
+// 语义与 divide(value, BigDecimal(divisor), context) **完全一致** ——
+// 同样的舍入模式、同样的精度处理、同样的结果位数。区别只在**速度**：
+// 除数是「单块整数 d × 10 的幂」时可以分两段做长除法（先除 10^m 再除 d），
+// 每段都是 O(块数)；通用路径的「二分试商」是 O(块数²)。
+//
+// divisor >= 10^9 时除数不止一块，回退到通用路径。
+BigDecimal BigDecimal::divideBySmallInt(const BigDecimal& value, std::uint64_t divisor,
+                                         const Context& context) {
+    if (divisor == 0) throw std::domain_error("BigDecimal: 除数为零");
+    if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    if (context.precision > kMaxPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出上限");
+    }
+    if (value.sign_ == 0) return BigDecimal();
+
+    // 除数超过一块：通用路径。
+    //
+    // 整数除数的 scale 恒为 0，所以对齐后的 commonScale 就是 value.scale_。
+    if (divisor >= kBase) {
+        BigDecimal integer(static_cast<std::int64_t>(divisor));
+        return divide(value, integer, context);
+    }
+
+    // 除数是单块整数 d（d = divisor），没有 10 的幂因子。
+    //
+    // 与 divide 一样：整数除数的 scale 为 0，对齐后的共同 scale 是
+    // value.scale_，于是被除数不变、除数变成 d × 10^value.scale_。
+    const std::uint32_t d = static_cast<std::uint32_t>(divisor);
+    const Blk numerator = value.digits_;
+
+    const auto rounded = roundQuotientSmall(numerator, d, value.scale_,
+                                            context.precision, context.mode, value.sign_ < 0);
+
+    BigDecimal result;
+    result.digits_ = rounded.first;
+    result.scale_ = rounded.second;
+    result.sign_ = value.sign_;
+    result.normalize();
+    return result;
+}
+
+BigDecimal BigDecimal::ceil(const BigDecimal& value, const Context& context) {
+    return roundToPrecision(value, Context{context.precision, RoundingMode::Ceil});
+}
+
+BigDecimal BigDecimal::round(const BigDecimal& value, const Context& context) {
+    return roundToPrecision(value, Context{context.precision, RoundingMode::HalfEven});
+}
+
+BigDecimal BigDecimal::modulo(const BigDecimal& lhs, const BigDecimal& rhs) {
+    if (rhs.sign_ == 0) throw std::domain_error("BigDecimal: 取余的除数为零");
+    if (lhs.sign_ == 0) return BigDecimal();
+
+    // 取余按**绝对值**做除法，结果符号跟随被除数（与 C 的 % 一致）。
+    const BigDecimal dividend = abs(lhs);
+    const BigDecimal divisor = abs(rhs);
+
+    // 对齐到共同的小数位，把两个数都变成整数：
+    // 被除数 = numerator / 10^commonScale，除数 = denominator / 10^commonScale。
+    const int commonScale = std::max(dividend.scale_, divisor.scale_);
+    const Blk numerator = shiftLeftDecimal(dividend.digits_, commonScale - dividend.scale_);
+    const Blk denominator = shiftLeftDecimal(divisor.digits_, commonScale - divisor.scale_);
+
+    // 整数长除法：商向下取整（向零），余数即结果。
+    const auto divided = divideBlk(numerator, denominator);
+
+    BigDecimal remainder;
+    remainder.digits_ = divided.second;
+    remainder.scale_ = commonScale;
+    remainder.sign_ = lhs.sign_ < 0 ? -1 : 1;
+    remainder.normalize();
+    return remainder;
+}
+// --- 超越函数 ---
+
+namespace {
+
+// 超越函数工作精度相对用户精度的保护位。
+//
+// 关键区分：**有效数字位**与**十进制小数位**是两个概念。
+// Context::precision 是有效数字位（与 Python decimal 的 prec 同义），
+// 与数值量级无关。因此保护位只能加在有效位上 ——
+// brief 原实现把 precision 当成小数位数用（scaled = value * 10^(2*guard)），
+// 对量级偏离 1 很大的输入会算错位数。
+constexpr int kGuardDigits = 10;
+
+// 内部工作精度相对用户精度至少要多出的位数（低于此值时用此值兜底）。
+constexpr int kMinWorkPrecision = 24;
+
+// exp 的参数上限：|x| >= 10^5 时结果已有约 4.3 万位十进制数，
+// 再大则舍入本身的开销已不可接受。正负参数同此界 ——
+// 负参数的 exp 结果同样有 |x|/ln(10) 位的小数。
+constexpr int kMaxExpArgumentExponent = 5;
+
+// exp 里用来**估计 k 的量级**的探针精度。
+//
+// k = floor(x / ln(10))，|x| < 10^5 时 |k| < 43427 —— 所以 20 位探针
+// 足以把 k 定死（差 1 位会在后面被修正回来，见 expInternal）。
+constexpr int kExpProbePrecision = 20;
+
+// 超越函数的精度上限、整数幂的指数与结果位数上限、科学计数法的指数上限
+// 都是**公开契约**，声明在 BigDecimal.h（见那里的实测数据）。
+
+// 十进制整数的最大位数（用于 long long 溢出保护）。
+constexpr int kMaxIntegerDigits = 18;
+
+constexpr std::int64_t kMaxInt64 = 9223372036854775807LL;
+
+// floor(e / 2)：C++ 的整数除法向零取整，负数需要修正。
+int floorHalf(int e) { return e >= 0 ? e / 2 : (e - 1) / 2; }
+
+}  // namespace
+
+// 值的十进制指数 e：10^e <= |value| < 10^(e+1)。
+int BigDecimal::decimalExponent() const {
+    if (sign_ == 0) return 0;
+    // digits_ 是小端：最高位块在末尾。
+    // 整数部分的十进制位数 = 总位数 - 小数位数。
+    const int integerDigits = decimalDigitCount(digits_) - scale_;
+    // 10^e <= |v| < 10^(e+1) 的 e = 位数 - 1。
+    return integerDigits - 1;
+}
+
+// 精确地做 value * 10^exponent。
+//
+// 正指数：把块序列左移若干位，digits_ 不变、scale_ 不变，完全精确。
+// 负指数：value / 10^k = digits * 10^-(scale+k)，digits_ 不变、scale_ 增大，
+//         同样完全精确（十进制的 10 的负整数次幂就是移小数点）。
+BigDecimal BigDecimal::shiftByPowerOfTen(const BigDecimal& value, int exponent) {
+    if (exponent == 0 || value.sign_ == 0) return value;
+
+    BigDecimal result = value;
+    if (exponent > 0) {
+        result.digits_ = shiftLeftDecimal(result.digits_, exponent);
+    } else {
+        result.scale_ += -exponent;
+    }
+    result.normalize();
+    return result;
+}
+
+// 精确地乘以 2。
+BigDecimal BigDecimal::multiplyByTwo(const BigDecimal& value) {
+    BigDecimal result = value;
+    result.digits_ = doubleBlk(result.digits_);
+    result.normalize();
+    return result;
+}
+
+// 精确地除以 2。
+//
+// 十进制下 x/2 通常不终止，但 x/2 = (x*5)/10 总是精确的：
+// 先乘 5（整数运算），再把小数位加一位（*10^-1）。
+BigDecimal BigDecimal::divideByTwo(const BigDecimal& value) {
+    BigDecimal result = value * BigDecimal(5);
+    result.scale_ += 1;
+    result.normalize();
+    return result;
+}
+
+// 向下取整到整数（scale 归零）。
+BigDecimal BigDecimal::floorToInteger(const BigDecimal& value) {
+    if (value.scale_ == 0) return value;
+
+    // 先按绝对值截断小数部分。
+    BigDecimal magnitude = abs(value);
+    for (int i = 0; i < magnitude.scale_; ++i) divideBy10(magnitude.digits_);
+    magnitude.scale_ = 0;
+    magnitude.normalize();
+
+    // 截断后与原值相等：本来就是整数。
+    if (magnitude.compare(abs(value)) == 0) {
+        return value.sign_ < 0 ? BigDecimal(0) - magnitude : magnitude;
+    }
+    // 有被丢掉的小数部分：正数向下取整就是截断值；负数要再往下走一格。
+    if (value.sign_ < 0) return BigDecimal(0) - (magnitude + BigDecimal(1));
+    return magnitude;
+}
+
+// scale 为 0 的整数值转成 long long。
+long long BigDecimal::toInteger(const BigDecimal& value) {
+    if (value.scale_ != 0) throw std::invalid_argument("BigDecimal: 期望整数值");
+    if (value.sign_ == 0) return 0;
+
+    const std::string text = value.toString();
+    const bool negative = text[0] == '-';
+    const std::size_t start = negative ? 1 : 0;
+    if (text.size() - start > static_cast<std::size_t>(kMaxIntegerDigits)) {
+        throw std::overflow_error("BigDecimal: 整数超出 long long 范围");
+    }
+    long long magnitude = 0;
+    for (std::size_t i = start; i < text.size(); ++i) {
+        const int digit = text[i] - '0';
+        if (magnitude > (kMaxInt64 - digit) / 10) {
+            throw std::overflow_error("BigDecimal: 整数超出 long long 范围");
+        }
+        magnitude = magnitude * 10 + digit;
+    }
+    return negative ? -magnitude : magnitude;
+}
+
+// 精确的整数幂 base^power（power >= 1）。
+BigDecimal BigDecimal::integerPower(const BigDecimal& base, long long power) {
+    if (power < 0) throw std::invalid_argument("BigDecimal: 整数幂的指数必须非负");
+
+    // 结果位数的估算：底数的**整数位数 + 小数位数**再乘以指数。
+    //
+    // 只看整数位数是不够的：底数小于 1 时（base = 0.001 的整数位数为 -2），
+    // 那个「整数位数 > 0」的判据会把整个防护跳过，而结果的**小数位数**
+    // 恰恰是按 power 线性增长的 —— 0.001^100000 需要 30 万位小数。
+    //
+    // 底数 |b| 的十进制位数记为 d（整数部分位数 + 小数位数），
+    // 则 |b^power| 的十进制位数约等于 power × d。
+    const int baseDigits = decimalDigitCount(base.digits_);
+    const int baseScale = base.scale_;
+    const long long resultDigits =
+        power * static_cast<long long>(baseDigits + baseScale);
+    if (resultDigits > static_cast<long long>(kMaxPowerResultDigits)) {
+        throw std::overflow_error("BigDecimal: 幂的结果位数过大");
+    }
+
+    BigDecimal result(1);
+    BigDecimal factor = base;
+    long long remaining = power;
+    while (remaining > 0) {
+        if (remaining & 1) result = result * factor;
+        remaining >>= 1;
+        if (remaining > 0) factor = factor * factor;
+    }
+    return result;
+}
+
+// atanh 级数：z + z^3/3 + z^5/5 + ...
+//
+// atanh(z) = 0.5 * ln((1+z)/(1-z))，故 ln(x) = 2 * atanh((x-1)/(x+1))。
+// |z| <= 1/3 时每项约按 1/9 的比例衰减，收敛很快；同号项相加，无抵消。
+BigDecimal BigDecimal::atanhSeries(const BigDecimal& z, const Context& work) {
+    // 收敛判据：加数绝对值小于 10^-(work.precision+2) 即停止 ——
+    // 比要求的精度再低两位，保证末位不受截断影响。
+    const BigDecimal epsilon = shiftByPowerOfTen(BigDecimal(1), -(work.precision + 2));
+
+    // **每一项都要限制在工作精度内**，否则小数位会无限增长：
+    // z 的小数位约为 work.precision，而 z*z 的小数位是它的两倍，
+    // 第 k 次迭代的 power 小数位达到 (2k+1) * work.precision。
+    // 在 work.precision = 110、k = 230 时中间数会有 5 万位十进制数 ——
+    // 除法的开销随之从毫秒级涨到几十秒。
+    //
+    // 舍入到 work.precision 位有效数字是安全的：级数的项单调递减，
+    // 每一项的**相对**精度才是关键，截掉的是远低于 ulp 的低位。
+    const BigDecimal zRounded = roundToPrecision(z, work);
+    const BigDecimal zSquared = roundToPrecision(zRounded * zRounded, work);
+
+    BigDecimal power = zRounded;             // z^(2k+1)
+    BigDecimal sum = zRounded;
+    // 项数上界：|z| <= 1/3 时 z^(2k+1) <= 3^-(2k+1)，需要约 1.05 * precision 项。
+    for (int k = 1; k <= work.precision * 2 + 8; ++k) {
+        power = roundToPrecision(power * zSquared, work);
+        // 除以 2k+1：走「除以小整数」的线性路径。
+        //
+        // 语义与 divide(power, BigDecimal(2*k+1), ...) 完全一致，
+        // 但除法从 O(块数²) 降到 O(块数) —— 这一项是级数里的主项。
+        const BigDecimal addend = divideBySmallInt(power, static_cast<std::uint64_t>(2 * k + 1),
+                                                   Context{work.precision, RoundingMode::HalfEven});
+        if (addend.isZero()) break;
+        sum = sum + addend;
+        if (abs(addend).compare(epsilon) < 0) break;
+    }
+    return sum;
+}
+
+// exp(g) 的泰勒级数：1 + g + g^2/2! + g^3/3! + ...
+//
+// 调用方保证 0 <= g < ln(10) ≈ 2.303，项全部为正 —— 没有抵消，数值稳定。
+// 需要的项数约 1.4 * precision。
+BigDecimal BigDecimal::expSeries(const BigDecimal& g, const Context& work) {
+    const BigDecimal epsilon = shiftByPowerOfTen(BigDecimal(1), -(work.precision + 2));
+
+    // 同样要把中间结果限制在工作精度内：term 的小数位会随迭代增长，
+    // 不限制的话 exp(1) 在 100 位精度下也会拖出几秒。
+    const BigDecimal gRounded = roundToPrecision(g, work);
+
+    BigDecimal term(1);
+    BigDecimal sum(1);
+    for (int n = 1; n <= work.precision * 3 + 16; ++n) {
+        term = roundToPrecision(term * gRounded, work);
+        // 除以 n：走「除以小整数」的线性路径（语义与通用路径一致）。
+        term = divideBySmallInt(term, static_cast<std::uint64_t>(n),
+                                Context{work.precision, RoundingMode::HalfEven});
+        if (term.isZero()) break;
+        sum = sum + term;
+        if (abs(term).compare(epsilon) < 0) break;
+    }
+    return sum;
+}
+
+// ln(2)：按 work 精度实时计算。
+//
+// ln(2) = 2 * atanh(1/3)。
+//
+// 不用硬编码常量：brief 里的 60 位常量在 precision > 60 时不够用，
+// 而高精度计算器正是本项目的存在意义。
+BigDecimal BigDecimal::ln2Constant(const Context& work) {
+    const BigDecimal z = divide(BigDecimal(1), BigDecimal(3),
+                                Context{work.precision, RoundingMode::HalfEven});
+    return multiplyByTwo(atanhSeries(z, work));
+}
+
+// ln(10)：按 work 精度实时计算。
+//
+// ln(10) = 3*ln(2) + ln(5/4)，其中 ln(5/4) = 2*atanh(1/9)。
+//
+// ln2 由调用方传入：一次 ln 运算里 ln(2) 会被用到好几处，
+// 重算一遍 atanh 级数的代价不小。
+BigDecimal BigDecimal::ln10Constant(const BigDecimal& ln2, const Context& work) {
+    const BigDecimal z = divide(BigDecimal(1), BigDecimal(9),
+                                Context{work.precision, RoundingMode::HalfEven});
+    const BigDecimal lnOneAndAQuarter = multiplyByTwo(atanhSeries(z, work));
+    return ln2 * BigDecimal(3) + lnOneAndAQuarter;
+}
+
+// 把 value 分解成 mantissa * 10^exponent，其中 mantissa ∈ [1, 2)。
+//
+// 具体地：先取 exponent = value 的十进制指数（10^e <= |v| < 10^(e+1)），
+// 再把尾数反复折半。halvings 记录折半次数，
+// 于是 原尾数 = mantissa * 2^halvings。
+//
+// 移位与折半都是精确操作，不引入任何舍入。
+BigDecimal BigDecimal::decomposeForLog(const BigDecimal& value, int& exponent, int& halvings) {
+    exponent = value.decimalExponent();
+    BigDecimal mantissa = shiftByPowerOfTen(value, -exponent);   // ∈ [1, 10)
+    halvings = 0;
+    while (mantissa.compare(BigDecimal(2)) >= 0) {
+        mantissa = divideByTwo(mantissa);
+        ++halvings;
+    }
+    return mantissa;                                            // ∈ [1, 2)
+}
+
+// exp 的内部实现。
+//
+// 分解：x = k*ln(10) + g，k = floor(x / ln10)，g ∈ [0, ln10)。
+// 于是 exp(x) = 10^k * exp(g)，exp(g) 的级数参数恒在 [0, 2.31) 以内 ——
+// 收敛快，且与 |x| 的量级无关。
+//
+// 该恒等式对**任意**整数 k 都成立，所以 k 取整差一位也只是让 g 靠近 0 或
+// ln(10)，不影响正确性 —— 但 g 的精度会受影响，见下面的 extraDigits。
+//
+// ln(10) 必须比工作精度再高若干位：g = x - k*ln(10) 是**大数相减**，
+// 误差约为 |k| * 10^-(work.precision+extra)。要让它小于 10^-work.precision，
+// extra 必须大于 |k| 的十进制指数。
+BigDecimal BigDecimal::expInternal(const BigDecimal& value, const Context& work,
+                                   const Context& final) {
+    if (value.isZero()) return BigDecimal(1);
+
+    // exp 的参数过大时结果的位数不可控，直接报溢出。
+    const int magnitude = value.decimalExponent();
+    if (magnitude >= kMaxExpArgumentExponent) {
+        throw std::overflow_error("BigDecimal: exp 的参数过大，结果超出可计算范围");
+    }
+
+    // 多算的位数按 **|k|** 定，其中 k = floor(x / ln(10))。
+    //
+    // g = x - k*ln(10) 里被抵消掉的量级是 |k*ln(10)| ≈ |k|，
+    // 所以「要保护几位」由 |k| 决定，**与 x 的量级无关**。
+    //
+    // 按 |x| 的十进制指数给保护位是错的：x 极小时（1e-200）k = 0，
+    // 根本没有抵消，一位保护位都不需要，而那个公式会多算 205 位
+    // （实测 exp(1e-200) 要 271 ms，exp(1e-99000) 更是永远算不完）。
+    //
+    // |x| < 1 时 k 直接可定，**完全绕开除法**：
+    //   x >= 0 → x/ln(10) ∈ [0, 0.435) → k = 0
+    //   x <  0 → x/ln(10) ∈ (-0.435, 0) → k = -1
+    //
+    // 绕开除法不是可有可无的优化：除法要先对齐小数位，而长除法是
+    // O(位数²) —— x 的小数位有 99000 个时，实测 exp(1e-99000) 要 45 秒。
+    //
+    // 走这条支与走除法的结果**完全一致**：除法得到的商四舍五入后仍在
+    // (-0.435, 0.435) 内，floor 必然是同一个整数，g 也逐位相同。
+    const bool tinyArgument = magnitude < 0;
+
+    // |k| 的十进制位数 —— 保护位数的依据。
+    int kDigits = 0;
+    BigDecimal k;
+    if (tinyArgument) {
+        k = value.sign_ < 0 ? BigDecimal(-1) : BigDecimal(0);
+        kDigits = k.isZero() ? 0 : 1;
+    } else {
+        // |x| >= 1 时 k 要靠除法得到。先用 20 位探针估 |k| 的**量级**
+        // （探针只用来量级，不参与最终计算）：
+        // |x| < 10^5 时 |k| < 43427，所以 20 位探针足够把量级定死。
+        const Context probe{kExpProbePrecision, RoundingMode::HalfEven};
+        const BigDecimal probeLn10 = ln10Constant(ln2Constant(probe), probe);
+        const BigDecimal probeQuotient = divide(value, probeLn10,
+                                                Context{probe.precision + 3, RoundingMode::HalfEven});
+        const BigDecimal probeK = floorToInteger(probeQuotient);
+        kDigits = probeK.isZero() ? 0 : decimalDigitCount(abs(probeK).digits_);
+    }
+
+    // |k| 的十进制位数再加 5 位保护位。k = 0 时没有任何抵消，一位都不需要。
+    const int extraDigits = std::max(2, kDigits + 5);
+    const Context precise{work.precision + extraDigits, RoundingMode::HalfEven};
+
+    const BigDecimal ln10 = ln10Constant(ln2Constant(precise), precise);
+
+    if (!tinyArgument) {
+        // k = floor(x / ln10)。除法要更高精度，否则 k 的整数部分可能因
+        // 末位舍入而差 1 —— 那会让 g 从 0 跳到 ln10，级数慢一个量级。
+        const BigDecimal quotient = divide(value, ln10,
+                                           Context{precise.precision + 3, RoundingMode::HalfEven});
+        k = floorToInteger(quotient);
+    }
+
+    BigDecimal g = value - k * ln10;
+
+    // 把 g 拉回 [0, ln10)。恒等式 exp(x) = 10^k * exp(g) 仍然成立。
+    if (g.sign_ < 0) {
+        k = k - BigDecimal(1);
+        g = g + ln10;
+    } else if (g.compare(ln10) >= 0) {
+        k = k + BigDecimal(1);
+        g = g - ln10;
+    }
+
+    // exp(g)：g ∈ [0, ln10)。
+    const BigDecimal mantissa = expSeries(g, work);
+
+    const long long power = toInteger(k);
+    if (power > static_cast<long long>(std::numeric_limits<int>::max()) ||
+        power < static_cast<long long>(std::numeric_limits<int>::min())) {
+        throw std::overflow_error("BigDecimal: exp 的参数过大，结果超出可计算范围");
+    }
+
+    // 还原：乘以 10^k。k 为负时是移小数点，同样精确。
+    //
+    // 顺序很关键：**先移位、后舍入**。移位是精确的位操作，先移位再按最终
+    // 精度舍入，结果与「先舍入再移位」数值相同，但表示更干净 ——
+    // 后者会在尾数里留下尾随零（精度 20 时 exp(100) 会打印成
+    // 26881171418161354484000000000000000000000000）。
+    //
+    // 那串零是**精度 20 的真实值**（Python decimal 在 prec=20 下给出同一个
+    // 数），不是「先舍入再移位」的 bug 产物 —— 它只是比 20 位有效数字
+    // 多出来的尾随零。精度 50 时两者一致：
+    // 26881171418161354484126255515800135873611118.773742
+    // （与 Python decimal prec=50 完全相同）。
+    const BigDecimal scaled = shiftByPowerOfTen(mantissa, static_cast<int>(power));
+    return roundToPrecision(scaled, final);
+}
+
+// ln 的内部实现。
+//
+// 两条路径：
+//   1. x ∈ [1/2, 2]：直接用 atanh 级数。z = (x-1)/(x+1) ∈ [-1/3, 1/3]，
+//      收敛最快，且**没有抵消**（结果接近 0 时 z 也接近 0，相对精度保持）。
+//   2. 其他：写成 x = m * 10^e，m ∈ [1, 10)。ln(x) = e*ln(10) + ln(m)。
+//      ln(m) 先把 m 折半到 [1, 2)：m = r * 2^j，则 ln(m) = j*ln(2) + ln(r)。
+//
+// 路径 2 在 x 靠近 1 时会有抵消（-ln10 + ln(m)），所以路径 1 必须覆盖
+// 「结果接近 0」的全部情形 —— 那正是 x ∈ [1/2, 2] 的内部。
+//
+// 路径 2 内部也不存在抵消：只有 m >= 2 才会出现 j*ln(2) 这一项，
+// 而那时 ln(m) >= ln(2)，两者量级可比，结果量级不小于 ln(2)。
+BigDecimal BigDecimal::lnInternal(const BigDecimal& value, const Context& work) {
+    const BigDecimal one(1);
+    if (value.equals(one)) return BigDecimal(0);
+
+    const BigDecimal half = BigDecimal::fromString("0.5");
+    const BigDecimal two(2);
+
+    // 路径 1：靠近 1 的直接展开。
+    if (value.compare(half) >= 0 && value.compare(two) <= 0) {
+        const BigDecimal z = divide(value - one, value + one,
+                                    Context{work.precision, RoundingMode::HalfEven});
+        return multiplyByTwo(atanhSeries(z, work));
+    }
+
+    // 路径 2：量级分解。
+    int exponent = 0;
+    int halvings = 0;
+    const BigDecimal mantissa = decomposeForLog(value, exponent, halvings);
+
+    const BigDecimal ln2 = ln2Constant(work);
+    const BigDecimal z = divide(mantissa - one, mantissa + one,
+                                Context{work.precision, RoundingMode::HalfEven});
+    BigDecimal result = multiplyByTwo(atanhSeries(z, work));
+    result = result + ln2 * BigDecimal(halvings);
+
+    // ln(x) = e*ln(10) + ln(m)。
+    //
+    // 这里 e*ln(10) 与 ln(m) 的**相对**误差都约 10^-precision，
+    // 且两者量级可比（|e*ln10| >= ln10 > |ln(m)|），所以没有抵消放大。
+    result = result + ln10Constant(ln2, work) * BigDecimal(exponent);
+    return result;
+}
+
+// log10 的内部实现。
+//
+// 与 ln 同样的两条路径，但拆成「指数部分 + 尾数部分」，
+// 这样 10 的整数次幂给出**精确**的整数（log10(1000) = 3，不是 2.999…）。
+BigDecimal BigDecimal::log10Internal(const BigDecimal& value, const Context& work,
+                                     const Context& final) {
+    const BigDecimal one(1);
+    if (value.equals(one)) return BigDecimal(0);
+
+    const BigDecimal half = BigDecimal::fromString("0.5");
+    const BigDecimal two(2);
+    const BigDecimal ln2 = ln2Constant(work);
+    const BigDecimal ln10 = ln10Constant(ln2, work);
+
+    // 路径 1：靠近 1 的直接展开。
+    if (value.compare(half) >= 0 && value.compare(two) <= 0) {
+        const BigDecimal z = divide(value - one, value + one,
+                                    Context{work.precision, RoundingMode::HalfEven});
+        const BigDecimal naturalLog = multiplyByTwo(atanhSeries(z, work));
+        const BigDecimal quotient = divide(naturalLog, ln10,
+                                           Context{work.precision, RoundingMode::HalfEven});
+        return roundToPrecision(quotient, final);
+    }
+
+    // 路径 2：量级分解。log10(x) = exponent + log10(尾数)。
+    int exponent = 0;
+    int halvings = 0;
+    const BigDecimal mantissa = decomposeForLog(value, exponent, halvings);
+
+    const BigDecimal z = divide(mantissa - one, mantissa + one,
+                                Context{work.precision, RoundingMode::HalfEven});
+    // ln(尾数) = halvings*ln(2) + 2*atanh(z)
+    const BigDecimal naturalLog = multiplyByTwo(atanhSeries(z, work)) + ln2 * BigDecimal(halvings);
+
+    const BigDecimal quotient = divide(naturalLog, ln10,
+                                       Context{work.precision, RoundingMode::HalfEven});
+    // 指数部分是整数，与商相加后舍入。
+    return roundToPrecision(quotient + BigDecimal(exponent), final);
+}
+
+// --- 对外的超越函数接口 ---
+//
+// 五个入口都要检查 precision 的上限：
+//
+// 1. precision <= 0：除数为零之类的非法上下文。
+// 2. precision > kMaxTranscendentalPrecision：超越函数的工作精度是
+//    **平方级**的（见 kMaxTranscendentalPrecision 的实测数据）。
+//    没有这道闸，sqrt(2) @ precision=99990 会永远算不完，
+//    而且失败方式**不一致** —— 有的精度下内层的 divide 恰好抛异常，
+//    有的精度下则一路挂起。
+//
+// 统一的 std::invalid_argument 让调用方拿到确定的行为。
+
+BigDecimal BigDecimal::sqrt(const BigDecimal& value, const Context& context) {
+    if (value.sign_ < 0) throw std::domain_error("BigDecimal: 负数没有实数平方根");
+    if (value.isZero()) return BigDecimal(0);
+    if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    if (context.precision > kMaxTranscendentalPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出超越函数的上限");
+    }
+
+    const int workPrecision = std::max(context.precision + kGuardDigits, kMinWorkPrecision);
+    const Context work{workPrecision, RoundingMode::HalfEven};
+
+    // 牛顿迭代：x <- (x + n/x) / 2。
+    //
+    // 初值必须来自 n 的**真实量级**。brief 原实现把 n 放大 10^(2*guard) 后
+    // 用字符串的位数推初值 —— 放大后 scale_ = 2*guard，字符串里整数部分的
+    // 位数与 n 的量级无关，于是 value = 2 会得到初值 1（真实答案 1.414e(guard)），
+    // 而迭代上界只有 guard + 10 步，收敛不住。
+    //
+    // 这里把 n 分解成 m * 10^(2h)：取 e = n 的十进制指数（10^e <= n < 10^(e+1)），
+    // h = floor(e/2)，则 m = n * 10^(-2h) ∈ [1, 100)，其平方根落在 [1, 10)。
+    // 移位是精确的位操作，不引入任何舍入。
+    const int e = value.decimalExponent();
+    const int h = floorHalf(e);           // floor(e/2)，注意 C++ 的负数除法向零取整
+    const BigDecimal scaled = shiftByPowerOfTen(value, -2 * h);
+
+    // 初值取 1：牛顿法从 1 出发对 m ∈ [1, 100) 收敛良好
+    // （真根在 [1, 10)，初值与真根同量级）。
+    BigDecimal guess(1);
+
+    // 收敛判据：相邻两次迭代之差小于 10^-(work.precision-1)。
+    // 真根在 [1, 10)，所以工作精度下的 1 ulp 是 10^-work.precision；
+    // 判据放宽到 10 ulp，兼顾舍入导致的「在两个相邻值间摆动」。
+    const BigDecimal epsilon = shiftByPowerOfTen(BigDecimal(1), -(work.precision - 1));
+
+    // 牛顿迭代。
+    const int maxIterations = 64;
+    for (int iteration = 0; iteration < maxIterations; ++iteration) {
+        const BigDecimal quotient = divide(scaled, guess, work);
+        // (guess + quotient) / 2 用精确的除以二，避免多一次舍入。
+        const BigDecimal next = divideByTwo(guess + quotient);
+        const BigDecimal difference = abs(next - guess);
+        guess = next;
+        if (difference.compare(epsilon) <= 0) break;
+    }
+
+    // 还原：sqrt(n) = sqrt(m) * 10^h。
+    // 移位精确，最后按用户精度舍入。
+    return roundToPrecision(shiftByPowerOfTen(guess, h), context);
+}
+
+BigDecimal BigDecimal::exp(const BigDecimal& value, const Context& context) {
+    if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    if (context.precision > kMaxTranscendentalPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出超越函数的上限");
+    }
+    const int workPrecision = std::max(context.precision + kGuardDigits, kMinWorkPrecision);
+    const Context work{workPrecision, RoundingMode::HalfEven};
+    return expInternal(value, work, context);
+}
+
+BigDecimal BigDecimal::ln(const BigDecimal& value, const Context& context) {
+    if (value.sign_ <= 0) throw std::domain_error("BigDecimal: 对数要求正数");
+    if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    if (context.precision > kMaxTranscendentalPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出超越函数的上限");
+    }
+    if (value.equals(BigDecimal(1))) return BigDecimal(0);
+
+    const int workPrecision = std::max(context.precision + kGuardDigits, kMinWorkPrecision);
+    const Context work{workPrecision, RoundingMode::HalfEven};
+    return roundToPrecision(lnInternal(value, work), context);
+}
+
+BigDecimal BigDecimal::log10(const BigDecimal& value, const Context& context) {
+    if (value.sign_ <= 0) throw std::domain_error("BigDecimal: 对数要求正数");
+    if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+    if (context.precision > kMaxTranscendentalPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出超越函数的上限");
+    }
+    if (value.equals(BigDecimal(1))) return BigDecimal(0);
+
+    const int workPrecision = std::max(context.precision + kGuardDigits, kMinWorkPrecision);
+    const Context work{workPrecision, RoundingMode::HalfEven};
+    return log10Internal(value, work, context);
+}
+
+BigDecimal BigDecimal::pow(const BigDecimal& base, const BigDecimal& exponent,
+                           const Context& context) {
+    if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
+
+    // 整数指数走快速幂，结果精确。
+    //
+    // 判定「整数」用 scale_ == 0（值本身就是整数），而不是解析字符串 ——
+    // brief 原实现手工解析字符串成 long long，超过 10^18 的指数会静默溢出。
+    //
+    // 注意这里**没有** kMaxTranscendentalPrecision 的闸：整数次幂是**精确**
+    // 运算，代价由 kMaxIntegerPower（指数）与 kMaxPowerResultDigits
+    // （结果位数）约束，与超越函数的工作精度毫无关系。
+    //
+    // 早先的版本把超越函数的闸放在 pow 的最前面，于是 pow(2, 100) 在
+    // precision=2000 时被拒 —— 那是一个它根本不该管的能力：
+    // 「超越函数」的上限按定义就不适用于精确的整数次幂。
+    // pow(10, 100000) 在 precision=2000 下完全合法（结果 10 万位，
+    // 实测约 7 s）。
+    if (exponent.scale_ == 0) {
+        // 指数过大时直接报溢出，而不是让乘法算出天量数字。
+        if (abs(exponent).compare(BigDecimal(static_cast<std::int64_t>(kMaxIntegerPower))) > 0) {
+            throw std::overflow_error("BigDecimal: 幂的指数过大");
+        }
+
+        if (exponent.sign_ < 0) {
+            // 负整数指数：1 / base^|n|。零底数无定义。
+            if (base.isZero()) {
+                throw std::domain_error("BigDecimal: 零的负数次幂未定义");
+            }
+            const long long magnitude = -toInteger(exponent);
+            const BigDecimal positive = integerPower(base, magnitude);
+            return roundToPrecision(divide(BigDecimal(1), positive, context), context);
+        }
+
+        // 零底数：0^0 在 decimal 规范里是**非法运算**（Python 的
+        // Decimal(0) ** Decimal(0) 抛 InvalidOperation），0^正数 = 0。
+        if (base.isZero()) {
+            if (exponent.isZero()) {
+                throw std::domain_error("BigDecimal: 零的零次幂未定义");
+            }
+            return BigDecimal(0);
+        }
+
+        // 指数为 0 时结果为 1。
+        const long long power = toInteger(exponent);
+        return roundToPrecision(integerPower(base, power), context);
+    }
+
+    // 非整数指数：pow(a,b) = exp(b·ln a)。
+    //
+    // 这一条才是真正的超越函数路径，工作精度是平方级的，因此受
+    // kMaxTranscendentalPrecision 约束 —— 闸门放在**这条分支上**，
+    // 而不是 pow 的入口。
+    if (context.precision > kMaxTranscendentalPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出超越函数的上限");
+    }
+
+    // 零底数要先单独处理：0^正数 = 0 是有定义的（与 Python 一致），
+    // 不能落进「负底数未定义」那条路。
+    if (base.isZero()) {
+        if (exponent.sign_ < 0) throw std::domain_error("BigDecimal: 零的负数次幂未定义");
+        return BigDecimal(0);
+    }
+    if (base.sign_ < 0) throw std::domain_error("BigDecimal: 负底数的非整数次幂未定义");
+
+    const int workPrecision = std::max(context.precision + kGuardDigits, kMinWorkPrecision);
+    const Context work{workPrecision, RoundingMode::HalfEven};
+
+    const BigDecimal naturalLog = lnInternal(base, work);
+    const BigDecimal product = naturalLog * exponent;
+    return expInternal(product, work, context);
+}
+
 }  // namespace hpc
 ```
 
@@ -757,6 +2332,7 @@ bool BigDecimal::isZero() const { return sign_ == 0; }
 ```cpp
 #include "test_framework.h"
 
+#include <cstdint>
 #include <stdexcept>
 
 #include "core/BigDecimal.h"
@@ -823,6 +2399,510 @@ TEST(compare, sign) {
     CHECK(BigDecimal::fromString("1.0").compare(BigDecimal::fromString("1")) == 0);
     CHECK(BigDecimal::fromString("-1").compare(BigDecimal::fromString("1")) < 0);
     CHECK(BigDecimal::fromString("0.5").compare(BigDecimal::fromString("0.50")) == 0);
+}
+
+TEST(compare, both_negative) {
+    // 两个**同号**（都是负数）时，比较必须先比绝对值再翻转符号。
+    // 只测异号会漏掉这条路径。
+    CHECK(BigDecimal::fromString("-1").compare(BigDecimal::fromString("-2")) > 0);
+    CHECK(BigDecimal::fromString("-2").compare(BigDecimal::fromString("-1")) < 0);
+    CHECK(BigDecimal::fromString("-1.5").compare(BigDecimal::fromString("-1.50")) == 0);
+    CHECK(BigDecimal::fromString("-0.1").compare(BigDecimal::fromString("-0.2")) > 0);
+    // 同为负数时大小关系与相反数一致。
+    CHECK(BigDecimal::fromString("-3").compare(BigDecimal::fromString("-3")) == 0);
+    CHECK(BigDecimal::fromString("-10").compare(BigDecimal::fromString("-9")) < 0);
+}
+
+// --- 以下为边界情况补充：零操作数、负零、块边界、极值 scale ---
+
+TEST(parse, negative_zero_is_zero) {
+    // "-0" 必须规范化为 0，既不输出 "-0"，也不保留负号。
+    const BigDecimal negZero = BigDecimal::fromString("-0");
+    CHECK(negZero.isZero());
+    CHECK_EQ(negZero.sign(), 0);
+    CHECK_EQ(negZero.toString(), std::string("0"));
+    CHECK_EQ(BigDecimal::fromString("-0.00").toString(), std::string("0"));
+    CHECK_EQ(BigDecimal::fromString("0.000").toString(), std::string("0"));
+}
+
+TEST(parse, int64_constructor) {
+    CHECK_EQ(BigDecimal(42).toString(), std::string("42"));
+    CHECK_EQ(BigDecimal(-42).toString(), std::string("-42"));
+    CHECK_EQ(BigDecimal(0).toString(), std::string("0"));
+    CHECK(BigDecimal(0).isZero());
+    // INT64_MIN 取负会溢出，必须走 -(v+1)+1 的路径。
+    CHECK_EQ(BigDecimal(std::int64_t(-9223372036854775807LL - 1)).toString(),
+             std::string("-9223372036854775808"));
+    CHECK_EQ(BigDecimal(std::int64_t(9223372036854775807LL)).toString(),
+             std::string("9223372036854775807"));
+    // string_view 构造函数与 fromString 等价。
+    CHECK_EQ(BigDecimal(std::string_view("12.50")).toString(), std::string("12.5"));
+}
+
+TEST(arith, zero_operands) {
+    const BigDecimal zero = BigDecimal::fromString("0");
+    const BigDecimal five = BigDecimal::fromString("5");
+    CHECK_EQ((zero + five).toString(), std::string("5"));
+    CHECK_EQ((five + zero).toString(), std::string("5"));
+    CHECK_EQ((zero - five).toString(), std::string("-5"));
+    CHECK_EQ((five - zero).toString(), std::string("5"));
+    CHECK_EQ((zero * five).toString(), std::string("0"));
+    CHECK_EQ((zero * zero).toString(), std::string("0"));
+    CHECK_EQ((zero - zero).toString(), std::string("0"));
+    // 零与负数相加仍不得产生 "-0"。
+    CHECK_EQ((zero + BigDecimal::fromString("-5")).toString(), std::string("-5"));
+    CHECK_EQ((zero + BigDecimal::fromString("-0")).toString(), std::string("0"));
+}
+
+TEST(arith, block_boundary) {
+    // 跨越 10^9 块边界：进位必须正确传播到高位块。
+    CHECK_EQ((BigDecimal::fromString("999999999") + BigDecimal::fromString("1")).toString(),
+             std::string("1000000000"));
+    CHECK_EQ((BigDecimal::fromString("999999999") + BigDecimal::fromString("999999999")).toString(),
+             std::string("1999999998"));
+    CHECK_EQ((BigDecimal::fromString("1000000000") - BigDecimal::fromString("1")).toString(),
+             std::string("999999999"));
+    CHECK_EQ((BigDecimal::fromString("12345678901234567890") * BigDecimal::fromString("2")).toString(),
+             std::string("24691357802469135780"));
+    // scale 之差跨块时，对齐不能丢精度。
+    CHECK_EQ((BigDecimal::fromString("1") + BigDecimal::fromString("0.0000000001")).toString(),
+             std::string("1.0000000001"));
+}
+
+TEST(arith, multiply_inner_carry) {
+    // 乘法的**内层**进位：两个满块相乘时中间结果超过 10^9，
+    // 进位必须传给下一块。只测 "大数 * 2" 覆盖不到内层进位。
+    CHECK_EQ((BigDecimal::fromString("999999999") * BigDecimal::fromString("999999999")).toString(),
+             std::string("999999998000000001"));
+    CHECK_EQ((BigDecimal::fromString("999999999") * BigDecimal::fromString("2")).toString(),
+             std::string("1999999998"));
+}
+
+TEST(parse, trailing_zeros_span_blocks) {
+    // 尾随零跨块时，normalize 的逐次除以 10 必须从**高位**往低位传进位。
+    // 小端表示下若方向反了，这里的结果会变成 1.000000000 而不是 12。
+    CHECK_EQ(BigDecimal::fromString("12.0000000000").toString(), std::string("12"));
+    CHECK_EQ(BigDecimal::fromString("1.500").toString(), std::string("1.5"));
+    CHECK_EQ(BigDecimal::fromString("1000.000000000").toString(), std::string("1000"));
+}
+
+TEST(abs_, value) {
+    CHECK_EQ(BigDecimal::abs(BigDecimal::fromString("-3.5")).toString(), std::string("3.5"));
+    CHECK_EQ(BigDecimal::abs(BigDecimal::fromString("3.5")).toString(), std::string("3.5"));
+    CHECK_EQ(BigDecimal::abs(BigDecimal::fromString("-0")).toString(), std::string("0"));
+}
+
+TEST(equals_, value) {
+    CHECK(BigDecimal::fromString("1.0").equals(BigDecimal::fromString("1")));
+    CHECK(BigDecimal::fromString("0.50").equals(BigDecimal::fromString("0.5")));
+    CHECK(!BigDecimal::fromString("1.0").equals(BigDecimal::fromString("1.1")));
+    CHECK(BigDecimal::fromString("0").equals(BigDecimal::fromString("-0")));
+}
+
+// --- Task 3：除法、舍入与 Context ---
+//
+// Context::precision 是**有效数字位**（与 Python decimal 的 prec 同义），
+// 不是小数位数。
+
+namespace {
+
+using hpc::Context;
+using hpc::RoundingMode;
+
+BigDecimal div(const std::string& a, const std::string& b, int precision,
+               RoundingMode mode = RoundingMode::HalfEven) {
+    return BigDecimal::divide(BigDecimal::fromString(a), BigDecimal::fromString(b),
+                               Context{precision, mode});
+}
+
+}  // namespace
+
+TEST(divide, basic) {
+    CHECK_EQ(div("10", "4", 10).toString(), std::string("2.5"));
+    CHECK_EQ(div("1", "2", 10).toString(), std::string("0.5"));
+    CHECK_EQ(div("7", "1", 10).toString(), std::string("7"));
+}
+
+TEST(divide, repeating) {
+    // 1/7 = 0.142857142857... 保留 10 位有效数字
+    CHECK_EQ(div("1", "7", 10).toString(), std::string("0.1428571429"));
+    CHECK_EQ(div("2", "3", 10).toString(), std::string("0.6666666667"));
+}
+
+TEST(divide, significant_digits_not_decimal_places) {
+    // 精度是**有效数字位**：整数部分会占掉有效数字位。
+    CHECK_EQ(div("100", "7", 10).toString(), std::string("14.28571429"));
+    CHECK_EQ(div("1", "7", 3).toString(), std::string("0.143"));
+    // 精度 1 时只剩 1 位有效数字。
+    CHECK_EQ(div("1", "7", 1).toString(), std::string("0.1"));
+    CHECK_EQ(div("100", "7", 1).toString(), std::string("10"));
+    // 精度 1000 也不能丢位：1/7 要给到 1000 位有效数字。
+    const std::string big = div("1", "7", 1000).toString();
+    CHECK_EQ(big.substr(0, 22), std::string("0.14285714285714285714"));
+    CHECK_EQ(big.size(), std::size_t(1002));   // "0." + 1000 位
+}
+
+TEST(divide, divide_by_zero) {
+    bool threw = false;
+    try {
+        div("1", "0", 10);
+    } catch (const std::domain_error&) { threw = true; }
+    CHECK(threw);
+
+    threw = false;
+    try {
+        BigDecimal::modulo(BigDecimal::fromString("1"), BigDecimal::fromString("0"));
+    } catch (const std::domain_error&) { threw = true; }
+    CHECK(threw);
+}
+
+TEST(divide, invalid_precision) {
+    bool threw = false;
+    try {
+        div("1", "3", 0);
+    } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+
+    threw = false;
+    try {
+        div("1", "3", -1);
+    } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+}
+
+TEST(divide, zero_dividend) {
+    CHECK_EQ(div("0", "7", 10).toString(), std::string("0"));
+    CHECK_EQ(div("0", "0.000001", 10).toString(), std::string("0"));
+    // 0 除以 0 仍然要抛除零错误。
+    bool threw = false;
+    try { div("0", "0", 10); } catch (const std::domain_error&) { threw = true; }
+    CHECK(threw);
+}
+
+TEST(divide, negative_operands) {
+    CHECK_EQ(div("-1", "7", 10).toString(), std::string("-0.1428571429"));
+    CHECK_EQ(div("1", "-7", 10).toString(), std::string("-0.1428571429"));
+    CHECK_EQ(div("-1", "-7", 10).toString(), std::string("0.1428571429"));
+}
+
+TEST(divide, fractional_operands) {
+    // 除数带小数位时不能多出一个 10^b（brief 原实现会算成 20）。
+    CHECK_EQ(div("1", "0.5", 10).toString(), std::string("2"));
+    CHECK_EQ(div("0.5", "0.25", 10).toString(), std::string("2"));
+    CHECK_EQ(div("1", "2.5", 10).toString(), std::string("0.4"));
+    CHECK_EQ(div("3", "0.5", 10).toString(), std::string("6"));
+}
+
+TEST(divide, magnitude_far_from_one) {
+    // 量级远离 1 的商：有效数字位要按**商**的量级算，不能按被除数。
+    CHECK_EQ(div("1", "1000", 10).toString(), std::string("0.001"));
+    CHECK_EQ(div("1", "0.000000001", 10).toString(), std::string("1000000000"));
+    CHECK_EQ(div("0.0000000001", "3", 10).toString(),
+             std::string("0.00000000003333333333"));
+}
+
+TEST(divide, rounding_modes) {
+    // 1/3 在 10 位有效数字下，不同模式给出不同结果。
+    CHECK_EQ(div("1", "3", 10, RoundingMode::HalfEven).toString(),
+             std::string("0.3333333333"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::HalfUp).toString(),
+             std::string("0.3333333333"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::Down).toString(),
+             std::string("0.3333333333"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::Up).toString(),
+             std::string("0.3333333334"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::Ceil).toString(),
+             std::string("0.3333333334"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::Floor).toString(),
+             std::string("0.3333333333"));
+}
+
+TEST(divide, rounding_direction_on_negatives) {
+    // 负数时 Ceil/Floor 的方向必须反过来。
+    CHECK_EQ(div("-1", "3", 10, RoundingMode::Ceil).toString(),
+             std::string("-0.3333333333"));
+    CHECK_EQ(div("-1", "3", 10, RoundingMode::Floor).toString(),
+             std::string("-0.3333333334"));
+    // 向零截断与远离零截断不区分符号。
+    CHECK_EQ(div("-1", "3", 10, RoundingMode::Down).toString(),
+             std::string("-0.3333333333"));
+    CHECK_EQ(div("-1", "3", 10, RoundingMode::Up).toString(),
+             std::string("-0.3333333334"));
+}
+
+TEST(divide, bankers_rounding_exact_half) {
+    // 正好一半时走偶数分支：
+    // 0.25 保留 1 位有效数字 -> 0.2（2 是偶数）
+    // 0.35 保留 1 位有效数字 -> 0.4（3 是奇数，要进位成 4）
+    CHECK_EQ(div("0.25", "1", 1, RoundingMode::HalfEven).toString(), std::string("0.2"));
+    CHECK_EQ(div("0.35", "1", 1, RoundingMode::HalfEven).toString(), std::string("0.4"));
+    // HalfUp 在正好一半时总是进位。
+    CHECK_EQ(div("0.25", "1", 1, RoundingMode::HalfUp).toString(), std::string("0.3"));
+    CHECK_EQ(div("0.35", "1", 1, RoundingMode::HalfUp).toString(), std::string("0.4"));
+}
+
+TEST(divide, bankers_rounding_more_than_half) {
+    // 超过一半（不是正好一半）时必须进位，不能被误判成"正好一半"。
+    // 2/3 = 0.666... 保留 1 位 -> 0.7
+    CHECK_EQ(div("2", "3", 1, RoundingMode::HalfEven).toString(), std::string("0.7"));
+    // 1/6 = 0.1666... 保留 1 位 -> 0.2
+    CHECK_EQ(div("1", "6", 1, RoundingMode::HalfEven).toString(), std::string("0.2"));
+    // 1/2 = 0.5 正好一半，保留 1 位 -> 0.5（末位 5 是奇数，要进位）
+    CHECK_EQ(div("1", "2", 1, RoundingMode::HalfEven).toString(), std::string("0.5"));
+    // 3/2 = 1.5 正好一半，保留 1 位 -> 2（1 是奇数，要进位）
+    CHECK_EQ(div("3", "2", 1, RoundingMode::HalfEven).toString(), std::string("2"));
+    // 5/2 = 2.5 正好一半，保留 1 位 -> 2（2 是偶数，不进位）
+    CHECK_EQ(div("5", "2", 1, RoundingMode::HalfEven).toString(), std::string("2"));
+}
+
+TEST(floor_ceil, value) {
+    // 0.333333 有 6 位有效数字，精度 6 时原样保留（不需要任何进位）。
+    const BigDecimal third = BigDecimal::fromString("0.333333");
+    CHECK_EQ(BigDecimal::floor(third, Context{6, RoundingMode::Floor}).toString(),
+             std::string("0.333333"));
+    CHECK_EQ(BigDecimal::ceil(third, Context{6, RoundingMode::Ceil}).toString(),
+             std::string("0.333333"));
+    // 精度降到 5 位时才有舍入发生：向下舍、向上舍都进位。
+    CHECK_EQ(BigDecimal::floor(third, Context{5, RoundingMode::Floor}).toString(),
+             std::string("0.33333"));
+    CHECK_EQ(BigDecimal::ceil(third, Context{5, RoundingMode::Ceil}).toString(),
+             std::string("0.33334"));
+}
+
+TEST(floor_ceil, direction_on_negatives) {
+    // Floor 向 -∞，Ceil 向 +∞ —— 负数时方向与直觉相反。
+    const BigDecimal value = BigDecimal::fromString("-2.555");
+    CHECK_EQ(BigDecimal::floor(value, Context{3, RoundingMode::Floor}).toString(),
+             std::string("-2.56"));
+    CHECK_EQ(BigDecimal::ceil(value, Context{3, RoundingMode::Ceil}).toString(),
+             std::string("-2.55"));
+    CHECK_EQ(BigDecimal::round(value, Context{3, RoundingMode::HalfEven}).toString(),
+             std::string("-2.56"));
+    // 正数时方向相反。
+    const BigDecimal positive = BigDecimal::fromString("2.555");
+    CHECK_EQ(BigDecimal::floor(positive, Context{3, RoundingMode::Floor}).toString(),
+             std::string("2.55"));
+    CHECK_EQ(BigDecimal::ceil(positive, Context{3, RoundingMode::Ceil}).toString(),
+             std::string("2.56"));
+}
+
+TEST(floor_ceil, carry_across_integer_part) {
+    // 进位溢出整数位时要正确进位（9.99 向上取整 -> 10）。
+    CHECK_EQ(BigDecimal::ceil(BigDecimal::fromString("9.99"), Context{2}).toString(),
+             std::string("10"));
+    CHECK_EQ(BigDecimal::floor(BigDecimal::fromString("9.99"), Context{2}).toString(),
+             std::string("9.9"));
+    CHECK_EQ(BigDecimal::ceil(BigDecimal::fromString("0.999"), Context{2}).toString(),
+             std::string("1"));
+    CHECK_EQ(BigDecimal::ceil(BigDecimal::fromString("99.9"), Context{2}).toString(),
+             std::string("100"));
+}
+
+TEST(floor_ceil, integers_are_unchanged) {
+    const BigDecimal value = BigDecimal::fromString("42");
+    CHECK_EQ(BigDecimal::floor(value, Context{6, RoundingMode::Floor}).toString(),
+             std::string("42"));
+    CHECK_EQ(BigDecimal::ceil(value, Context{6, RoundingMode::Ceil}).toString(),
+             std::string("42"));
+    CHECK_EQ(BigDecimal::round(value, Context{6, RoundingMode::HalfEven}).toString(),
+             std::string("42"));
+}
+
+TEST(round_, bankers_rounding) {
+    // round 固定用 HalfEven。
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("2.5"), Context{2}).toString(),
+             std::string("2.5"));
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("0.125"), Context{3}).toString(),
+             std::string("0.125"));
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("0.135"), Context{3}).toString(),
+             std::string("0.135"));
+    // 精度不足以容纳全部有效数字时才发生舍入：2.555 保留 2 位 -> 2.6（进位）。
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("2.555"), Context{2}).toString(),
+             std::string("2.6"));
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("-2.555"), Context{2}).toString(),
+             std::string("-2.6"));
+    // 正好一半时取偶：1.5 保留 1 位 -> 2（1 是奇数）；2.5 保留 1 位 -> 2（2 是偶数）。
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("1.5"), Context{1}).toString(),
+             std::string("2"));
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("2.5"), Context{1}).toString(),
+             std::string("2"));
+    CHECK_EQ(BigDecimal::round(BigDecimal::fromString("-2.5"), Context{1}).toString(),
+             std::string("-2"));
+}
+
+TEST(modulo, sign_follows_dividend) {
+    // 取余结果符号跟随被除数（与 C 的 % 一致）。
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("7"), BigDecimal::fromString("2")).toString(),
+             std::string("1"));
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("-7"), BigDecimal::fromString("2")).toString(),
+             std::string("-1"));
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("7"), BigDecimal::fromString("-2")).toString(),
+             std::string("1"));
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("-7"), BigDecimal::fromString("-2")).toString(),
+             std::string("-1"));
+}
+
+TEST(modulo, fractional_operands) {
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("5.5"), BigDecimal::fromString("2")).toString(),
+             std::string("1.5"));
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("-5.5"), BigDecimal::fromString("2")).toString(),
+             std::string("-1.5"));
+    // 除数带小数位时余数必须小于除数。
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("1"), BigDecimal::fromString("0.3")).toString(),
+             std::string("0.1"));
+}
+
+TEST(modulo, exact_multiple_and_zero) {
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("6"), BigDecimal::fromString("3")).toString(),
+             std::string("0"));
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("0"), BigDecimal::fromString("3")).toString(),
+             std::string("0"));
+    // 比除数小的被除数，余数就是它自己。
+    CHECK_EQ(BigDecimal::modulo(BigDecimal::fromString("2"), BigDecimal::fromString("5")).toString(),
+             std::string("2"));
+}
+
+TEST(divide, legacy_crash_inputs_are_safe) {
+    // legacy 缺陷 #10 的触发输入：除法收尾的舍入分支对单节点链表做 ->prior 回退，
+    // 退到 nullptr 后解引用崩溃。v3 的舍入走块数组路径，这些输入必须全部安全。
+    const char* numerators[] = {"1.5", "2.5", "-02.881332", "12.34", "0.1", "1"};
+    const char* denominators[] = {"474", "474", "0474", "56", "7", "3"};
+    for (const char* n : numerators) {
+        for (const char* d : denominators) {
+            // 只要求不崩溃且结果可解析。
+            const std::string result = div(n, d, 1).toString();
+            CHECK(!result.empty());
+        }
+    }
+    // 精度 1 是 legacy 里 FracBit = 0 的等价场景。
+    CHECK_EQ(div("1.5", "474", 1).toString(), std::string("0.003"));
+    CHECK_EQ(div("2.5", "474", 1).toString(), std::string("0.005"));
+    CHECK_EQ(div("-02.881332", "474", 1).toString(), std::string("-0.006"));
+}
+
+TEST(divide, no_negative_zero_output) {
+    CHECK_EQ(div("0", "3", 10).toString(), std::string("0"));
+    CHECK_EQ(div("-0", "3", 10).toString(), std::string("0"));
+    // 精度 >= 1 至少保留 1 位有效数字，所以非零值永远不会舍入成 0，
+    // 更不会输出 "-0"。
+    CHECK_EQ(div("-1", "1000000", 1, RoundingMode::Down).toString(),
+             std::string("-0.000001"));
+    CHECK_EQ(div("-0.4", "1", 1, RoundingMode::Floor).toString(), std::string("-0.4"));
+}
+
+// 回归测试：precision 曾无上限，写死一个巨大值（如 1000000）会让单次除法
+// 以分钟计。核心现在拒绝超出上限的精度，逼迫调用方按量的级给精度。
+TEST(divide, rejects_absurd_precision) {
+    bool threw = false;
+    try {
+        BigDecimal::divide(BigDecimal::fromString("1"), BigDecimal::fromString("2"),
+                           Context{1000000, RoundingMode::Down});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    threw = false;
+    try {
+        BigDecimal::divide(BigDecimal::fromString("1"), BigDecimal::fromString("2"),
+                           Context{0, RoundingMode::Down});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+// 回归测试：normalize() 的尾随零剥离曾有两个缺陷。
+//
+// 1. 逐个剥离尾随零是 O(零个数 × 块数) 的二次方开销。高精度除法的商
+//    形如 0.5000…0，precision=1000000 时单次除法要以分钟计。
+//    现改为整块批量剥离。
+// 2. 批量剥离时若 scale_ 少减了 9，会把 10.00 归一化成 1 ——
+//    值被除了 10^9 而小数位只减了 1。
+TEST(normalize, trailing_zero_strip) {
+    // 跨块边界的尾随零：块内不足 9 个 + 整块为零
+    CHECK_EQ(BigDecimal::fromString("1.500").toString(), std::string("1.5"));
+    CHECK_EQ(BigDecimal::fromString("10.00").toString(), std::string("10"));
+    CHECK_EQ(BigDecimal::fromString("0.000").toString(), std::string("0"));
+
+    // 整整一块零（9 个零）后跟非零位：零块在**非零位之前**，不能被剥掉
+    std::string wide = "12.5";
+    wide.append(9, '0');
+    wide += "3";
+    CHECK_EQ(BigDecimal::fromString(wide).toString(), std::string("12.50000000003"));
+
+    // 整整一块尾随零（9 个零）必须被剥掉，且小数位同步收缩 9
+    std::string trailingBlock = "12.5";
+    trailingBlock.append(9, '0');
+    CHECK_EQ(BigDecimal::fromString(trailingBlock).toString(), std::string("12.5"));
+
+    // 两个整块尾随零（18 个零）
+    std::string twoBlocks = "12.5";
+    twoBlocks.append(18, '0');
+    CHECK_EQ(BigDecimal::fromString(twoBlocks).toString(), std::string("12.5"));
+
+    // 值不变、只归一化：除法结果尾随零被剥离后数值必须一致
+    const BigDecimal half = BigDecimal::divide(BigDecimal::fromString("1"),
+                                               BigDecimal::fromString("2"),
+                                               Context{20, RoundingMode::Down});
+    CHECK_EQ(half.toString(), std::string("0.5"));
+    CHECK(half.compare(BigDecimal::fromString("0.5")) == 0);
+}
+
+// 回归：科学计数法的指数上限曾被**放松了 10 倍**。
+//
+// 旧的守卫在把当前数字折进 magnitude **之前**检查：
+//
+//     if (magnitude > kMaxExponentMagnitude) throw ...;
+//     magnitude = magnitude * 10 + digit;
+//
+// 于是最后一位会把 magnitude 顶到 10 × 上限 —— 实际上限是 10^7 而不是
+// 文档写的 10^6，1e1000009 因此被接受。
+//
+// 现在检查放在折进之后，实际接受的上限与文档一致。
+TEST(scientific, enforces_exponent_limit_exactly) {
+    // 上限之内：接受，且 scale 正好等于指数。
+    CHECK(BigDecimal::fromString("1e1000000").scale() == 0);
+    CHECK(BigDecimal::fromString("1e1000000").toString().size() == 1000001);
+
+    // 上限之内、但离上限还有余量：必须接受（曾经被误拒的那一类）。
+    // 999999 < 1000000，所以 1e999999 是合法的。
+    CHECK(BigDecimal::fromString("1e999999").scale() == 0);
+    CHECK(BigDecimal::fromString("1e999999").toString().size() == 1000000);
+
+    // 超过上限：拒绝。
+    const char* tooLarge[] = {"1e1000001", "1e1000009", "1e1000010", "1e9999999"};
+    for (const char* text : tooLarge) {
+        bool threw = false;
+        try { BigDecimal::fromString(text); } catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+    }
+
+    // 负指数同样受限。
+    bool threw = false;
+    try { BigDecimal::fromString("1e-1000001"); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+
+    // 上限之内的负指数可以接受。
+    CHECK(BigDecimal::fromString("1e-1000000").scale() == 1000000);
+    CHECK(BigDecimal::fromString("1e-999999").scale() == 999999);
+}
+
+// 指数上限必须同时挡住「荒唐的指数」与「荒唐的分配」。
+//
+// 1e-1000000 有 100 万位小数 —— scale 很大，但那是**允许**的（上限之内）。
+// 真正要挡住的是超过上限的那些：否则 scale 会到 10^7，
+// 一个字面量就能撑爆内存。
+TEST(scientific, exponent_limit_bounds_the_scale) {
+    // 超上限：抛异常，而不是分配 1000 万位的 scale。
+    bool threw = false;
+    try { BigDecimal::fromString("1e-10000000"); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+
+    // 超上限的正指数同样被挡住。
+    threw = false;
+    try { BigDecimal::fromString("1e10000000"); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
 }
 ```
 
@@ -953,41 +3033,33 @@ std::pair<Blk, Blk> BigDecimal::divideBlk(const Blk& dividend, const Blk& diviso
 **关键**：进位必须 `push_back`（追加到**最高位**），不是 `insert(begin())`；商在累积时是**最高位在前**，最后必须 `reverse`。这两处是已知的易错点（原型阶段曾因此出错）。
 
 ```cpp
-BigDecimal BigDecimal::divide(const BigDecimal& lhs, const BigDecimal& rhs, const Context& context) {
+BigDecimal BigDecimal::divide(const BigDecimal& lhs, const BigDecimal& rhs,
+                               const Context& context) {
     if (rhs.sign_ == 0) throw std::domain_error("BigDecimal: 除数为零");
     if (context.precision <= 0) throw std::invalid_argument("BigDecimal: precision 必须为正");
-
-    // 多算两位用于判断进位，保证舍入正确。
-    const int guard = context.precision + 2;
-
-    // 把分子分母对齐到**共同的小数位**后再相除。
-    //
-    // 不要在这里额外乘 10^rhs.scale_ —— 那会与下面的
-    // result.scale_ = lhs.scale_ - rhs.scale_ + guard 重复计算，
-    // 使结果整整大 10 倍（1/0.5 会得到 20 而不是 2）。
-    const int commonScale = lhs.scale_ > rhs.scale_ ? lhs.scale_ : rhs.scale_;
-    Blk numerator = lhs.digits_;
-    for (int i = 0; i < commonScale - lhs.scale_; ++i) {
-        numerator = mulBlk(numerator, Blk{10});
+    // 上限：precision 直接决定运算量，写死一个巨大值（例如 1000000）会让
+    // 单次除法做十万位运算，实测以分钟计。真正的需求应按量的级给精度，
+    // 而不是靠一个荒谬的上限来"保险"。
+    if (context.precision > kMaxPrecision) {
+        throw std::invalid_argument("BigDecimal: precision 超出上限");
     }
-    Blk denominator = rhs.digits_;
-    for (int i = 0; i < commonScale - rhs.scale_; ++i) {
-        denominator = mulBlk(denominator, Blk{10});
-    }
-    // 再放大 guard 位以保留足够的小数位。
-    for (int i = 0; i < guard; ++i) {
-        numerator = mulBlk(numerator, Blk{10});
-    }
+    if (lhs.sign_ == 0) return BigDecimal();
 
-    const auto divided = divideBlk(numerator, denominator);
+    // 被除数与除数先对齐到共同的小数位：
+    // (L·10^-a) / (R·10^-b) = (L·10^(k-a)) / (R·10^(k-b))，其中 k = max(a, b)。
+    const int commonScale = std::max(lhs.scale_, rhs.scale_);
+    const Blk numerator = shiftLeftDecimal(lhs.digits_, commonScale - lhs.scale_);
+    const Blk denominator = shiftLeftDecimal(rhs.digits_, commonScale - rhs.scale_);
+
+    const auto rounded = roundQuotient(numerator, denominator, context.precision,
+                                       context.mode, lhs.sign_ * rhs.sign_ < 0);
 
     BigDecimal result;
-    result.digits_ = divided.first;
-    result.scale_ = guard;   // 分子分母已对齐到 commonScale，商的小数位就是 guard
+    result.digits_ = rounded.first;
+    result.scale_ = rounded.second;
     result.sign_ = lhs.sign_ * rhs.sign_;
     result.normalize();
-
-    return roundToPrecision(result, context);
+    return result;
 }
 
 // 注意：不要提供 operator/ —— 二元运算符不能带 Context 参数（MSVC 报 C2804）。
@@ -995,15 +3067,27 @@ BigDecimal BigDecimal::divide(const BigDecimal& lhs, const BigDecimal& rhs, cons
 
 BigDecimal BigDecimal::modulo(const BigDecimal& lhs, const BigDecimal& rhs) {
     if (rhs.sign_ == 0) throw std::domain_error("BigDecimal: 取余的除数为零");
-    if (lhs.compare(rhs) < 0 && lhs.sign() * rhs.sign() >= 0) return lhs;
-    // 求商时向零截断。精度按**操作数的量级**给，而不是写死一个巨大值 ——
-    // 写死 1000000 会让每次除法都做十万位运算，实测单次超过 3 分钟。
-    // 商的整数部分不超过 lhs 的位数，取这么多位足够精确。
-    const int quotientDigits = lhs.scale_ > rhs.scale_
-        ? lhs.scale_ - rhs.scale_ + 1
-        : 1;
-    BigDecimal quotient = divide(lhs, rhs, Context{quotientDigits, RoundingMode::Down});
-    return lhs - quotient * rhs;
+    if (lhs.sign_ == 0) return BigDecimal();
+
+    // 取余按**绝对值**做除法，结果符号跟随被除数（与 C 的 % 一致）。
+    const BigDecimal dividend = abs(lhs);
+    const BigDecimal divisor = abs(rhs);
+
+    // 对齐到共同的小数位，把两个数都变成整数：
+    // 被除数 = numerator / 10^commonScale，除数 = denominator / 10^commonScale。
+    const int commonScale = std::max(dividend.scale_, divisor.scale_);
+    const Blk numerator = shiftLeftDecimal(dividend.digits_, commonScale - dividend.scale_);
+    const Blk denominator = shiftLeftDecimal(divisor.digits_, commonScale - divisor.scale_);
+
+    // 整数长除法：商向下取整（向零），余数即结果。
+    const auto divided = divideBlk(numerator, denominator);
+
+    BigDecimal remainder;
+    remainder.digits_ = divided.second;
+    remainder.scale_ = commonScale;
+    remainder.sign_ = lhs.sign_ < 0 ? -1 : 1;
+    remainder.normalize();
+    return remainder;
 }
 ```
 
@@ -1121,55 +3205,88 @@ BigDecimal BigDecimal::round(const BigDecimal& value, const Context& context) {
 
 ```cpp
 TEST(divide, basic) {
-    const hpc::Context ctx{10, hpc::RoundingMode::HalfEven};
-    CHECK_EQ(BigDecimal::divide(BigDecimal::fromString("10"), BigDecimal::fromString("4"), ctx).toString(),
-             std::string("2.5"));
-    CHECK_EQ(BigDecimal::divide(BigDecimal::fromString("1"), BigDecimal::fromString("2"), ctx).toString(),
-             std::string("0.5"));
+    CHECK_EQ(div("10", "4", 10).toString(), std::string("2.5"));
+    CHECK_EQ(div("1", "2", 10).toString(), std::string("0.5"));
+    CHECK_EQ(div("7", "1", 10).toString(), std::string("7"));
 }
 
 TEST(divide, repeating) {
-    const hpc::Context ctx{10, hpc::RoundingMode::HalfEven};
-    // 1/7 = 0.142857142857... 保留 10 位
-    CHECK_EQ(BigDecimal::divide(BigDecimal::fromString("1"), BigDecimal::fromString("7"), ctx).toString(),
-             std::string("0.1428571429"));
+    // 1/7 = 0.142857142857... 保留 10 位有效数字
+    CHECK_EQ(div("1", "7", 10).toString(), std::string("0.1428571429"));
+    CHECK_EQ(div("2", "3", 10).toString(), std::string("0.6666666667"));
 }
 
 TEST(divide, divide_by_zero) {
-    const hpc::Context ctx{10, hpc::RoundingMode::HalfEven};
     bool threw = false;
     try {
-        BigDecimal::divide(BigDecimal::fromString("1"), BigDecimal::fromString("0"), ctx);
+        div("1", "0", 10);
+    } catch (const std::domain_error&) { threw = true; }
+    CHECK(threw);
+
+    threw = false;
+    try {
+        BigDecimal::modulo(BigDecimal::fromString("1"), BigDecimal::fromString("0"));
     } catch (const std::domain_error&) { threw = true; }
     CHECK(threw);
 }
 
 TEST(divide, rounding_modes) {
-    const BigDecimal third = BigDecimal::fromString("0.333333");
-    CHECK_EQ(BigDecimal::floor(third, hpc::Context{6, hpc::RoundingMode::Floor}).toString(),
-             std::string("0.333333"));
-    CHECK_EQ(BigDecimal::ceil(third, hpc::Context{6, hpc::RoundingMode::Ceil}).toString(),
-             std::string("0.333334"));
+    // 1/3 在 10 位有效数字下，不同模式给出不同结果。
+    CHECK_EQ(div("1", "3", 10, RoundingMode::HalfEven).toString(),
+             std::string("0.3333333333"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::HalfUp).toString(),
+             std::string("0.3333333333"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::Down).toString(),
+             std::string("0.3333333333"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::Up).toString(),
+             std::string("0.3333333334"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::Ceil).toString(),
+             std::string("0.3333333334"));
+    CHECK_EQ(div("1", "3", 10, RoundingMode::Floor).toString(),
+             std::string("0.3333333333"));
 }
 ```
 
 - [ ] **Step 5: 写 `tests/div_probe.cpp` 并在 CMake 注册**
 
 ```cpp
-// 除法探针：读入若干行 "a b"，输出每行 a/b 的结果（20 位精度）。
+// 除法探针：读入若干行 "a b [mode]"，输出每行 a/b 的结果（默认 20 位精度）。
+//
+// mode 可选，缺省为 HalfEven；取值与 hpc::RoundingMode 的名字一致。
+// 供 scripts/verify_div.py 做 Python decimal 差分验证。
 #include <iostream>
+#include <sstream>
 #include <string>
 
 #include "core/BigDecimal.h"
 
+namespace {
+
+hpc::RoundingMode parseMode(const std::string& name) {
+    if (name == "HalfUp") return hpc::RoundingMode::HalfUp;
+    if (name == "Down") return hpc::RoundingMode::Down;
+    if (name == "Up") return hpc::RoundingMode::Up;
+    if (name == "Ceil") return hpc::RoundingMode::Ceil;
+    if (name == "Floor") return hpc::RoundingMode::Floor;
+    return hpc::RoundingMode::HalfEven;
+}
+
+}  // namespace
+
 int main() {
     std::ios::sync_with_stdio(false);
-    std::string a, b;
-    while (std::cin >> a >> b) {
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        std::istringstream input(line);
+        std::string a, b, modeName;
+        if (!(input >> a >> b)) continue;
+        input >> modeName;   // 读不到就是空串
+        const hpc::RoundingMode mode = modeName.empty() ? hpc::RoundingMode::HalfEven
+                                                         : parseMode(modeName);
         try {
             const hpc::BigDecimal quotient = hpc::BigDecimal::divide(
                 hpc::BigDecimal::fromString(a), hpc::BigDecimal::fromString(b),
-                hpc::Context{20, hpc::RoundingMode::HalfEven});
+                hpc::Context{20, mode});
             std::cout << quotient.toString() << "\n";
         } catch (const std::exception&) {
             std::cout << "ERROR\n";
@@ -6521,9 +8638,14 @@ void registerApiRoutes(Server& server, const std::string& webRoot) {
 // 服务起来后把 URL 打印出来就够了。`--no-browser` 仍然被接受（恒等操作），
 // 只是为了兼容按兄弟项目方式写的调用脚本。
 //
-// Ctrl+C 的处理：装一个控制台处理器，只翻转一个标志位，主循环看到它就退出，
-// 随后 Server 的析构函数调用 stop()，stop() 会 join 服务线程 —— 进程干净地
-// 结束，不留残留线程，也不依赖「被杀进程反正会死」这种运气。
+// Ctrl+C 的处理：装一个控制台处理器，只翻转一个标志位（**不阻塞** ——
+// 控制台处理器跑在 OS 另起的一个线程上，在那里 join 服务线程会与主
+// 线程的 stop() 打架）。主循环看到标志位就退出，随后 Server 的析构
+// 函数调用 stop()。
+//
+// stop() 之后如果还有请求在算（内核的运算是**不可打断**的：一个 30 万
+// 位的进制转换要算 87 秒，中途没有取消点），进程不能傻等 —— 给一段
+// 宽限期让它们收尾，超时就直接结束进程。
 //
 // getenv 在 MSVC 下会触发弃用警告，这里显式关闭该检查。
 // 那个宏必须定义在包含任何头文件之前 —— 所以它在这里，而不是在
@@ -6535,6 +8657,7 @@ void registerApiRoutes(Server& server, const std::string& webRoot) {
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -6553,10 +8676,15 @@ void registerApiRoutes(Server& server, const std::string& webRoot) {
 
 namespace {
 
-// Ctrl+C 被按下时置位。主循环每 200 ms 查一次。
+// Ctrl+C 被按下时置位。主循环每 50 ms 查一次。
 std::atomic<bool> g_stopRequested{false};
 
 #if defined(_WIN32)
+// 控制台处理器跑在 OS 另起的一个线程上。
+//
+// 这里**只能**做「翻转标志位」这种不会阻塞的事：一旦在这里 join
+// 服务线程，就会与主线程里的 stop() 抢同一个线程 —— 谁先谁后都可能
+// 出问题（互相等）。让处理器立刻返回，真正的收尾交给主线程。
 BOOL WINAPI consoleHandler(DWORD signalType) {
     switch (signalType) {
         case CTRL_C_EVENT:
@@ -6689,15 +8817,41 @@ int main(int argc, char** argv) {
 
     // 等待服务线程结束或收到停止信号。
     //
-    // Server 的析构函数会调用 stop()，而 stop() 会 join 线程 ——
-    // 因此循环退出后不会有残留线程，进程可以干净地结束。
+    // 50 ms 一查：Ctrl+C 到进程退出之间不该有明显的延迟。
     while (server.running() && !g_stopRequested.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    // 显式停一次：把监听套接字关掉、唤醒并 join 服务线程。
+    // 显式停一次：翻掉 running 标志、唤醒并 join 服务线程。
+    //
+    // stop() 是**有界**的：accept 线程最多等 100 ms，在途请求最多再等
+    // 500 ms。所以这里不会因为一个停滞的客户端或一个长计算而卡住。
     server.stop();
     std::cout << "服务已停止。" << std::endl;
+
+    // 在途请求可能还在算 —— 内核的运算没有取消点，等不到它自然结束。
+    //
+    // 给一小段宽限期让它们把响应写完；超时就直接结束进程。
+    // 这正是「Ctrl+C 必须能立刻停服」的要求：宁可丢掉一个还没算完的
+    // 响应，也不能让进程赖着不走。
+    //
+    // 宽限期取 300 ms：够一次内存里的写操作完成，又不至于让
+    // 「Ctrl+C 停不下来」的感觉回来。停滞的客户端也会在这段时间里
+    // 被读超时踢掉（见 HttpServer 的 kReadTimeoutMillis）。
+    const auto graceDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    while (server.activeConnections() > 0 &&
+           std::chrono::steady_clock::now() < graceDeadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    if (server.activeConnections() > 0) {
+        std::cout << "仍有 " << server.activeConnections()
+                  << " 个请求在计算（内核运算不可打断），直接结束进程。" << std::endl;
+        std::fflush(nullptr);
+        // 连接线程是 detach 的，还没算完的那次计算就让它随进程一起消失。
+        std::_Exit(0);
+    }
+
     return 0;
 }
 ```
